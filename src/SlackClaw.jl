@@ -4,6 +4,7 @@ using HTTP
 using JSON
 
 include("config.jl")
+include("directives.jl")
 include("message_types.jl")
 include("slack_api.jl")
 include("claude_runner.jl")

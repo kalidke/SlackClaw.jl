@@ -27,8 +27,12 @@ function run_claude(prompt::String, config::SlackClawConfig; session_id::String=
         push!(args, "--resume", session_id)
     end
 
-    if !isempty(config.system_prompt)
-        push!(args, "--system-prompt", config.system_prompt)
+    # Build system prompt: user config + directive instructions
+    sys_parts = String[]
+    !isempty(config.system_prompt) && push!(sys_parts, config.system_prompt)
+    config.agent_directives && push!(sys_parts, DIRECTIVE_INSTRUCTIONS)
+    if !isempty(sys_parts)
+        push!(args, "--system-prompt", join(sys_parts, "\n\n"))
     end
 
     if config.max_budget_usd > 0

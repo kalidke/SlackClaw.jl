@@ -16,6 +16,10 @@ Base.@kwdef mutable struct SlackClawConfig
     allowed_tools::Vector{String} = String[]
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 10
+    max_continue::Int = 10              # max consecutive [CONTINUE] before forced stop
     system_prompt::String = "Keep responses under 2000 characters. Be concise and direct. This is a Slack channel."
+    agent_directives::Bool = true       # enable [CONTINUE]/[SCHEDULE] directives
+    status_file::String = ".slackclaw_status"
+    status_poll_s::Int = 30             # how often to check status file during execution
     bot_user_id::String = ""
 end
