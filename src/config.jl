@@ -17,7 +17,8 @@ Base.@kwdef mutable struct SlackClawConfig
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 10
     max_continue::Int = 10              # max consecutive [CONTINUE] before forced stop
-    system_prompt::String = "Keep responses under 2000 characters. Be concise and direct. This is a Slack channel."
+    system_prompt::String = """Keep responses under 2000 characters. Be concise and direct. This is a Slack channel.
+If a task will take more than a few seconds, first reply with a brief message explaining what you're about to do, what steps are involved, and what the user should expect to see (e.g. status updates, follow-ups, or a final summary). Then proceed with the work."""
     agent_directives::Bool = true       # enable [CONTINUE]/[SCHEDULE] directives
     status_file::String = ".slackclaw_status"
     status_poll_s::Int = 30             # how often to check status file during execution
