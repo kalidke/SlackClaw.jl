@@ -31,44 +31,81 @@ mutable struct MonitorState
 end
 
 const SLACK_MAX_TEXT = 3900
-const THREADS_FILE = ".slackclaw_threads.json"
+const STATE_FILE = ".slackclaw_state.json"
 
 # --- Persistence ---
 
-"""Save thread sessions to disk."""
-function save_threads!(state::MonitorState)
-    path = joinpath(state.config.repo_dir, THREADS_FILE)
-    data = Dict{String,Any}()
+"""Save full monitor state (threads, last_ts, scheduled tasks) to disk."""
+function save_state!(state::MonitorState)
+    path = joinpath(state.config.repo_dir, STATE_FILE)
+    threads_data = Dict{String,Any}()
     for (ts, s) in state.threads
-        data[ts] = Dict(
+        threads_data[ts] = Dict(
             "thread_ts" => s.thread_ts,
             "session_id" => s.session_id,
             "last_reply_ts" => s.last_reply_ts,
             "created" => s.created,
         )
     end
+    scheduled_data = [Dict(
+        "thread_ts" => s.thread_ts,
+        "session_id" => s.session_id,
+        "prompt" => s.prompt,
+        "due_at" => s.due_at,
+    ) for s in state.scheduled]
+    data = Dict(
+        "last_ts" => state.last_ts,
+        "threads" => threads_data,
+        "scheduled" => scheduled_data,
+    )
     open(path, "w") do io
         JSON.print(io, data)
     end
 end
 
-"""Load thread sessions from disk."""
-function load_threads(config::SlackClawConfig)::Dict{String,ThreadSession}
-    path = joinpath(config.repo_dir, THREADS_FILE)
+"""Load persisted state from disk. Returns (threads, last_ts, scheduled)."""
+function load_state(config::SlackClawConfig)
+    path = joinpath(config.repo_dir, STATE_FILE)
     threads = Dict{String,ThreadSession}()
-    isfile(path) || return threads
+    last_ts = ""
+    scheduled = ScheduledTask[]
+
+    # Migrate old threads-only file if it exists
+    old_path = joinpath(config.repo_dir, ".slackclaw_threads.json")
+    if !isfile(path) && isfile(old_path)
+        try
+            data = JSON.parsefile(old_path)
+            for (ts, d) in data
+                threads[ts] = ThreadSession(
+                    d["thread_ts"], d["session_id"],
+                    d["last_reply_ts"], d["created"])
+            end
+            @info "SlackClaw: migrated $(length(threads)) thread(s) from old format"
+            return threads, last_ts, scheduled
+        catch; end
+    end
+
+    isfile(path) || return threads, last_ts, scheduled
     try
         data = JSON.parsefile(path)
-        for (ts, d) in data
+        last_ts = get(data, "last_ts", "")
+        for (ts, d) in get(data, "threads", Dict())
             threads[ts] = ThreadSession(
                 d["thread_ts"], d["session_id"],
                 d["last_reply_ts"], d["created"])
         end
-        @info "SlackClaw: loaded $(length(threads)) thread session(s) from disk"
+        now = time()
+        for d in get(data, "scheduled", [])
+            due = d["due_at"]
+            due > now || continue  # skip expired scheduled tasks
+            push!(scheduled, ScheduledTask(
+                d["thread_ts"], d["session_id"], d["prompt"], due))
+        end
+        @info "SlackClaw: loaded state — $(length(threads)) thread(s), $(length(scheduled)) scheduled task(s), last_ts=$last_ts"
     catch e
-        @warn "SlackClaw: failed to load threads file" exception=e
+        @warn "SlackClaw: failed to load state file" exception=e
     end
-    return threads
+    return threads, last_ts, scheduled
 end
 
 # --- Utilities ---
@@ -118,9 +155,10 @@ function start_monitor(config::SlackClawConfig)
     config.bot_user_id = slack_auth_test(config)
     @info "SlackClaw: bot user ID = $(config.bot_user_id)"
 
-    threads = load_threads(config)
-    state = MonitorState(config, slack_ts_now(), true, Task[], nothing, threads,
-                         Dict{String,Float64}(), ScheduledTask[])
+    threads, persisted_ts, scheduled = load_state(config)
+    last_ts = isempty(persisted_ts) ? slack_ts_now() : persisted_ts
+    state = MonitorState(config, last_ts, true, Task[], nothing, threads,
+                         Dict{String,Float64}(), scheduled)
 
     info_parts = ["Repo: `$(config.repo_dir)`"]
     !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
@@ -174,6 +212,7 @@ function poll_once!(state::MonitorState)
             should_process(msg, state.config, raw) || continue
             dispatch_command!(state, msg)
         end
+        save_state!(state)
     end
 
     # 2. Thread replies
@@ -215,7 +254,7 @@ function expire_threads!(state::MonitorState)
         delete!(state.threads, sorted[i].thread_ts)
     end
     @info "SlackClaw: expired $to_remove old thread(s)"
-    save_threads!(state)
+    save_state!(state)
 end
 
 # --- Scheduled tasks ---
@@ -275,7 +314,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     current_session = result.session_id
                     state.threads[thread_ts] = ThreadSession(
                         thread_ts, current_session, slack_ts_now(), time())
-                    save_threads!(state)
+                    save_state!(state)
                 end
 
                 if !result.success
@@ -310,6 +349,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     due = time() + directive.delay_s
                     push!(state.scheduled, ScheduledTask(
                         thread_ts, current_session, directive.prompt, due))
+                    save_state!(state)
                     mins = round(Int, directive.delay_s / 60)
                     slack_post_message(config,
                         "_Scheduled follow-up in $(mins)m._";

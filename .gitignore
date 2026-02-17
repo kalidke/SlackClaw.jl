@@ -5,3 +5,4 @@
 /docs/Manifest*.toml
 /docs/build/
 .slackclaw_threads.json
+.slackclaw_state.json
