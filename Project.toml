@@ -1,7 +1,7 @@
 name = "SlackClaw"
 uuid = "916c34f9-65bc-4d80-9781-b3dc311e871d"
-authors = ["klidke@unm.edu"]
 version = "1.0.0-DEV"
+authors = ["klidke@unm.edu"]
 
 [deps]
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
@@ -9,7 +9,7 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 
 [compat]
 HTTP = "1"
-JSON = "0.21"
+JSON = "0.21, 1"
 julia = "1.10"
 
 [extras]
