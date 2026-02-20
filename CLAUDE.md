@@ -21,7 +21,7 @@ julia --project -e "using SlackClaw; run_monitor(SlackClawConfig())"
 
 ## Required Environment
 
-- `SLACK_BOT_TOKEN` — Bot token with scopes: `channels:history`, `channels:read`, `chat:write`, `reactions:write`
+- `SLACK_BOT_TOKEN` — Bot token with scopes: `channels:history`, `channels:read`, `groups:history`, `chat:write`, `reactions:write`
 - `SLACK_CHANNEL_ID` — Target channel to monitor
 
 ## Architecture

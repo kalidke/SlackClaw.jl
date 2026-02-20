@@ -25,6 +25,7 @@ Navigate to **OAuth & Permissions** and add these **Bot Token Scopes**:
 |-------|---------|
 | `channels:history` | Read messages in public channels |
 | `channels:read` | List channels and get channel info |
+| `groups:history` | Read messages in private channels |
 | `chat:write` | Post messages and thread replies |
 | `reactions:write` | Add emoji reactions (status indicators) |
 
