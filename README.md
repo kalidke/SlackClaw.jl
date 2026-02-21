@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/LidkeLab/SlackClaw.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/LidkeLab/SlackClaw.jl)
 
-Slack-to-Claude Code bridge. SlackClaw monitors a Slack channel, dispatches messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as subprocesses, and posts results back as threaded replies. Supports multi-turn sessions, concurrent tasks, and an agent loop with `[CONTINUE]`/`[SCHEDULE]` directives for autonomous workflows.
+Slack-to-Claude Code bridge. SlackClaw monitors Slack channels, dispatches messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as subprocesses, and posts results back as threaded replies. Supports multi-turn sessions, concurrent tasks, multi-channel listening, and an agent loop with `[CONTINUE]`/`[SCHEDULE]` directives for autonomous workflows.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Navigate to **OAuth & Permissions** and add these **Bot Token Scopes**:
 | Scope | Purpose |
 |-------|---------|
 | `channels:history` | Read messages in public channels |
-| `channels:read` | List channels and get channel info |
+| `channels:read` | List channels and get channel info (including listen channel names) |
 | `groups:history` | Read messages in private channels |
 | `chat:write` | Post messages and thread replies |
 | `reactions:write` | Add emoji reactions (status indicators) |
@@ -138,15 +138,17 @@ All options are fields on `SlackClawConfig`:
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
 | `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
 | `allowed_tools` | `[]` | Restrict Claude to specific tools |
+| `listen_channel_ids` | `[]` | Channels to poll read-only (responses go to primary channel) |
 
 ## How It Works
 
-1. **Poll** — Fetches new channel messages and thread replies every `poll_interval_s` seconds
+1. **Poll** — Fetches new channel messages, thread replies, and listen channel messages every `poll_interval_s` seconds
 2. **Dispatch** — Each message spawns an async Claude invocation in the configured `repo_dir`
 3. **React** — Adds emoji reactions: :eyes: (processing), :white_check_mark: (success), :x: (error)
 4. **Thread** — All responses go to the message thread, preserving conversation context
 5. **Resume** — Thread replies continue the same Claude session via `--resume`
-6. **Persist** — Sessions and scheduled tasks survive restarts (saved to `.slackclaw_state.json`)
+6. **Listen** — Messages from listen channels are quoted in the primary channel and processed there
+7. **Persist** — Sessions and scheduled tasks survive restarts (saved to `.slackclaw_state.json`)
 
 ### Agent Directives
 
@@ -157,6 +159,20 @@ When `agent_directives` is enabled (default), Claude can control its own executi
 - **`[SCHEDULE: 2h: check pipeline results]`** — Schedule a future invocation (supports `30m`, `1h`, `2h30m`, etc.)
 
 If no directive is present, the task is considered complete.
+
+### Multi-Channel Listening
+
+A monitor can listen to additional channels beyond its primary one. Messages from listen channels are posted as new threads in the primary channel (prefixed with the source channel name) and processed there:
+
+```julia
+run_monitor(SlackClawConfig(
+    slack_channel_id = "C_PRIMARY",          # primary channel for responses
+    listen_channel_ids = ["C_GENERAL", "C_ANNOUNCE"],  # read-only channels
+    repo_dir = "/path/to/repo",
+))
+```
+
+Channel names are resolved via the Slack API on startup and cached for the session. The bot must be invited to each listen channel. Polls are staggered between channels to stay within Slack rate limits.
 
 ## Running as a Service
 
