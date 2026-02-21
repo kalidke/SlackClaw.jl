@@ -9,6 +9,7 @@ mutable struct ThreadSession
     session_id::String
     last_reply_ts::String  # newest reply we've seen in this thread
     created::Float64       # time() when created, for expiry
+    channel_id::String     # which channel this thread lives in
 end
 
 """A scheduled future invocation."""
@@ -28,6 +29,8 @@ mutable struct MonitorState
     threads::Dict{String,ThreadSession}  # thread_ts -> session
     busy_threads::Dict{String,Float64}   # thread_ts -> start time()
     scheduled::Vector{ScheduledTask}     # pending scheduled tasks
+    listen_last_ts::Dict{String,String}  # channel_id -> last_ts for listen channels
+    channel_names::Dict{String,String}   # channel_id -> display name (cached)
 end
 
 const SLACK_MAX_TEXT = 3900
@@ -45,6 +48,7 @@ function save_state!(state::MonitorState)
             "session_id" => s.session_id,
             "last_reply_ts" => s.last_reply_ts,
             "created" => s.created,
+            "channel_id" => s.channel_id,
         )
     end
     scheduled_data = [Dict(
@@ -57,18 +61,20 @@ function save_state!(state::MonitorState)
         "last_ts" => state.last_ts,
         "threads" => threads_data,
         "scheduled" => scheduled_data,
+        "listen_last_ts" => state.listen_last_ts,
     )
     open(path, "w") do io
         JSON.print(io, data)
     end
 end
 
-"""Load persisted state from disk. Returns (threads, last_ts, scheduled)."""
+"""Load persisted state from disk. Returns (threads, last_ts, scheduled, listen_last_ts)."""
 function load_state(config::SlackClawConfig)
     path = joinpath(config.repo_dir, STATE_FILE)
     threads = Dict{String,ThreadSession}()
     last_ts = ""
     scheduled = ScheduledTask[]
+    listen_last_ts = Dict{String,String}()
 
     # Migrate old threads-only file if it exists
     old_path = joinpath(config.repo_dir, ".slackclaw_threads.json")
@@ -78,21 +84,23 @@ function load_state(config::SlackClawConfig)
             for (ts, d) in data
                 threads[ts] = ThreadSession(
                     d["thread_ts"], d["session_id"],
-                    d["last_reply_ts"], d["created"])
+                    d["last_reply_ts"], d["created"],
+                    config.slack_channel_id)
             end
             @info "SlackClaw: migrated $(length(threads)) thread(s) from old format"
-            return threads, last_ts, scheduled
+            return threads, last_ts, scheduled, listen_last_ts
         catch; end
     end
 
-    isfile(path) || return threads, last_ts, scheduled
+    isfile(path) || return threads, last_ts, scheduled, listen_last_ts
     try
         data = JSON.parsefile(path)
         last_ts = get(data, "last_ts", "")
         for (ts, d) in get(data, "threads", Dict())
             threads[ts] = ThreadSession(
                 d["thread_ts"], d["session_id"],
-                d["last_reply_ts"], d["created"])
+                d["last_reply_ts"], d["created"],
+                get(d, "channel_id", config.slack_channel_id))
         end
         now = time()
         for d in get(data, "scheduled", [])
@@ -101,11 +109,14 @@ function load_state(config::SlackClawConfig)
             push!(scheduled, ScheduledTask(
                 d["thread_ts"], d["session_id"], d["prompt"], due))
         end
+        for (ch, ts) in get(data, "listen_last_ts", Dict())
+            listen_last_ts[ch] = ts
+        end
         @info "SlackClaw: loaded state — $(length(threads)) thread(s), $(length(scheduled)) scheduled task(s), last_ts=$last_ts"
     catch e
         @warn "SlackClaw: failed to load state file" exception=e
     end
-    return threads, last_ts, scheduled
+    return threads, last_ts, scheduled, listen_last_ts
 end
 
 # --- Utilities ---
@@ -119,17 +130,19 @@ function slack_ts_now()
 end
 
 """Post a response to Slack, truncating if needed."""
-function post_response(config::SlackClawConfig, text::String, thread_ts::String)
+function post_response(config::SlackClawConfig, text::String, thread_ts::String;
+                       channel_id::String=config.slack_channel_id)
     if length(text) > SLACK_MAX_TEXT
         text = text[1:SLACK_MAX_TEXT] * "\n\n_(truncated)_"
     end
-    slack_post_message(config, text; thread_ts)
+    slack_post_message(config, text; thread_ts, channel_id)
 end
 
 # --- Status file watching ---
 
 """Watch status file during Claude execution, posting updates to thread."""
-function watch_status_file(config::SlackClawConfig, thread_ts::String, stop::Ref{Bool})
+function watch_status_file(config::SlackClawConfig, thread_ts::String, stop::Ref{Bool};
+                           channel_id::String=config.slack_channel_id)
     path = joinpath(config.repo_dir, config.status_file)
     last_content = ""
     while !stop[]
@@ -142,7 +155,7 @@ function watch_status_file(config::SlackClawConfig, thread_ts::String, stop::Ref
             content = strip(read(path, String))
             if !isempty(content) && content != last_content
                 last_content = content
-                slack_post_message(config, "_Status: $(content)_"; thread_ts)
+                slack_post_message(config, "_Status: $(content)_"; thread_ts, channel_id)
             end
         catch; end
     end
@@ -155,14 +168,35 @@ function start_monitor(config::SlackClawConfig)
     config.bot_user_id = slack_auth_test(config)
     @info "SlackClaw: bot user ID = $(config.bot_user_id)"
 
-    threads, persisted_ts, scheduled = load_state(config)
+    threads, persisted_ts, scheduled, listen_last_ts = load_state(config)
     last_ts = isempty(persisted_ts) ? slack_ts_now() : persisted_ts
+
+    # Resolve channel names for listen channels
+    channel_names = Dict{String,String}()
+    for ch_id in config.listen_channel_ids
+        try
+            info = slack_conversations_info(config, ch_id)
+            channel_names[ch_id] = get(info, "name", ch_id)
+            @info "SlackClaw: listen channel $(ch_id) → #$(channel_names[ch_id])"
+        catch e
+            @warn "SlackClaw: could not resolve channel name" channel_id=ch_id exception=e
+            channel_names[ch_id] = ch_id
+        end
+        # Initialize last_ts for new listen channels
+        if !haskey(listen_last_ts, ch_id)
+            listen_last_ts[ch_id] = last_ts
+        end
+    end
+
     state = MonitorState(config, last_ts, true, Task[], nothing, threads,
-                         Dict{String,Float64}(), scheduled)
+                         Dict{String,Float64}(), scheduled, listen_last_ts,
+                         channel_names)
 
     info_parts = ["Repo: `$(config.repo_dir)`"]
     !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
     config.agent_directives && push!(info_parts, "Agent mode")
+    !isempty(config.listen_channel_ids) && push!(info_parts,
+        "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
     slack_post_message(config,
         "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
 
@@ -218,8 +252,64 @@ function poll_once!(state::MonitorState)
     # 2. Thread replies
     poll_threads!(state)
 
-    # 3. Scheduled tasks
+    # 3. Listen channels (respond in primary channel)
+    poll_listen_channels!(state)
+
+    # 4. Scheduled tasks
     check_scheduled!(state)
+end
+
+# --- Listen channel polling ---
+
+"""Poll listen-only channels for new messages, dispatching responses to the primary channel."""
+function poll_listen_channels!(state::MonitorState)
+    config = state.config
+    isempty(config.listen_channel_ids) && return
+
+    for ch_id in config.listen_channel_ids
+        state.running || break
+        ch_last_ts = get(state.listen_last_ts, ch_id, state.last_ts)
+        try
+            raw_msgs = slack_get_history(config, ch_last_ts; channel_id=ch_id)
+            isempty(raw_msgs) && continue
+
+            ch_name = get(state.channel_names, ch_id, ch_id)
+            parsed = parse_slack_messages(raw_msgs)
+            for (msg, raw) in zip(parsed, raw_msgs)
+                if msg.ts > ch_last_ts
+                    ch_last_ts = msg.ts
+                end
+                should_process(msg, config, raw) || continue
+                # Prefix message with channel origin for Claude context
+                prefixed_text = "[from #$(ch_name)] $(msg.text)"
+                prefixed_msg = SlackMessage(msg.ts, msg.user, prefixed_text, msg.thread_ts)
+                # Dispatch to primary channel (no reaction on listen channel -- we're read-only)
+                dispatch_listen_command!(state, prefixed_msg, ch_name)
+            end
+            state.listen_last_ts[ch_id] = ch_last_ts
+            save_state!(state)
+        catch e
+            @error "SlackClaw listen channel poll error" channel_id=ch_id exception=(e, catch_backtrace())
+        end
+        sleep(0.5)  # stagger polls to avoid rate limits
+    end
+end
+
+"""Dispatch a message from a listen channel -- post response in primary channel."""
+function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_name::String)
+    config = state.config
+    filter!(!istaskdone, state.active_tasks)
+
+    if length(state.active_tasks) >= config.max_concurrent_tasks
+        @info "SlackClaw: skipping listen channel message (busy)" channel=ch_name
+        return
+    end
+
+    # Post a new thread in the primary channel with the listen channel context
+    primary = config.slack_channel_id
+    header = "_Message from #$(ch_name):_\n> $(msg.text)"
+    thread_ts = slack_post_message(config, header; channel_id=primary)
+    run_agent_loop!(state, thread_ts, msg.text, ""; channel_id=primary)
 end
 
 # --- Thread polling ---
@@ -228,7 +318,8 @@ function poll_threads!(state::MonitorState)
     for (thread_ts, session) in state.threads
         state.running || break
         try
-            raw_replies = slack_get_replies(state.config, thread_ts, session.last_reply_ts)
+            raw_replies = slack_get_replies(state.config, thread_ts, session.last_reply_ts;
+                                           channel_id=session.channel_id)
             isempty(raw_replies) && continue
             parsed = parse_slack_messages(raw_replies)
             for (msg, raw) in zip(parsed, raw_replies)
@@ -266,27 +357,34 @@ function check_scheduled!(state::MonitorState)
 
     for sched in due
         @info "SlackClaw: firing scheduled task for thread $(sched.thread_ts)"
+        ch = if haskey(state.threads, sched.thread_ts)
+            state.threads[sched.thread_ts].channel_id
+        else
+            state.config.slack_channel_id
+        end
         slack_post_message(state.config, "_Scheduled follow-up firing..._";
-            thread_ts=sched.thread_ts)
-        run_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id)
+            thread_ts=sched.thread_ts, channel_id=ch)
+        run_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id;
+                        channel_id=ch)
     end
 end
 
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
-    run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="")
+    run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="", channel_id=state.config.slack_channel_id)
 
 Run Claude in a loop, handling [CONTINUE] and [SCHEDULE] directives.
 Posts each response to the thread. Watches status file during execution.
 """
 function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
-                         session_id::String; react_ts::String="")
+                         session_id::String; react_ts::String="",
+                         channel_id::String=state.config.slack_channel_id)
     config = state.config
     filter!(!istaskdone, state.active_tasks)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
-        slack_post_message(config, "Busy — please wait."; thread_ts)
+        slack_post_message(config, "Busy — please wait."; thread_ts, channel_id)
         return
     end
 
@@ -301,7 +399,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             while true
                 # Start status file watcher
                 stop_watcher = Ref(false)
-                watcher = @async watch_status_file(config, thread_ts, stop_watcher)
+                watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
                 # Run Claude
                 result = run_claude(current_prompt, config; session_id=current_session)
@@ -313,13 +411,14 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 if !isempty(result.session_id)
                     current_session = result.session_id
                     state.threads[thread_ts] = ThreadSession(
-                        thread_ts, current_session, slack_ts_now(), time())
+                        thread_ts, current_session, slack_ts_now(), time(),
+                        channel_id)
                     save_state!(state)
                 end
 
                 if !result.success
-                    post_response(config, result.result_text, thread_ts)
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x")
+                    post_response(config, result.result_text, thread_ts; channel_id)
+                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                     break
                 end
 
@@ -331,14 +430,14 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 end
 
                 # Post the clean response
-                post_response(config, clean_text, thread_ts)
+                post_response(config, clean_text, thread_ts; channel_id)
 
                 if directive.type == :continue
                     continue_count += 1
                     if continue_count >= config.max_continue
                         slack_post_message(config,
                             "_Reached max continue limit ($(config.max_continue)). Stopping._";
-                            thread_ts)
+                            thread_ts, channel_id)
                         break
                     end
                     @info "SlackClaw: [CONTINUE] #$continue_count in thread $thread_ts"
@@ -353,12 +452,12 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     mins = round(Int, directive.delay_s / 60)
                     slack_post_message(config,
                         "_Scheduled follow-up in $(mins)m._";
-                        thread_ts)
+                        thread_ts, channel_id)
                     @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
                     break
 
                 else  # :done
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "white_check_mark")
+                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
                     break
                 end
             end
@@ -366,8 +465,8 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
             try
                 err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
-                slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts)
-                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x")
+                slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts, channel_id)
+                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
             catch; end
         finally
             delete!(state.busy_threads, thread_ts)
@@ -383,25 +482,27 @@ end
 
 # --- Dispatch: top-level messages ---
 
-function dispatch_command!(state::MonitorState, msg::SlackMessage)
+function dispatch_command!(state::MonitorState, msg::SlackMessage;
+                          channel_id::String=state.config.slack_channel_id)
     config = state.config
     filter!(!istaskdone, state.active_tasks)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config,
             "Busy with $(length(state.active_tasks)) task(s) — please wait.";
-            thread_ts=msg.ts)
+            thread_ts=msg.ts, channel_id)
         return
     end
 
-    slack_add_reaction(config, msg.ts, "eyes")
-    run_agent_loop!(state, msg.ts, msg.text, ""; react_ts=msg.ts)
+    slack_add_reaction(config, msg.ts, "eyes"; channel_id)
+    run_agent_loop!(state, msg.ts, msg.text, ""; react_ts=msg.ts, channel_id)
 end
 
 # --- Dispatch: thread replies ---
 
 function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session::ThreadSession)
     config = state.config
+    ch = session.channel_id
 
     # If thread is busy, report elapsed time
     if haskey(state.busy_threads, session.thread_ts)
@@ -410,12 +511,13 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
         elapsed_str = mins > 0 ? "$(mins)m $(secs)s" : "$(secs)s"
         slack_post_message(config,
             "_Still working... ($(elapsed_str) elapsed)_";
-            thread_ts=session.thread_ts)
+            thread_ts=session.thread_ts, channel_id=ch)
         return
     end
 
-    slack_add_reaction(config, msg.ts, "eyes")
-    run_agent_loop!(state, session.thread_ts, msg.text, session.session_id; react_ts=msg.ts)
+    slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
+    run_agent_loop!(state, session.thread_ts, msg.text, session.session_id;
+                    react_ts=msg.ts, channel_id=ch)
 end
 
 # --- Shutdown ---

@@ -55,15 +55,27 @@ function slack_auth_test(config::SlackClawConfig)
 end
 
 """
-    slack_get_history(config, oldest) -> (Vector{Dict}, Vector{Dict})
+    slack_conversations_info(config, channel_id) -> Dict
+
+Fetch channel metadata. Returns the full channel info dict.
+"""
+function slack_conversations_info(config::SlackClawConfig, channel_id::String)
+    data = slack_request(:get, "conversations.info", config;
+        query=Dict("channel" => channel_id))
+    return data["channel"]
+end
+
+"""
+    slack_get_history(config, oldest; channel_id=config.slack_channel_id) -> Vector{Dict}
 
 Fetch channel messages newer than `oldest` timestamp.
-Returns `(parsed_messages, raw_dicts)` in chronological order (oldest first).
+Returns raw message dicts in chronological order (oldest first).
 """
-function slack_get_history(config::SlackClawConfig, oldest::String)
+function slack_get_history(config::SlackClawConfig, oldest::String;
+                           channel_id::String=config.slack_channel_id)
     data = slack_request(:get, "conversations.history", config;
         query=Dict(
-            "channel" => config.slack_channel_id,
+            "channel" => channel_id,
             "oldest" => oldest,
             "limit" => "100",
         ))
@@ -73,14 +85,16 @@ function slack_get_history(config::SlackClawConfig, oldest::String)
 end
 
 """
-    slack_post_message(config, text; thread_ts="") -> String
+    slack_post_message(config, text; thread_ts="", channel_id=config.slack_channel_id) -> String
 
-Post a message to the configured channel. Returns the message `ts`.
+Post a message to a channel. Returns the message `ts`.
 If `thread_ts` is non-empty, posts as a thread reply.
 """
-function slack_post_message(config::SlackClawConfig, text::String; thread_ts::String="")
+function slack_post_message(config::SlackClawConfig, text::String;
+                            thread_ts::String="",
+                            channel_id::String=config.slack_channel_id)
     body = Dict(
-        "channel" => config.slack_channel_id,
+        "channel" => channel_id,
         "text" => text,
     )
     if !isempty(thread_ts)
@@ -91,15 +105,16 @@ function slack_post_message(config::SlackClawConfig, text::String; thread_ts::St
 end
 
 """
-    slack_get_replies(config, thread_ts, oldest) -> Vector{Dict}
+    slack_get_replies(config, thread_ts, oldest; channel_id=config.slack_channel_id) -> Vector{Dict}
 
 Fetch replies in a thread newer than `oldest`. Returns in chronological order.
 The first message (the thread parent) is always included by the API; we skip it.
 """
-function slack_get_replies(config::SlackClawConfig, thread_ts::String, oldest::String)
+function slack_get_replies(config::SlackClawConfig, thread_ts::String, oldest::String;
+                           channel_id::String=config.slack_channel_id)
     data = slack_request(:get, "conversations.replies", config;
         query=Dict(
-            "channel" => config.slack_channel_id,
+            "channel" => channel_id,
             "ts" => thread_ts,
             "oldest" => oldest,
             "limit" => "100",
@@ -111,13 +126,14 @@ function slack_get_replies(config::SlackClawConfig, thread_ts::String, oldest::S
 end
 
 """
-    slack_add_reaction(config, ts, emoji)
+    slack_add_reaction(config, ts, emoji; channel_id=config.slack_channel_id)
 
 Add an emoji reaction to a message. Silently ignores "already_reacted" errors.
 """
-function slack_add_reaction(config::SlackClawConfig, ts::String, emoji::String)
+function slack_add_reaction(config::SlackClawConfig, ts::String, emoji::String;
+                            channel_id::String=config.slack_channel_id)
     body = Dict(
-        "channel" => config.slack_channel_id,
+        "channel" => channel_id,
         "timestamp" => ts,
         "name" => emoji,
     )
