@@ -15,9 +15,11 @@ julia --project -e "using Pkg; Pkg.test()"
 # Run tests directly
 julia --project test/runtests.jl
 
-# Start the monitor
+# Start the monitor (requires SLACK_BOT_TOKEN and SLACK_CHANNEL_ID env vars)
 julia --project -e "using SlackClaw; run_monitor(SlackClawConfig())"
 ```
+
+Tests cover pure logic (directive parsing, message filtering, Claude output parsing, config defaults). Slack API and monitor loop are not tested (would require mocking).
 
 ## Required Environment
 
@@ -32,7 +34,7 @@ Six source files, all included from `SlackClaw.jl`:
 - **message_types.jl** — `SlackMessage` struct; `parse_slack_messages()` and `should_process()` filtering (skips bots, self, empty)
 - **directives.jl** — Agent control flow: `parse_directives()` extracts `[CONTINUE]`/`[SCHEDULE: duration: prompt]`/done from response text via regex
 - **slack_api.jl** — HTTP wrappers for Slack Web API with rate-limit retry (exponential backoff). All channel-scoped functions accept an explicit `channel_id` kwarg (defaults to `config.slack_channel_id`)
-- **claude_runner.jl** — `run_claude()` spawns `claude --print --output-format json` subprocess; returns `ClaudeResult` (success, text, cost, session_id). Filters `CLAUDE_*` env vars from subprocess.
+- **claude_runner.jl** — `run_claude()` spawns `claude --print --output-format json --dangerously-skip-permissions` subprocess; returns `ClaudeResult` (success, text, cost, session_id). Strips all `CLAUDE_*` env vars from subprocess environment to prevent session leakage. Appends `DIRECTIVE_INSTRUCTIONS` to system prompt when `agent_directives` is enabled.
 - **monitor.jl** — Core polling loop and agent loop. Contains `MonitorState`, `ThreadSession`, `ScheduledTask`, persistence via `.slackclaw_state.json`. `ThreadSession` carries `channel_id` for multi-channel thread tracking
 
 ### Data Flow
