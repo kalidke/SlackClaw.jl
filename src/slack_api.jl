@@ -55,6 +55,17 @@ function slack_auth_test(config::SlackClawConfig)
 end
 
 """
+    slack_conversations_info(config, channel_id) -> Dict
+
+Fetch channel metadata. Returns the full channel info dict.
+"""
+function slack_conversations_info(config::SlackClawConfig, channel_id::String)
+    data = slack_request(:get, "conversations.info", config;
+        query=Dict("channel" => channel_id))
+    return data["channel"]
+end
+
+"""
     slack_get_history(config, oldest; channel_id=config.slack_channel_id) -> Vector{Dict}
 
 Fetch channel messages newer than `oldest` timestamp.

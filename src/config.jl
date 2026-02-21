@@ -23,4 +23,5 @@ If a task will take more than a few seconds, first reply with a brief message ex
     status_file::String = ".slackclaw_status"
     status_poll_s::Int = 30             # how often to check status file during execution
     bot_user_id::String = ""
+    listen_channel_ids::Vector{String} = String[]  # channels to poll (listen-only, respond in primary)
 end
