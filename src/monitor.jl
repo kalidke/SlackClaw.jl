@@ -374,6 +374,7 @@ function poll_threads!(state::MonitorState)
             @error "SlackClaw thread poll error" thread_ts exception=(e, catch_backtrace())
         end
     end
+    save_state!(state)
     expire_threads!(state)
 end
 
