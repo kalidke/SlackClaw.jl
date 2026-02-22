@@ -295,7 +295,11 @@ function poll_listen_channels!(state::MonitorState)
     end
 end
 
-"""Dispatch a message from a listen channel -- post response in primary channel."""
+const LISTEN_RELEVANCE_PREFIX = """You are monitoring a shared Slack channel for messages relevant to your repo/role. \
+If the following message is NOT relevant to your project, respond with exactly "[SKIP]" and nothing else. \
+If it IS relevant, respond normally.\n\n"""
+
+"""Dispatch a message from a listen channel -- only post to primary channel if Claude deems it relevant."""
 function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_name::String)
     config = state.config
     filter!(!istaskdone, state.active_tasks)
@@ -305,11 +309,39 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
         return
     end
 
-    # Post a new thread in the primary channel with the listen channel context
     primary = config.slack_channel_id
-    header = "_Message from #$(ch_name):_\n> $(msg.text)"
-    thread_ts = slack_post_message(config, header; channel_id=primary)
-    run_agent_loop!(state, thread_ts, msg.text, ""; channel_id=primary)
+
+    # Run Claude first to check relevance before posting anything
+    task = @async begin
+        try
+            relevance_prompt = LISTEN_RELEVANCE_PREFIX * msg.text
+            result = run_claude(relevance_prompt, config)
+
+            # Skip if Claude says not relevant, errored, or empty
+            response_text = strip(result.result_text)
+            if !result.success || isempty(response_text) || startswith(response_text, "[SKIP]")
+                @info "SlackClaw: listen message skipped (not relevant)" channel=ch_name
+                return
+            end
+
+            # Relevant — post header + response as a new thread in primary channel
+            header = "_Message from #$(ch_name):_\n> $(msg.text)"
+            thread_ts = slack_post_message(config, header; channel_id=primary)
+            post_response(config, response_text, thread_ts; channel_id=primary)
+
+            # Track the thread for follow-up replies
+            if !isempty(result.session_id)
+                state.threads[thread_ts] = ThreadSession(
+                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
+                save_state!(state)
+            end
+        catch e
+            @error "SlackClaw listen dispatch error" channel=ch_name exception=(e, catch_backtrace())
+        end
+    end
+
+    push!(state.active_tasks, task)
+    return nothing
 end
 
 # --- Thread polling ---
@@ -429,8 +461,10 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     (DIRECTIVE_DONE, result.result_text)
                 end
 
-                # Post the clean response
-                post_response(config, clean_text, thread_ts; channel_id)
+                # Post the clean response (directive-only messages leave clean_text empty)
+                if !isempty(strip(clean_text))
+                    post_response(config, clean_text, thread_ts; channel_id)
+                end
 
                 if directive.type == :continue
                     continue_count += 1
