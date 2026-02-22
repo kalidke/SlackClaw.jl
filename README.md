@@ -138,7 +138,10 @@ All options are fields on `SlackClawConfig`:
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
 | `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
 | `allowed_tools` | `[]` | Restrict Claude to specific tools |
-| `listen_channel_ids` | `[]` | Channels to poll read-only (responses go to primary channel) |
+| `listen_channel_ids` | `[]` | Channels to poll read-only (relevance-filtered, responses go to primary channel) |
+| `proactive_enabled` | `false` | Enable periodic autonomous checks |
+| `proactive_prompt` | `""` | Prompt with suggestions for proactive actions |
+| `proactive_interval_s` | `3600` | Seconds between proactive checks |
 
 ## How It Works
 
@@ -147,8 +150,9 @@ All options are fields on `SlackClawConfig`:
 3. **React** — Adds emoji reactions: :eyes: (processing), :white_check_mark: (success), :x: (error)
 4. **Thread** — All responses go to the message thread, preserving conversation context
 5. **Resume** — Thread replies continue the same Claude session via `--resume`
-6. **Listen** — Messages from listen channels are quoted in the primary channel and processed there
-7. **Persist** — Sessions and scheduled tasks survive restarts (saved to `.slackclaw_state.json`)
+6. **Listen** — Messages from listen channels are relevance-filtered (irrelevant messages silently skipped) and posted to the primary channel
+7. **Proactive** — Periodically runs autonomous checks and posts if something noteworthy is found
+8. **Persist** — Sessions, scheduled tasks, and proactive timestamps survive restarts (saved to `.slackclaw_state.json`)
 
 ### Agent Directives
 
@@ -173,6 +177,37 @@ run_monitor(SlackClawConfig(
 ```
 
 Channel names are resolved via the Slack API on startup and cached for the session. The bot must be invited to each listen channel. Polls are staggered between channels to stay within Slack rate limits.
+
+Listen channels use a relevance filter: Claude is asked whether each message is relevant to the instance's repo before posting. Irrelevant messages are silently dropped.
+
+### Proactive Mode
+
+When enabled, SlackClaw periodically runs Claude to autonomously check for things worth reporting. Claude reads two files in `repo_dir` at runtime:
+
+- **`.slackclaw_proactive_tasks`** — what to check (task suggestions). Editable anytime without restart.
+- **`.slackclaw_proactive_log`** — what was already reported (auto-appended). Prevents repetition.
+
+If nothing is noteworthy, Claude responds `[SKIP]` and stays silent.
+
+```julia
+run_monitor(SlackClawConfig(
+    proactive_enabled = true,
+    proactive_interval_s = 3600,        # check every hour
+))
+```
+
+Task suggestions go in `.slackclaw_proactive_tasks` (created by the orchestrator or manually):
+```
+- Check for open PRs that need review
+- Summarize notable recent commits
+- Check if any CI pipelines are failing
+```
+
+The `proactive_prompt` config field can provide additional inline instructions if needed, but task suggestions should go in the file for hot-reload support.
+
+Frequency can be adjusted dynamically via Slack messages:
+- `proactive every 30m` — change interval
+- `proactive off` / `proactive on` — toggle
 
 ## Running as a Service
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-SlackClaw is a Julia package that bridges Slack channels to Claude Code. It polls Slack channels for messages, dispatches them to the Claude CLI as subprocesses, and posts results back to threads. Supports multi-turn sessions, agent directives (`[CONTINUE]`/`[SCHEDULE]`), concurrent tasks, multi-channel listening, status file watching, and state persistence across restarts.
+SlackClaw is a Julia package that bridges Slack channels to Claude Code. It polls Slack channels for messages, dispatches them to the Claude CLI as subprocesses, and posts results back to threads. Supports multi-turn sessions, agent directives (`[CONTINUE]`/`[SCHEDULE]`), concurrent tasks, multi-channel listening, proactive mode, status file watching, and state persistence across restarts.
 
 ## Commands
 
@@ -41,9 +41,10 @@ Six source files, all included from `SlackClaw.jl`:
 
 1. `poll_once!()` fetches new channel messages → parses/filters → `dispatch_command!()` for each
 2. Also polls tracked thread sessions for replies → `dispatch_thread_reply!()`
-3. Polls listen channels → `poll_listen_channels!()` → `dispatch_listen_command!()` (posts to primary channel)
+3. Polls listen channels → `poll_listen_channels!()` → `dispatch_listen_command!()` (relevance-filtered, posts to primary channel only if relevant)
 4. Checks and fires due `ScheduledTask`s
-5. `dispatch_command!()` adds eyes reaction, calls `run_agent_loop!()` as `@async` task
+5. `check_proactive!()` runs periodic autonomous checks if enabled
+6. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds eyes reaction and calls `run_agent_loop!()` as `@async` task
 6. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break
 7. Status file (`.slackclaw_status`) watched in background during execution, updates posted to thread
 
@@ -53,12 +54,25 @@ Each dispatch spawns an `@async` Task. Max `max_concurrent_tasks` (default 5) en
 
 ### Multi-Channel Listening
 
-`listen_channel_ids` configures channels to poll read-only. Messages from listen channels are prefixed with `[from #channel-name]` and dispatched as new threads in the primary channel. Channel names are resolved via `conversations.info` on startup and cached. Polls are staggered (0.5s between channels) to avoid rate limits.
+`listen_channel_ids` configures channels to poll read-only. Messages from listen channels are prefixed with `[from #channel-name]` and run through a relevance filter: Claude is asked to respond `[SKIP]` if the message isn't relevant to the instance's repo/role. Only relevant messages get posted as new threads in the primary channel. Channel names are resolved via `conversations.info` on startup and cached. Polls are staggered (0.5s between channels) to avoid rate limits.
+
+### Proactive Mode
+
+When `proactive_enabled=true`, `check_proactive!()` fires every `proactive_interval_s` (default 3600s/1h). Fires when either `proactive_prompt` is non-empty or `.slackclaw_proactive_tasks` exists in `repo_dir`. Claude reads two files at runtime:
+
+- **`.slackclaw_proactive_tasks`** — task suggestions (what to check). Written by the orchestrator at launch, editable anytime without restart. Claude reads this each cycle for current ideas.
+- **`.slackclaw_proactive_log`** — post history (what was already reported). Appended automatically after each real post. Claude reads this to avoid repetition.
+
+Behavioral rules (`[SKIP]` convention, conciseness) live in `PROACTIVE_PREFIX` constant. The `proactive_prompt` config string is appended if non-empty (backward compat / inline overrides). Only real content gets posted as a top-level message in the primary channel.
+
+Dynamic control via Slack messages in the monitored channel:
+- `proactive every 30m` / `proactive interval 2h` — adjust frequency
+- `proactive on` / `proactive off` — toggle
 
 ### Persistence
 
-State saved to `.slackclaw_state.json` in `repo_dir`: `last_ts`, thread sessions (with `channel_id`), scheduled tasks, and `listen_last_ts` per listen channel. Loaded on startup. Migrates legacy `.slackclaw_threads.json` format.
+State saved to `.slackclaw_state.json` in `repo_dir`: `last_ts`, thread sessions (with `channel_id`), scheduled tasks, `listen_last_ts` per listen channel, and `last_proactive` timestamp. Loaded on startup. Migrates legacy `.slackclaw_threads.json` format.
 
 ## Dependencies
 
-Only `HTTP` and `JSON`. Julia >= 1.10.
+`HTTP`, `JSON`, and `Dates` (stdlib). Julia >= 1.10.
