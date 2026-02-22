@@ -130,8 +130,8 @@ function slack_ts_now()
 end
 
 """Post a response to Slack, truncating if needed."""
-function post_response(config::SlackClawConfig, text::String, thread_ts::String;
-                       channel_id::String=config.slack_channel_id)
+function post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
+                       channel_id::AbstractString=config.slack_channel_id)
     if length(text) > SLACK_MAX_TEXT
         text = text[1:SLACK_MAX_TEXT] * "\n\n_(truncated)_"
     end
