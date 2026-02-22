@@ -176,6 +176,9 @@ end
     @test cfg.max_budget_usd == 0.0
     @test cfg.model == ""
     @test cfg.bot_user_id == ""
+    @test cfg.proactive_enabled == false
+    @test cfg.proactive_prompt == ""
+    @test cfg.proactive_interval_s == 3600
 end
 
 end

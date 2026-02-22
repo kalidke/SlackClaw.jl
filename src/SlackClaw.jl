@@ -1,5 +1,6 @@
 module SlackClaw
 
+using Dates
 using HTTP
 using JSON
 

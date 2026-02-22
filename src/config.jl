@@ -23,4 +23,7 @@ Base.@kwdef mutable struct SlackClawConfig
     status_poll_s::Int = 30             # how often to check status file during execution
     bot_user_id::String = ""
     listen_channel_ids::Vector{String} = String[]  # channels to poll (listen-only, respond in primary)
+    proactive_enabled::Bool = false                 # enable periodic proactive checks
+    proactive_prompt::String = ""                   # prompt with suggestions for proactive actions
+    proactive_interval_s::Int = 3600                # seconds between proactive checks (default 1h)
 end

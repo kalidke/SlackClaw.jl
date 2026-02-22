@@ -31,6 +31,7 @@ mutable struct MonitorState
     scheduled::Vector{ScheduledTask}     # pending scheduled tasks
     listen_last_ts::Dict{String,String}  # channel_id -> last_ts for listen channels
     channel_names::Dict{String,String}   # channel_id -> display name (cached)
+    last_proactive::Float64              # time() of last proactive check
 end
 
 const SLACK_MAX_TEXT = 3900
@@ -62,19 +63,21 @@ function save_state!(state::MonitorState)
         "threads" => threads_data,
         "scheduled" => scheduled_data,
         "listen_last_ts" => state.listen_last_ts,
+        "last_proactive" => state.last_proactive,
     )
     open(path, "w") do io
         JSON.print(io, data)
     end
 end
 
-"""Load persisted state from disk. Returns (threads, last_ts, scheduled, listen_last_ts)."""
+"""Load persisted state from disk. Returns (threads, last_ts, scheduled, listen_last_ts, last_proactive)."""
 function load_state(config::SlackClawConfig)
     path = joinpath(config.repo_dir, STATE_FILE)
     threads = Dict{String,ThreadSession}()
     last_ts = ""
     scheduled = ScheduledTask[]
     listen_last_ts = Dict{String,String}()
+    last_proactive = 0.0
 
     # Migrate old threads-only file if it exists
     old_path = joinpath(config.repo_dir, ".slackclaw_threads.json")
@@ -88,14 +91,15 @@ function load_state(config::SlackClawConfig)
                     config.slack_channel_id)
             end
             @info "SlackClaw: migrated $(length(threads)) thread(s) from old format"
-            return threads, last_ts, scheduled, listen_last_ts
+            return threads, last_ts, scheduled, listen_last_ts, last_proactive
         catch; end
     end
 
-    isfile(path) || return threads, last_ts, scheduled, listen_last_ts
+    isfile(path) || return threads, last_ts, scheduled, listen_last_ts, last_proactive
     try
         data = JSON.parsefile(path)
         last_ts = get(data, "last_ts", "")
+        last_proactive = get(data, "last_proactive", 0.0)
         for (ts, d) in get(data, "threads", Dict())
             threads[ts] = ThreadSession(
                 d["thread_ts"], d["session_id"],
@@ -116,7 +120,7 @@ function load_state(config::SlackClawConfig)
     catch e
         @warn "SlackClaw: failed to load state file" exception=e
     end
-    return threads, last_ts, scheduled, listen_last_ts
+    return threads, last_ts, scheduled, listen_last_ts, last_proactive
 end
 
 # --- Utilities ---
@@ -168,7 +172,7 @@ function start_monitor(config::SlackClawConfig)
     config.bot_user_id = slack_auth_test(config)
     @info "SlackClaw: bot user ID = $(config.bot_user_id)"
 
-    threads, persisted_ts, scheduled, listen_last_ts = load_state(config)
+    threads, persisted_ts, scheduled, listen_last_ts, last_proactive = load_state(config)
     last_ts = isempty(persisted_ts) ? slack_ts_now() : persisted_ts
 
     # Resolve channel names for listen channels
@@ -190,13 +194,15 @@ function start_monitor(config::SlackClawConfig)
 
     state = MonitorState(config, last_ts, true, Task[], nothing, threads,
                          Dict{String,Float64}(), scheduled, listen_last_ts,
-                         channel_names)
+                         channel_names, last_proactive)
 
     info_parts = ["Repo: `$(config.repo_dir)`"]
     !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
     config.agent_directives && push!(info_parts, "Agent mode")
     !isempty(config.listen_channel_ids) && push!(info_parts,
         "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
+    config.proactive_enabled && push!(info_parts,
+        "Proactive: every $(div(config.proactive_interval_s, 60))m")
     slack_post_message(config,
         "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
 
@@ -257,6 +263,9 @@ function poll_once!(state::MonitorState)
 
     # 4. Scheduled tasks
     check_scheduled!(state)
+
+    # 5. Proactive check
+    check_proactive!(state)
 end
 
 # --- Listen channel polling ---
@@ -401,6 +410,86 @@ function check_scheduled!(state::MonitorState)
     end
 end
 
+# --- Proactive mode ---
+
+const PROACTIVE_LOG_FILE = ".slackclaw_proactive_log"
+
+const PROACTIVE_PREFIX = """You are running a proactive check. Review the suggestions below \
+and decide if there is anything noteworthy to report right now. \
+If nothing is worth posting, respond with exactly "[SKIP]" and nothing else. \
+Only post if you have something genuinely useful or interesting.
+
+Before responding, read the proactive log file at "%LOG_PATH%" to see what you have \
+posted recently. Do not repeat or re-report things already in the log. \
+If you do post something, keep it concise.
+
+"""
+
+"""Check if a proactive run is due, and if so, run Claude with the proactive prompt."""
+function check_proactive!(state::MonitorState)
+    config = state.config
+    config.proactive_enabled || return
+    isempty(config.proactive_prompt) && return
+
+    now = time()
+    elapsed = now - state.last_proactive
+    elapsed >= config.proactive_interval_s || return
+
+    filter!(!istaskdone, state.active_tasks)
+    if length(state.active_tasks) >= config.max_concurrent_tasks
+        @info "SlackClaw: skipping proactive check (busy)"
+        return
+    end
+
+    state.last_proactive = now
+    save_state!(state)
+
+    primary = config.slack_channel_id
+    log_path = joinpath(config.repo_dir, PROACTIVE_LOG_FILE)
+
+    task = @async begin
+        try
+            prefix = replace(PROACTIVE_PREFIX, "%LOG_PATH%" => log_path)
+            prompt = prefix * config.proactive_prompt
+            result = run_claude(prompt, config)
+
+            response_text = strip(result.result_text)
+            if !result.success || isempty(response_text) || startswith(response_text, "[SKIP]")
+                @info "SlackClaw: proactive check — nothing to report"
+                return
+            end
+
+            # Post as new top-level message in primary channel
+            thread_ts = slack_post_message(config, response_text; channel_id=primary)
+
+            # Append to proactive log
+            try
+                ts_str = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM")
+                # Truncate response to a one-liner for the log
+                summary = first(response_text, 200)
+                summary = replace(summary, '\n' => ' ')
+                open(log_path, "a") do io
+                    println(io, "[$ts_str] $summary")
+                end
+            catch; end
+
+            # Track thread for follow-up replies
+            if !isempty(result.session_id)
+                state.threads[thread_ts] = ThreadSession(
+                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
+                save_state!(state)
+            end
+
+            @info "SlackClaw: proactive check posted to channel"
+        catch e
+            @error "SlackClaw proactive check error" exception=(e, catch_backtrace())
+        end
+    end
+
+    push!(state.active_tasks, task)
+    return nothing
+end
+
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
@@ -519,6 +608,26 @@ end
 function dispatch_command!(state::MonitorState, msg::SlackMessage;
                           channel_id::String=state.config.slack_channel_id)
     config = state.config
+
+    # Dynamic proactive frequency adjustment
+    m = match(r"proactive\s+(?:every|interval)\s+(\d+[hm]\w*)"i, msg.text)
+    if m !== nothing
+        new_interval = parse_duration(String(m.captures[1]))
+        config.proactive_interval_s = new_interval
+        mins = div(new_interval, 60)
+        slack_post_message(config, "_Proactive interval set to $(mins)m._";
+            thread_ts=msg.ts, channel_id)
+        return
+    end
+    m = match(r"proactive\s+(on|off)"i, msg.text)
+    if m !== nothing
+        config.proactive_enabled = lowercase(m.captures[1]) == "on"
+        status = config.proactive_enabled ? "enabled" : "disabled"
+        slack_post_message(config, "_Proactive mode $(status)._";
+            thread_ts=msg.ts, channel_id)
+        return
+    end
+
     filter!(!istaskdone, state.active_tasks)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
