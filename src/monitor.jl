@@ -413,14 +413,15 @@ end
 # --- Proactive mode ---
 
 const PROACTIVE_LOG_FILE = ".slackclaw_proactive_log"
+const PROACTIVE_TASKS_FILE = ".slackclaw_proactive_tasks"
 
-const PROACTIVE_PREFIX = """You are running a proactive check. Review the suggestions below \
-and decide if there is anything noteworthy to report right now. \
+const PROACTIVE_PREFIX = """You are running a proactive check. \
 If nothing is worth posting, respond with exactly "[SKIP]" and nothing else. \
 Only post if you have something genuinely useful or interesting.
 
-Before responding, read the proactive log file at "%LOG_PATH%" to see what you have \
-posted recently. Do not repeat or re-report things already in the log. \
+Read the proactive tasks file at "%TASKS_PATH%" for your current task suggestions. \
+Read the proactive log file at "%LOG_PATH%" to see what you have posted recently. \
+Do not repeat or re-report things already in the log. \
 If you do post something, keep it concise.
 
 """
@@ -429,7 +430,8 @@ If you do post something, keep it concise.
 function check_proactive!(state::MonitorState)
     config = state.config
     config.proactive_enabled || return
-    isempty(config.proactive_prompt) && return
+    tasks_path = joinpath(config.repo_dir, PROACTIVE_TASKS_FILE)
+    isempty(config.proactive_prompt) && !isfile(tasks_path) && return
 
     now = time()
     elapsed = now - state.last_proactive
@@ -449,8 +451,11 @@ function check_proactive!(state::MonitorState)
 
     task = @async begin
         try
-            prefix = replace(PROACTIVE_PREFIX, "%LOG_PATH%" => log_path)
-            prompt = prefix * config.proactive_prompt
+            prefix = replace(replace(PROACTIVE_PREFIX,
+                "%LOG_PATH%" => log_path),
+                "%TASKS_PATH%" => tasks_path)
+            prompt = prefix
+            !isempty(config.proactive_prompt) && (prompt *= config.proactive_prompt)
             result = run_claude(prompt, config)
 
             response_text = strip(result.result_text)
