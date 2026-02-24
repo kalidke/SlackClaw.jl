@@ -528,8 +528,11 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 stop_watcher = Ref(false)
                 watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
-                # Run Claude
-                result = run_claude(current_prompt, config; session_id=current_session)
+                # Run Claude (pass thread context for file upload support)
+                result = run_claude(current_prompt, config;
+                    session_id=current_session,
+                    thread_ts=thread_ts,
+                    channel_id=channel_id)
 
                 # Stop watcher
                 stop_watcher[] = true

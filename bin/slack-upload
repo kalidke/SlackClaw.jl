@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# slack-upload: Upload a file to a Slack channel/thread via files.uploadV2 (3-step flow).
+#
+# Usage: slack-upload <file_path> [comment]
+#
+# Required env vars (set automatically by SlackClaw):
+#   SLACKCLAW_BOT_TOKEN   - Slack bot token
+#   SLACKCLAW_CHANNEL_ID  - Target channel
+#   SLACKCLAW_THREAD_TS   - Thread timestamp (for threaded reply)
+#
+# Optional:
+#   SLACKCLAW_UPLOAD_COMMENT - Default comment (overridden by $2)
+
+set -euo pipefail
+
+FILE_PATH="${1:?Usage: slack-upload <file_path> [comment]}"
+COMMENT="${2:-${SLACKCLAW_UPLOAD_COMMENT:-}}"
+
+# Validate
+[[ -f "$FILE_PATH" ]] || { echo "Error: file not found: $FILE_PATH" >&2; exit 1; }
+[[ -n "${SLACKCLAW_BOT_TOKEN:-}" ]] || { echo "Error: SLACKCLAW_BOT_TOKEN not set" >&2; exit 1; }
+[[ -n "${SLACKCLAW_CHANNEL_ID:-}" ]] || { echo "Error: SLACKCLAW_CHANNEL_ID not set" >&2; exit 1; }
+[[ -n "${SLACKCLAW_THREAD_TS:-}" ]] || { echo "Error: SLACKCLAW_THREAD_TS not set" >&2; exit 1; }
+
+FILENAME=$(basename "$FILE_PATH")
+FILESIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+AUTH="Authorization: Bearer $SLACKCLAW_BOT_TOKEN"
+
+# URL-encode the filename (replace spaces, special chars)
+ENCODED_FILENAME=$(printf '%s' "$FILENAME" | jq -sRr @uri)
+
+# Step 1: Get upload URL
+RESP=$(curl -s -X GET \
+    -H "$AUTH" \
+    "https://slack.com/api/files.getUploadURLExternal?filename=${ENCODED_FILENAME}&length=${FILESIZE}")
+
+OK=$(echo "$RESP" | jq -r '.ok')
+if [[ "$OK" != "true" ]]; then
+    ERR=$(echo "$RESP" | jq -r '.error // "unknown"')
+    echo "Error: files.getUploadURLExternal failed: $ERR" >&2
+    exit 1
+fi
+
+UPLOAD_URL=$(echo "$RESP" | jq -r '.upload_url')
+FILE_ID=$(echo "$RESP" | jq -r '.file_id')
+
+# Step 2: Upload file bytes to the pre-signed URL
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -F "file=@${FILE_PATH}" \
+    "$UPLOAD_URL")
+
+if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+    echo "Error: file upload returned HTTP $HTTP_CODE" >&2
+    exit 1
+fi
+
+# Step 3: Complete upload and share to channel/thread
+COMPLETE_BODY=$(jq -n \
+    --arg file_id "$FILE_ID" \
+    --arg title "$FILENAME" \
+    --arg channel "$SLACKCLAW_CHANNEL_ID" \
+    --arg thread "$SLACKCLAW_THREAD_TS" \
+    --arg comment "$COMMENT" \
+    '{
+        files: [{id: $file_id, title: $title}],
+        channel_id: $channel,
+        thread_ts: $thread
+    } + (if $comment != "" then {initial_comment: $comment} else {} end)')
+
+RESP=$(curl -s -X POST \
+    -H "$AUTH" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    -d "$COMPLETE_BODY" \
+    "https://slack.com/api/files.completeUploadExternal")
+
+OK=$(echo "$RESP" | jq -r '.ok')
+if [[ "$OK" != "true" ]]; then
+    ERR=$(echo "$RESP" | jq -r '.error // "unknown"')
+    echo "Error: files.completeUploadExternal failed: $ERR" >&2
+    exit 1
+fi
+
+echo "Uploaded $FILENAME to thread $SLACKCLAW_THREAD_TS"

@@ -14,7 +14,10 @@ end
 
 Run `claude` CLI in `--print` mode with JSON output. Blocks until complete or timeout.
 """
-function run_claude(prompt::String, config::SlackClawConfig; session_id::String="")
+function run_claude(prompt::String, config::SlackClawConfig;
+                    session_id::String="",
+                    thread_ts::String="",
+                    channel_id::String="")
     args = String[
         "claude", "-p", prompt,
         "--print",
@@ -49,6 +52,23 @@ function run_claude(prompt::String, config::SlackClawConfig; session_id::String=
 
     # Build clean environment without Claude session vars
     filtered_env = String["$(k)=$(v)" for (k, v) in ENV if !startswith(k, "CLAUDE")]
+
+    # Inject SlackClaw context for file upload support
+    if !isempty(thread_ts)
+        push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")
+    end
+    if !isempty(channel_id)
+        push!(filtered_env, "SLACKCLAW_CHANNEL_ID=$channel_id")
+    end
+    if !isempty(config.slack_bot_token)
+        push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
+    end
+    # Path to the upload helper script (sibling to this package's src/)
+    upload_bin = normpath(joinpath(@__DIR__, "..", "bin", "slack-upload"))
+    if isfile(upload_bin)
+        push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
+    end
+
     cmd = setenv(`$args`, filtered_env; dir=config.repo_dir)
 
     t_start = time()

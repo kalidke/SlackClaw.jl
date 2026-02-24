@@ -126,6 +126,48 @@ function slack_get_replies(config::SlackClawConfig, thread_ts::AbstractString, o
 end
 
 """
+    slack_upload_file(config, file_path; thread_ts="", channel_id=config.slack_channel_id,
+                      title="", initial_comment="") -> Dict
+
+Upload a file to Slack using the V2 three-step flow:
+1. `files.getUploadURLExternal` — get pre-signed upload URL
+2. POST file bytes to the upload URL
+3. `files.completeUploadExternal` — finalize and share to channel/thread
+"""
+function slack_upload_file(config::SlackClawConfig, file_path::AbstractString;
+                           thread_ts::AbstractString="",
+                           channel_id::AbstractString=config.slack_channel_id,
+                           title::AbstractString="",
+                           initial_comment::AbstractString="")
+    isfile(file_path) || error("slack_upload_file: file not found: $file_path")
+    filename = basename(file_path)
+    filesize = stat(file_path).size
+    disp_title = isempty(title) ? filename : title
+
+    # Step 1: Get upload URL
+    data = slack_request(:get, "files.getUploadURLExternal", config;
+        query=Dict("filename" => filename, "length" => string(filesize)))
+    upload_url = data["upload_url"]
+    file_id = data["file_id"]
+
+    # Step 2: Upload file bytes (multipart POST to pre-signed URL, not Slack API)
+    file_bytes = read(file_path)
+    form = HTTP.Form(Dict("file" => HTTP.Multipart(filename, IOBuffer(file_bytes))))
+    resp = HTTP.post(upload_url; body=form, status_exception=false)
+    resp.status in 200:299 || error("slack_upload_file: upload returned HTTP $(resp.status)")
+
+    # Step 3: Complete upload and share
+    complete_body = Dict{String,Any}(
+        "files" => [Dict("id" => file_id, "title" => disp_title)],
+        "channel_id" => channel_id,
+    )
+    !isempty(thread_ts) && (complete_body["thread_ts"] = thread_ts)
+    !isempty(initial_comment) && (complete_body["initial_comment"] = initial_comment)
+
+    return slack_request(:post, "files.completeUploadExternal", config; body=complete_body)
+end
+
+"""
     slack_add_reaction(config, ts, emoji; channel_id=config.slack_channel_id)
 
 Add an emoji reaction to a message. Silently ignores "already_reacted" errors.
