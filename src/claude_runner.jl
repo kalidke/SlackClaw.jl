@@ -119,16 +119,24 @@ end
     parse_claude_output(output::String, duration_ms::Int) -> ClaudeResult
 
 Parse JSON output from `claude --print --output-format json`.
+The CLI returns a JSON array of event objects; the result is in the last
+entry with `"type" => "result"`.
 """
 function parse_claude_output(output::String, duration_ms::Int)
     try
         data = JSON.parse(output)
-        result_text = get(data, "result", "")
-        is_error = get(data, "is_error", false)
-        cost = get(data, "total_cost_usd", 0.0)
-        session_id = get(data, "session_id", "")
-        # duration_ms from CLI if available, else use our measurement
-        cli_duration = get(data, "duration_ms", duration_ms)
+        # CLI returns a JSON array — find the result entry
+        entry = if data isa Vector
+            idx = findlast(d -> d isa Dict && get(d, "type", "") == "result", data)
+            idx === nothing ? Dict() : data[idx]
+        else
+            data  # legacy single-object format
+        end
+        result_text = get(entry, "result", "")
+        is_error = get(entry, "is_error", false)
+        cost = get(entry, "total_cost_usd", 0.0)
+        session_id = get(entry, "session_id", "")
+        cli_duration = get(entry, "duration_ms", duration_ms)
         return ClaudeResult(!is_error, result_text, cli_duration, cost, session_id)
     catch
         # Not valid JSON -- treat raw output as the result

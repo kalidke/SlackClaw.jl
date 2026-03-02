@@ -384,7 +384,13 @@ function expire_threads!(state::MonitorState)
     sorted = sort(collect(values(state.threads)); by=s -> s.created)
     to_remove = length(sorted) - max
     for i in 1:to_remove
-        delete!(state.threads, sorted[i].thread_ts)
+        s = sorted[i]
+        try
+            slack_post_message(state.config,
+                "_Thread closed — I can only track $(max) threads at a time. Start a new thread to continue._";
+                thread_ts=s.thread_ts, channel_id=s.channel_id)
+        catch; end
+        delete!(state.threads, s.thread_ts)
     end
     @info "SlackClaw: expired $to_remove old thread(s)"
     save_state!(state)
@@ -562,6 +568,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # Post the clean response (directive-only messages leave clean_text empty)
                 if !isempty(strip(clean_text))
                     post_response(config, clean_text, thread_ts; channel_id)
+                elseif directive.type == :done
+                    # Claude did work (tool use) but produced no text response
+                    post_response(config, "_Done — changes applied._", thread_ts; channel_id)
                 end
 
                 if directive.type == :continue
