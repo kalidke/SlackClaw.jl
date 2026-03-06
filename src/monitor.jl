@@ -211,23 +211,34 @@ function start_monitor(config::SlackClawConfig)
 end
 
 function run_monitor(config::SlackClawConfig)
-    state = start_monitor(config)
+    crash_log = joinpath(config.repo_dir, ".slackclaw_crash.log")
     try
-        while state.running
-            try
-                poll_once!(state)
-            catch e
-                @error "SlackClaw poll error" exception=(e, catch_backtrace())
+        state = start_monitor(config)
+        try
+            while state.running
+                try
+                    poll_once!(state)
+                catch e
+                    @error "SlackClaw poll error" exception=(e, catch_backtrace())
+                end
+                for _ in 1:state.config.poll_interval_s
+                    state.running || break
+                    sleep(1)
+                end
             end
-            for _ in 1:state.config.poll_interval_s
-                state.running || break
-                sleep(1)
-            end
+        catch e
+            e isa InterruptException || rethrow()
+        finally
+            stop_monitor!(state)
         end
     catch e
-        e isa InterruptException || rethrow()
-    finally
-        stop_monitor!(state)
+        open(crash_log, "a") do io
+            println(io, "\n=== CRASH $(Dates.now()) ===")
+            showerror(io, e, catch_backtrace())
+            println(io)
+        end
+        @error "SlackClaw crashed — see $crash_log"
+        rethrow()
     end
 end
 
