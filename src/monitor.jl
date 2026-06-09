@@ -20,6 +20,11 @@ mutable struct ScheduledTask
     due_at::Float64  # time() when this should fire
 end
 
+"""
+Runtime state of a monitor: cursors, tracked threads, scheduled tasks, and
+the active task list. Created by [`start_monitor`](@ref); persisted to
+`.slackclaw_state.json` in `repo_dir` across restarts.
+"""
 mutable struct MonitorState
     config::SlackClawConfig
     last_ts::String
@@ -230,6 +235,15 @@ end
 
 # --- Core loop ---
 
+"""
+    start_monitor(config::SlackClawConfig) -> MonitorState
+
+Authenticate with Slack, load persisted state, resolve listen-channel names,
+and post the startup banner. Returns the [`MonitorState`](@ref) without
+entering a message loop — use [`run_monitor`](@ref) for the blocking
+entry point, or drive `poll_once!` yourself and call
+[`stop_monitor!`](@ref) when done.
+"""
 function start_monitor(config::SlackClawConfig)
     @info "SlackClaw: authenticating with Slack..."
     config.bot_user_id = slack_auth_test(config)
@@ -278,6 +292,16 @@ function start_monitor(config::SlackClawConfig)
     return state
 end
 
+"""
+    run_monitor(config::SlackClawConfig)
+
+Blocking main entry point. Starts the monitor and serves messages until
+interrupted (Ctrl-C): with `config.socket_mode == false` (default) this is
+the timer-driven poll loop; with `socket_mode == true` it is the Socket Mode
+websocket loop (requires `config.app_token`; errors at startup if empty —
+there is no silent fallback to polling). Fatal errors are appended to
+`.slackclaw_crash.log` in `repo_dir` before rethrowing.
+"""
 function run_monitor(config::SlackClawConfig)
     crash_log = joinpath(config.repo_dir, ".slackclaw_crash.log")
     try
@@ -776,6 +800,13 @@ end
 
 # --- Shutdown ---
 
+"""
+    stop_monitor!(state::MonitorState)
+
+Stop the monitor: flips `state.running` (loops and background tasks exit at
+their next check), waits for in-flight dispatch tasks, and posts a shutdown
+notice to the primary channel.
+"""
 function stop_monitor!(state::MonitorState)
     @info "SlackClaw: stopping monitor..."
     state.running = false

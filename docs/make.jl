@@ -14,6 +14,9 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "Slack App Setup" => "setup.md",
+        "Socket Mode" => "socket-mode.md",
+        "API Reference" => "api.md",
     ],
 )
 

@@ -35,23 +35,30 @@ Navigate to **OAuth & Permissions** and add these **Bot Token Scopes**:
 2. Authorize the requested permissions
 3. Copy the **Bot User OAuth Token** (`xoxb-...`) — this is your `SLACK_BOT_TOKEN`
 
-### 3b. (Optional) Enable Socket Mode
+### 4. (Optional) Enable Socket Mode — Push Delivery
 
-For push delivery instead of polling:
+Skip this step if you only want polling. With Socket Mode, Slack pushes message events to SlackClaw over an outbound websocket — sub-second latency, no history polling, and no public endpoint needed (works behind firewalls/NAT). Three things must be configured on the app:
 
-1. Go to **Socket Mode** in the sidebar and toggle **Enable Socket Mode**
-2. When prompted, create an **app-level token** with the `connections:write` scope — copy it (`xapp-...`); this is your `SLACK_APP_TOKEN`
-3. Go to **Event Subscriptions**, toggle **Enable Events**, and under **Subscribe to bot events** add: `message.channels`, `message.groups`, `message.im`
-4. Reinstall the app if Slack asks you to
+1. **Enable Socket Mode**: in the app sidebar go to **Socket Mode** and toggle **Enable Socket Mode**. When prompted, create an **app-level token** with the `connections:write` scope. Copy the token (`xapp-...`) — this is your `SLACK_APP_TOKEN`. (This is a third token type, separate from the bot token: app-level tokens are workspace-app-wide and only authorize the websocket connection. Replies still go out over the bot token.)
+2. **Subscribe to message events**: go to **Event Subscriptions**, toggle **Enable Events**, expand **Subscribe to bot events**, and add:
 
-### 4. Invite the Bot to a Channel
+   | Event | Purpose | Required bot scope |
+   |-------|---------|--------------------|
+   | `message.channels` | Messages in public channels | `channels:history` (already added) |
+   | `message.groups` | Messages in private channels | `groups:history` (already added) |
+   | `message.im` | Direct messages (optional) | `im:history` (add if you want DMs) |
+
+   Without these subscriptions the websocket connects but receives no message events — SlackClaw will appear deaf.
+3. **Reinstall the app** if Slack prompts you to (it does whenever scopes or event subscriptions change): **Install App** > **Reinstall to Workspace**.
+
+### 5. Invite the Bot to a Channel
 
 In Slack, go to the channel you want to monitor and run:
 ```
 /invite @SlackClaw
 ```
 
-### 5. Get the Channel ID
+### 6. Get the Channel ID
 
 Right-click the channel name > **View channel details** > scroll to the bottom. The Channel ID looks like `C0123456789`. This is your `SLACK_CHANNEL_ID`.
 
@@ -91,6 +98,8 @@ run_monitor(SlackClawConfig(
 
 You can run multiple monitors in the same Julia process or in separate processes — they share nothing except the Slack bot token.
 
+> **Socket Mode and multiple monitors:** the per-channel-instance pattern above applies to *polling* monitors. Slack load-balances each pushed event to exactly **one** open socket per app, so multiple Socket Mode monitors under the same app would each receive a random subset of events and miss the rest. Run at most **one** Socket Mode monitor per workspace app; keep additional per-channel instances on polling. See [Socket Mode](#socket-mode-push) below.
+
 ## Environment Variables
 
 ```bash
@@ -117,6 +126,15 @@ run_monitor(SlackClawConfig(
     max_budget_usd = 1.0,
     poll_interval_s = 30,
     max_concurrent_tasks = 3,
+))
+```
+
+For push delivery instead of polling (requires Slack app setup step 4):
+
+```julia
+run_monitor(SlackClawConfig(
+    socket_mode = true,                  # SLACK_APP_TOKEN must be set
+    repo_dir = "/home/user/myproject",
 ))
 ```
 
@@ -169,7 +187,7 @@ All options are fields on `SlackClawConfig`:
 
 ### Socket Mode (Push)
 
-With `socket_mode = true`, SlackClaw opens an outbound websocket (`apps.connections.open`) and Slack pushes message events as they happen — latency drops from ~10s to sub-second and per-channel history polling disappears. Requires the app-level token (see setup step 3b):
+With `socket_mode = true`, SlackClaw opens an outbound websocket (`apps.connections.open`) and Slack pushes message events as they happen. Compared to polling: latency drops from ~10s average to sub-second, per-channel history polling (and its rate-limit pressure) disappears, and listen channels are free — their events arrive on the same socket. Requires the app-level token and event subscriptions from setup step 4:
 
 ```julia
 run_monitor(SlackClawConfig(
@@ -179,12 +197,23 @@ run_monitor(SlackClawConfig(
 ))
 ```
 
-Notes:
+**Connection lifecycle.** Slack's websocket URLs are short-lived and connections are refreshed every few hours by design: Slack sends a `disconnect` frame (a `warning` about a minute ahead, then `refresh_requested`), SlackClaw reconnects with exponential backoff and requests a fresh URL each time. Each pushed envelope is acknowledged immediately on receipt — before Claude is dispatched — because unacked envelopes are redelivered after ~3 seconds while Claude runs for minutes.
 
-- Replies still go out over the bot token (`chat.postMessage`) — Socket Mode is events-in only.
-- Delivery is at-least-once and connections refresh every few hours, so the polling cursors are kept as a **reconciliation pass**: a gap-fill poll runs on every (re)connect and every `reconcile_interval_s` (default 5 min). Duplicates are dropped at the cursor, so a message is never dispatched twice.
-- Listen channels need no extra polling in this mode — their events arrive on the same socket.
-- Mode selection is explicit: `socket_mode = true` with an empty `app_token` is a startup error, not a fallback to polling.
+**Reliability.** Push delivery is at-least-once, and events that fire while the connection is down are not replayed by Slack. SlackClaw therefore keeps the polling cursors as a **reconciliation pass**: a gap-fill poll runs on every (re)connect and every `reconcile_interval_s` (default 5 min). Each message is claimed against its cursor exactly once, so socket events, reconciliation, and Slack redeliveries can overlap freely without a message ever being dispatched twice. State on disk (`.slackclaw_state.json`) is identical between modes — you can switch a channel between polling and Socket Mode by flipping the flag and restarting.
+
+**Mode selection is explicit.** `socket_mode = true` with an empty `app_token` is a startup error, not a fallback to polling. Replies always go out over the bot token (`chat.postMessage`) — Socket Mode is events-in only.
+
+**One socket per workspace.** Slack load-balances events across an app's open sockets — each event is delivered to exactly one. Run a single Socket Mode monitor per workspace app; per-channel parallel instances must stay on polling.
+
+**Troubleshooting:**
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `not_allowed_token_type` on connect | `app_token` is a bot (`xoxb-`) token — Socket Mode needs the app-level `xapp-` token |
+| `invalid_auth` on connect | App-level token revoked or from a different app |
+| Connects but never receives messages | Event subscriptions missing (setup step 4.2), or app not reinstalled after adding them |
+| Some messages arrive, others don't | Another Socket Mode connection is open for the same app (events are being split) |
+| Bot silent in one channel only | Bot not invited to that channel (`/invite @SlackClaw`) |
 
 ### Agent Directives
 
