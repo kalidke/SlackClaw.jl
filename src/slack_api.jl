@@ -45,6 +45,29 @@ function slack_request(method::Symbol, endpoint::String, config::SlackClawConfig
 end
 
 """
+    slack_apps_connections_open(config) -> String
+
+Request a Socket Mode websocket URL via `apps.connections.open`.
+Authenticates with the app-level token (`xapp-`, scope `connections:write`),
+not the bot token. The returned `wss://` URL is single-use and short-lived.
+"""
+function slack_apps_connections_open(config::SlackClawConfig)
+    isempty(config.app_token) &&
+        error("Socket Mode requires app_token (xapp- token with connections:write scope)")
+    resp = HTTP.post("$SLACK_API_BASE/apps.connections.open";
+        headers=[
+            "Authorization" => "Bearer $(config.app_token)",
+            "Content-Type" => "application/x-www-form-urlencoded",
+        ],
+        status_exception=false)
+    data = JSON.parse(String(resp.body))
+    if !get(data, "ok", false)
+        error("Slack API error on apps.connections.open: $(get(data, "error", "unknown"))")
+    end
+    return data["url"]
+end
+
+"""
     slack_auth_test(config) -> String
 
 Call `auth.test` and return the bot's own user ID.

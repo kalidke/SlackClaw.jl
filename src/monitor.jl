@@ -32,9 +32,11 @@ mutable struct MonitorState
     listen_last_ts::Dict{String,String}  # channel_id -> last_ts for listen channels
     channel_names::Dict{String,String}   # channel_id -> display name (cached)
     last_proactive::Float64              # time() of last proactive check
+    dispatch_lock::ReentrantLock         # guards cursor claims (socket events vs reconcile poll)
 end
 
 const SLACK_MAX_TEXT = 3900
+const MAX_RESPONSE_CHUNKS = 10
 const STATE_FILE = ".slackclaw_state.json"
 
 # --- Persistence ---
@@ -133,13 +135,74 @@ function slack_ts_now()
     return string(secs, ".", lpad(frac, 6, '0'))
 end
 
-"""Post a response to Slack, truncating if needed."""
+"""
+    chunk_text(text, limit=SLACK_MAX_TEXT) -> Vector{String}
+
+Split text into chunks of at most `limit` characters, preferring to break at a
+newline when one falls in the latter half of the window. Whitespace-only
+chunks are dropped.
+"""
+function chunk_text(text::AbstractString, limit::Int=SLACK_MAX_TEXT)
+    chunks = String[]
+    rest = String(text)
+    while length(rest) > limit
+        window = first(rest, limit)
+        nl = findlast('\n', window)
+        take = (nl !== nothing && length(window[1:nl]) > limit ÷ 2) ? length(window[1:nl]) : limit
+        chunk = String(rstrip(first(rest, take)))
+        isempty(chunk) || push!(chunks, chunk)
+        rest = lstrip(chop(rest; head=take, tail=0), '\n')
+    end
+    isempty(strip(rest)) || push!(chunks, String(rest))
+    return chunks
+end
+
+"""Post a response to Slack, splitting long text across multiple thread messages."""
 function post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
                        channel_id::AbstractString=config.slack_channel_id)
-    if length(text) > SLACK_MAX_TEXT
-        text = text[1:SLACK_MAX_TEXT] * "\n\n_(truncated)_"
+    chunks = chunk_text(text)
+    if length(chunks) > MAX_RESPONSE_CHUNKS
+        chunks = chunks[1:MAX_RESPONSE_CHUNKS]
+        chunks[end] *= "\n\n_(truncated after $(MAX_RESPONSE_CHUNKS) messages)_"
     end
-    slack_post_message(config, text; thread_ts, channel_id)
+    n = length(chunks)
+    for (i, chunk) in enumerate(chunks)
+        body = n > 1 ? "_($i/$n)_\n$chunk" : chunk
+        slack_post_message(config, body; thread_ts, channel_id)
+    end
+end
+
+# --- Cursor claims ---
+# Shared dedup gate between the poll/reconcile paths and Socket Mode dispatch:
+# atomically compare a message ts against its cursor and advance it. A message
+# is dispatched only by whichever path claims it first; redeliveries and
+# reconcile/socket overlap are dropped here.
+
+"""Claim a top-level message against the primary-channel cursor. Returns false if already seen."""
+function claim_primary!(state::MonitorState, ts::AbstractString)
+    lock(state.dispatch_lock) do
+        ts > state.last_ts || return false
+        state.last_ts = ts
+        return true
+    end
+end
+
+"""Claim a thread reply against the session's reply cursor."""
+function claim_thread_reply!(state::MonitorState, session::ThreadSession, ts::AbstractString)
+    lock(state.dispatch_lock) do
+        ts > session.last_reply_ts || return false
+        session.last_reply_ts = ts
+        return true
+    end
+end
+
+"""Claim a listen-channel message against that channel's cursor."""
+function claim_listen!(state::MonitorState, ch_id::AbstractString, ts::AbstractString)
+    lock(state.dispatch_lock) do
+        ts > get(state.listen_last_ts, ch_id, "") || return false
+        state.listen_last_ts[ch_id] = ts
+        return true
+    end
 end
 
 # --- Status file watching ---
@@ -194,10 +257,11 @@ function start_monitor(config::SlackClawConfig)
 
     state = MonitorState(config, last_ts, true, Task[], nothing, threads,
                          Dict{String,Float64}(), scheduled, listen_last_ts,
-                         channel_names, last_proactive)
+                         channel_names, last_proactive, ReentrantLock())
 
     info_parts = ["Repo: `$(config.repo_dir)`"]
     !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
+    config.socket_mode && push!(info_parts, "Socket Mode")
     config.agent_directives && push!(info_parts, "Agent mode")
     !isempty(config.listen_channel_ids) && push!(info_parts,
         "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
@@ -206,25 +270,27 @@ function start_monitor(config::SlackClawConfig)
     slack_post_message(config,
         "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
 
-    @info "SlackClaw: starting poll loop (interval=$(config.poll_interval_s)s)"
+    if config.socket_mode
+        @info "SlackClaw: Socket Mode (reconcile every $(config.reconcile_interval_s)s)"
+    else
+        @info "SlackClaw: starting poll loop (interval=$(config.poll_interval_s)s)"
+    end
     return state
 end
 
 function run_monitor(config::SlackClawConfig)
     crash_log = joinpath(config.repo_dir, ".slackclaw_crash.log")
     try
+        if config.socket_mode && isempty(config.app_token)
+            error("socket_mode=true but app_token is empty — set SLACK_APP_TOKEN " *
+                  "(xapp- token with connections:write). There is no fallback to polling.")
+        end
         state = start_monitor(config)
         try
-            while state.running
-                try
-                    poll_once!(state)
-                catch e
-                    @error "SlackClaw poll error" exception=(e, catch_backtrace())
-                end
-                for _ in 1:state.config.poll_interval_s
-                    state.running || break
-                    sleep(1)
-                end
+            if config.socket_mode
+                socket_loop!(state)
+            else
+                poll_loop!(state)
             end
         catch e
             e isa InterruptException || rethrow()
@@ -242,7 +308,36 @@ function run_monitor(config::SlackClawConfig)
     end
 end
 
+"""Polling-mode main loop. Runs until `state.running` is false."""
+function poll_loop!(state::MonitorState)
+    while state.running
+        try
+            poll_once!(state)
+        catch e
+            @error "SlackClaw poll error" exception=(e, catch_backtrace())
+        end
+        for _ in 1:state.config.poll_interval_s
+            state.running || break
+            sleep(1)
+        end
+    end
+end
+
 function poll_once!(state::MonitorState)
+    state.running || return
+    reconcile_messages!(state)
+    check_scheduled!(state)
+    check_proactive!(state)
+end
+
+"""
+Fetch and dispatch anything newer than the cursors: primary-channel history,
+tracked thread replies, listen channels. The whole message path of polling
+mode; in Socket Mode this runs as the gap-fill reconciliation (on reconnect
+and every `reconcile_interval_s`) — cursor claims drop anything the socket
+already dispatched.
+"""
+function reconcile_messages!(state::MonitorState)
     state.running || return
     filter!(!istaskdone, state.active_tasks)
 
@@ -257,9 +352,7 @@ function poll_once!(state::MonitorState)
     if !isempty(raw_msgs)
         parsed = parse_slack_messages(raw_msgs)
         for (msg, raw) in zip(parsed, raw_msgs)
-            if msg.ts > state.last_ts
-                state.last_ts = msg.ts
-            end
+            claim_primary!(state, msg.ts) || continue
             should_process(msg, state.config, raw) || continue
             dispatch_command!(state, msg)
         end
@@ -271,12 +364,6 @@ function poll_once!(state::MonitorState)
 
     # 3. Listen channels (respond in primary channel)
     poll_listen_channels!(state)
-
-    # 4. Scheduled tasks
-    check_scheduled!(state)
-
-    # 5. Proactive check
-    check_proactive!(state)
 end
 
 # --- Listen channel polling ---
@@ -296,9 +383,7 @@ function poll_listen_channels!(state::MonitorState)
             ch_name = get(state.channel_names, ch_id, ch_id)
             parsed = parse_slack_messages(raw_msgs)
             for (msg, raw) in zip(parsed, raw_msgs)
-                if msg.ts > ch_last_ts
-                    ch_last_ts = msg.ts
-                end
+                claim_listen!(state, ch_id, msg.ts) || continue
                 should_process(msg, config, raw) || continue
                 # Prefix message with channel origin for Claude context
                 prefixed_text = "[from #$(ch_name)] $(msg.text)"
@@ -306,7 +391,6 @@ function poll_listen_channels!(state::MonitorState)
                 # Dispatch to primary channel (no reaction on listen channel -- we're read-only)
                 dispatch_listen_command!(state, prefixed_msg, ch_name)
             end
-            state.listen_last_ts[ch_id] = ch_last_ts
             save_state!(state)
         catch e
             @error "SlackClaw listen channel poll error" channel_id=ch_id exception=(e, catch_backtrace())
@@ -375,9 +459,7 @@ function poll_threads!(state::MonitorState)
             isempty(raw_replies) && continue
             parsed = parse_slack_messages(raw_replies)
             for (msg, raw) in zip(parsed, raw_replies)
-                if msg.ts > session.last_reply_ts
-                    session.last_reply_ts = msg.ts
-                end
+                claim_thread_reply!(state, session, msg.ts) || continue
                 should_process(msg, state.config, raw) || continue
                 dispatch_thread_reply!(state, msg, session)
             end

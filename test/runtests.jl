@@ -162,12 +162,135 @@ end
     @test r.session_id == ""
 end
 
+@testset "chunk_text" begin
+    ct = SlackClaw.chunk_text
+
+    # Short text passes through untouched
+    @test ct("hello", 100) == ["hello"]
+    # Exactly at limit → single chunk
+    @test ct("a"^100, 100) == ["a"^100]
+    # Empty / whitespace-only → no chunks
+    @test isempty(ct("", 100))
+    @test isempty(ct("   \n  ", 100))
+
+    # Over limit, no newlines → hard split, nothing lost
+    chunks = ct("a"^250, 100)
+    @test length(chunks) == 3
+    @test all(length.(chunks) .<= 100)
+    @test join(chunks) == "a"^250
+
+    # Prefers a newline boundary in the latter half of the window
+    text = "A"^40 * "\n" * "B"^40
+    chunks = ct(text, 60)
+    @test chunks == ["A"^40, "B"^40]
+
+    # Early newline (first half) is ignored in favor of a full window
+    text = "ab\n" * "c"^120
+    chunks = ct(text, 100)
+    @test length(chunks) == 2
+    @test length(chunks[1]) == 100
+
+    # Multi-line content reassembles (modulo the consumed newlines)
+    text = join(["line $i is some text" for i in 1:40], "\n")
+    chunks = ct(text, 120)
+    @test all(length.(chunks) .<= 120)
+    @test replace(join(chunks, "\n"), "\n" => "") == replace(text, "\n" => "")
+end
+
+@testset "classify_socket_event" begin
+    cse = SlackClaw.classify_socket_event
+    cfg = SlackClawConfig(
+        slack_bot_token="fake", slack_channel_id="C0", bot_user_id="UBOT",
+        listen_channel_ids=["CLISTEN"],
+    )
+    tracked = Set(["111.000"])
+    base = Dict("type" => "message", "channel" => "C0", "user" => "U1",
+                "text" => "hi", "ts" => "200.0")
+
+    # Top-level message in primary channel
+    route, msg = cse(copy(base), cfg, tracked)
+    @test route == :primary
+    @test msg.ts == "200.0"
+    @test msg.text == "hi"
+
+    # Non-message event types ignored
+    @test cse(Dict("type" => "reaction_added"), cfg, tracked)[1] == :ignore
+
+    # Edits/deletes/joins ignored (different payload shapes)
+    for st in ("message_changed", "message_deleted", "channel_join")
+        d = copy(base); d["subtype"] = st
+        @test cse(d, cfg, tracked)[1] == :ignore
+    end
+
+    # thread_broadcast subtype is dispatchable
+    d = copy(base); d["subtype"] = "thread_broadcast"
+    @test cse(d, cfg, tracked)[1] == :primary
+
+    # Reply in a tracked thread
+    d = copy(base); d["thread_ts"] = "111.000"
+    route, msg = cse(d, cfg, tracked)
+    @test route == :thread_reply
+    @test msg.thread_ts == "111.000"
+
+    # Reply in an untracked thread ignored
+    d = copy(base); d["thread_ts"] = "999.0"
+    @test cse(d, cfg, tracked)[1] == :ignore
+
+    # Thread parent (thread_ts == ts) is a top-level message
+    d = copy(base); d["thread_ts"] = "200.0"
+    @test cse(d, cfg, tracked)[1] == :primary
+
+    # Listen channel top-level message
+    d = copy(base); d["channel"] = "CLISTEN"
+    @test cse(d, cfg, tracked)[1] == :listen
+
+    # Unconfigured channel ignored
+    d = copy(base); d["channel"] = "CX"
+    @test cse(d, cfg, tracked)[1] == :ignore
+
+    # Missing ts ignored
+    @test cse(Dict("type" => "message", "channel" => "C0"), cfg, tracked)[1] == :ignore
+
+    # Bot messages still classified — should_process filters at dispatch,
+    # after the cursor claim (cursors advance past bot messages too)
+    d = copy(base); d["bot_id"] = "B1"
+    @test cse(d, cfg, tracked)[1] == :primary
+end
+
+@testset "cursor claims" begin
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0")
+    state = SlackClaw.MonitorState(
+        cfg, "100.0", true, Task[], nothing,
+        Dict{String,SlackClaw.ThreadSession}(), Dict{String,Float64}(),
+        SlackClaw.ScheduledTask[], Dict{String,String}("CL" => "100.0"),
+        Dict{String,String}(), 0.0, ReentrantLock())
+
+    # Primary cursor: first claim wins, replays and older ts rejected
+    @test SlackClaw.claim_primary!(state, "200.0")
+    @test !SlackClaw.claim_primary!(state, "200.0")
+    @test !SlackClaw.claim_primary!(state, "150.0")
+    @test state.last_ts == "200.0"
+
+    # Thread reply cursor
+    sess = SlackClaw.ThreadSession("111.0", "sid", "111.0", 0.0, "C0")
+    @test SlackClaw.claim_thread_reply!(state, sess, "112.0")
+    @test !SlackClaw.claim_thread_reply!(state, sess, "112.0")
+    @test sess.last_reply_ts == "112.0"
+
+    # Listen channel cursor
+    @test SlackClaw.claim_listen!(state, "CL", "101.0")
+    @test !SlackClaw.claim_listen!(state, "CL", "101.0")
+    @test state.listen_last_ts["CL"] == "101.0"
+end
+
 @testset "SlackClawConfig defaults" begin
     cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0")
     @test cfg.poll_interval_s == 10
     @test cfg.max_concurrent_tasks == 5
-    @test cfg.max_active_threads == 10
+    @test cfg.max_active_threads == 3
     @test cfg.max_continue == 10
+    @test cfg.socket_mode == false
+    @test cfg.reconcile_interval_s == 300
     @test cfg.agent_directives == true
     @test cfg.claude_timeout_s == 3600
     @test cfg.max_turns == 30

@@ -7,6 +7,9 @@ default to reading from environment variables.
 Base.@kwdef mutable struct SlackClawConfig
     slack_bot_token::String = ENV["SLACK_BOT_TOKEN"]
     slack_channel_id::String = ENV["SLACK_CHANNEL_ID"]
+    app_token::String = get(ENV, "SLACK_APP_TOKEN", "")  # app-level xapp- token (Socket Mode)
+    socket_mode::Bool = false           # true = Socket Mode (push), false = polling; no silent fallback
+    reconcile_interval_s::Int = 300     # Socket Mode: gap-fill poll cadence
     poll_interval_s::Int = 10
     repo_dir::String = pwd()
     max_budget_usd::Float64 = 0.0  # 0 = no limit flag passed
