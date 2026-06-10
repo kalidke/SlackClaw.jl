@@ -283,11 +283,43 @@ end
     @test state.listen_last_ts["CL"] == "101.0"
 end
 
+@testset "thread expiry" begin
+    tla = SlackClaw.thread_last_active
+    iet = SlackClaw.idle_expired_threads
+    now = time()
+
+    # last_active = newest of created / last_reply_ts
+    s_idle = SlackClaw.ThreadSession("1.0", "sid", string(now - 8 * 86400), now - 60 * 86400, "C0")
+    @test isapprox(tla(s_idle), now - 8 * 86400; atol=1.0)
+
+    # Unparseable last_reply_ts falls back to created
+    s_hour = SlackClaw.ThreadSession("2.0", "sid", "", now - 3600, "C0")
+    @test tla(s_hour) == now - 3600
+
+    # Reply ts older than created → created wins
+    s_fresh = SlackClaw.ThreadSession("3.0", "sid", string(now - 86400), now - 60, "C0")
+    @test tla(s_fresh) == now - 60
+
+    threads = Dict("1.0" => s_idle, "2.0" => s_hour, "3.0" => s_fresh)
+
+    # 7d cutoff: only the 8d-idle thread expires
+    expired = iet(threads, 7 * 86400, now)
+    @test length(expired) == 1
+    @test expired[1].thread_ts == "1.0"
+
+    # Cutoff 0 disables idle expiry entirely
+    @test isempty(iet(threads, 0, now))
+
+    # 30m cutoff catches the 8d and 1h threads, keeps the 60s one
+    @test length(iet(threads, 1800, now)) == 2
+end
+
 @testset "SlackClawConfig defaults" begin
     cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0")
     @test cfg.poll_interval_s == 10
     @test cfg.max_concurrent_tasks == 5
     @test cfg.max_active_threads == 3
+    @test cfg.max_thread_idle_s == 604800
     @test cfg.max_continue == 10
     @test cfg.socket_mode == false
     @test cfg.reconcile_interval_s == 300

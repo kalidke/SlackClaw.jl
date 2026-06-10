@@ -495,21 +495,55 @@ function poll_threads!(state::MonitorState)
     expire_threads!(state)
 end
 
+"""Last-activity time for a thread session: newest reply seen, or creation time."""
+function thread_last_active(s::ThreadSession)
+    t = tryparse(Float64, s.last_reply_ts)
+    return t === nothing ? s.created : max(s.created, t)
+end
+
+"""Sessions idle longer than `idle_cutoff_s` as of `now` (none when cutoff is 0)."""
+function idle_expired_threads(threads::Dict{String,ThreadSession}, idle_cutoff_s::Int, now::Float64)
+    idle_cutoff_s > 0 || return ThreadSession[]
+    return [s for s in values(threads) if now - thread_last_active(s) > idle_cutoff_s]
+end
+
+"""
+Drop threads idle beyond `max_thread_idle_s`, then enforce the
+`max_active_threads` count cap (oldest first). Every tracked thread costs a
+`conversations.replies` call per poll/reconcile cycle, so unbounded idle
+threads become permanent rate-limit pressure.
+"""
 function expire_threads!(state::MonitorState)
-    max = state.config.max_active_threads
-    length(state.threads) <= max && return
-    sorted = sort(collect(values(state.threads)); by=s -> s.created)
-    to_remove = length(sorted) - max
-    for i in 1:to_remove
-        s = sorted[i]
+    dropped = 0
+
+    for s in idle_expired_threads(state.threads, state.config.max_thread_idle_s, time())
+        idle_d = round(Int, (time() - thread_last_active(s)) / 86400)
         try
             slack_post_message(state.config,
-                "_Thread closed — I can only track $(max) threads at a time. Start a new thread to continue._";
+                "_Thread closed after $(idle_d)d idle. Start a new thread to continue._";
                 thread_ts=s.thread_ts, channel_id=s.channel_id)
         catch; end
         delete!(state.threads, s.thread_ts)
+        dropped += 1
     end
-    @info "SlackClaw: expired $to_remove old thread(s)"
+
+    max = state.config.max_active_threads
+    if length(state.threads) > max
+        sorted = sort(collect(values(state.threads)); by=s -> s.created)
+        for i in 1:(length(sorted) - max)
+            s = sorted[i]
+            try
+                slack_post_message(state.config,
+                    "_Thread closed — I can only track $(max) threads at a time. Start a new thread to continue._";
+                    thread_ts=s.thread_ts, channel_id=s.channel_id)
+            catch; end
+            delete!(state.threads, s.thread_ts)
+            dropped += 1
+        end
+    end
+
+    dropped == 0 && return
+    @info "SlackClaw: expired $dropped thread(s)"
     save_state!(state)
 end
 
