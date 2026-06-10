@@ -105,8 +105,27 @@ Slack load-balances events across an app's open Socket Mode connections —
 each event is delivered to exactly **one** of them. Two SlackClaw socket
 monitors under the same app would each receive a random half of the traffic.
 Run a single Socket Mode monitor per workspace app; additional per-channel
-instances must use polling. (Multi-channel routing within one socket monitor
-is what `listen_channel_ids` provides.)
+instances must use polling.
+
+### Serving a whole workspace: `run_socket_fleet`
+
+To run *all* of a workspace's channels on push, use the fleet entry point —
+many channels, one socket, one process:
+
+```julia
+configs = [SlackClawConfig(slack_channel_id=id, socket_mode=true,
+                           repo_dir=dir, ...) for (id, dir) in channels]
+run_socket_fleet(configs)
+```
+
+Each config keeps its own monitor state — threads, persistence, scheduled
+tasks, proactive checks, and budgets behave exactly as in a single-channel
+monitor — and every pushed event is offered to every state, which ignores
+channels it doesn't serve. Startup validation requires: identical bot and app
+tokens across the fleet (one fleet = one workspace), `socket_mode = true` on
+every config, unique primary channels, and unique state-file paths — two
+channels sharing a `repo_dir` must set distinct `state_file` values, since a
+shared state file is silently last-writer-wins.
 
 ## Configuration reference
 

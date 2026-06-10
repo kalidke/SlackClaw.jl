@@ -314,6 +314,51 @@ end
     @test length(iet(threads, 1800, now)) == 2
 end
 
+@testset "fleet validation" begin
+    vf = SlackClaw.validate_fleet
+    mk(ch; bot="xoxb-1", app="xapp-1", repo="/tmp/repo_$ch", sf=".slackclaw_state.json", sock=true) =
+        SlackClawConfig(slack_bot_token=bot, slack_channel_id=ch, app_token=app,
+                        socket_mode=sock, repo_dir=repo, state_file=sf)
+
+    # Valid fleet of two
+    @test vf([mk("C1"), mk("C2")]) === nothing
+    # Single-channel fleet is fine
+    @test vf([mk("C1")]) === nothing
+
+    @test_throws ErrorException vf(SlackClawConfig[])                       # empty
+    @test_throws ErrorException vf([mk("C1"), mk("C1")])                    # duplicate channel
+    @test_throws ErrorException vf([mk("C1"), mk("C2"; app="xapp-2")])      # mixed app tokens
+    @test_throws ErrorException vf([mk("C1"), mk("C2"; bot="xoxb-2")])      # mixed workspaces
+    @test_throws ErrorException vf([mk("C1"; sock=false), mk("C2")])        # not opted in
+    @test_throws ErrorException vf([mk("C1"; app="")])                      # missing app token
+
+    # Shared repo_dir + default state_file = state clobber → error
+    @test_throws ErrorException vf([mk("C1"; repo="/tmp/shared"), mk("C2"; repo="/tmp/shared")])
+    # Distinct state_file resolves it
+    @test vf([mk("C1"; repo="/tmp/shared"),
+              mk("C2"; repo="/tmp/shared", sf=".slackclaw_state.c2.json")]) === nothing
+end
+
+@testset "state_file knob" begin
+    dir = mktempdir()
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0",
+                          repo_dir=dir, state_file=".slackclaw_state.custom.json")
+    state = SlackClaw.MonitorState(cfg, "123.000000", true, Task[], nothing,
+        Dict{String,SlackClaw.ThreadSession}(), Dict{String,Float64}(),
+        SlackClaw.ScheduledTask[], Dict{String,String}(), Dict{String,String}(),
+        0.0, ReentrantLock())
+    state.threads["111.0"] = SlackClaw.ThreadSession("111.0", "sid", "112.0", time(), "C0")
+
+    SlackClaw.save_state!(state)
+    @test isfile(joinpath(dir, ".slackclaw_state.custom.json"))
+    @test !isfile(joinpath(dir, ".slackclaw_state.json"))
+
+    threads, last_ts, _, _, _ = SlackClaw.load_state(cfg)
+    @test last_ts == "123.000000"
+    @test haskey(threads, "111.0")
+    @test threads["111.0"].session_id == "sid"
+end
+
 @testset "SlackClawConfig defaults" begin
     cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0")
     @test cfg.poll_interval_s == 10
@@ -323,6 +368,7 @@ end
     @test cfg.max_continue == 10
     @test cfg.socket_mode == false
     @test cfg.reconcile_interval_s == 300
+    @test cfg.state_file == ".slackclaw_state.json"
     @test cfg.agent_directives == true
     @test cfg.claude_timeout_s == 3600
     @test cfg.max_turns == 30

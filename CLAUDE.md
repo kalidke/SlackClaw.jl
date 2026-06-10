@@ -63,6 +63,10 @@ With `socket_mode=true`, `run_monitor` runs `socket_loop!` instead of the poll l
 
 Caveat for multi-instance setups: all channels of one Slack app arrive on one socket, and with several sockets open Slack load-balances each event to exactly one of them. Running one Socket Mode monitor per channel under the same app would drop events — Socket Mode wants one monitor per workspace token. Polling instances are unaffected.
 
+### Socket Fleet (full-workspace push)
+
+`run_socket_fleet(configs::Vector{SlackClawConfig})` serves MANY channels over ONE socket — the correct shape for a whole workspace on push. Each config gets its own `MonitorState` (threads, persistence, proactive, budgets — semantics identical to a single-channel monitor); the FIFO consumer offers every event to every state and non-matching states ignore it via `classify_socket_event`. Per-state housekeeping tasks are start-staggered (7s apart) to spread reconcile load. `validate_fleet` enforces: same bot+app token across the fleet, `socket_mode=true` everywhere, unique primary channels, and unique `(repo_dir, state_file)` pairs — channels sharing a `repo_dir` must override `config.state_file` or startup errors (state files are last-writer-wins). `socket_loop!` (single channel) is just a fleet of one.
+
 ### Concurrency
 
 Each dispatch spawns an `@async` Task. Max `max_concurrent_tasks` (default 5) enforced. Busy threads report elapsed time to the user if they send another message.

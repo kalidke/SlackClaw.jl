@@ -48,7 +48,7 @@ const STATE_FILE = ".slackclaw_state.json"
 
 """Save full monitor state (threads, last_ts, scheduled tasks) to disk."""
 function save_state!(state::MonitorState)
-    path = joinpath(state.config.repo_dir, STATE_FILE)
+    path = joinpath(state.config.repo_dir, state.config.state_file)
     threads_data = Dict{String,Any}()
     for (ts, s) in state.threads
         threads_data[ts] = Dict(
@@ -79,7 +79,7 @@ end
 
 """Load persisted state from disk. Returns (threads, last_ts, scheduled, listen_last_ts, last_proactive)."""
 function load_state(config::SlackClawConfig)
-    path = joinpath(config.repo_dir, STATE_FILE)
+    path = joinpath(config.repo_dir, config.state_file)
     threads = Dict{String,ThreadSession}()
     last_ts = ""
     scheduled = ScheduledTask[]

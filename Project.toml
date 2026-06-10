@@ -1,6 +1,6 @@
 name = "SlackClaw"
 uuid = "916c34f9-65bc-4d80-9781-b3dc311e871d"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["klidke@unm.edu"]
 
 [deps]

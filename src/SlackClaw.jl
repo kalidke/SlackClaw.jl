@@ -15,6 +15,7 @@ include("socket_mode.jl")
 export SlackClawConfig,
        start_monitor,
        run_monitor,
+       run_socket_fleet,
        stop_monitor!,
        SlackMessage,
        ClaudeResult,
