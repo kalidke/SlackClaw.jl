@@ -55,8 +55,8 @@ Seven source files, all included from `SlackClaw.jl`:
 With `socket_mode=true`, `run_monitor` runs `socket_loop!` instead of the poll loop (explicit selection — empty `app_token` is a startup error, never a silent fallback to polling). Flow:
 
 1. `apps.connections.open` (app-level token) → short-lived `wss://` URL → `HTTP.WebSockets.open`
-2. Slack pushes message events as envelopes; each is **acked immediately** (≈3s deadline; Claude dispatch takes minutes), then routed
-3. `classify_socket_event()` (pure, tested) decides `:primary`/`:thread_reply`/`:listen`/`:ignore`; `route_socket_event!` claims the matching cursor, applies `should_process`, and calls the same `dispatch_*` functions as polling
+2. Slack pushes message events as envelopes; the read loop only parses, **acks immediately** (≈3s deadline), and enqueues onto a `Channel` — it never does API work, so a rate-limit retry in dispatch can't starve acks of queued frames
+3. A **single FIFO consumer task** (`socket_event_consumer!`) drains the queue: `classify_socket_event()` (pure, tested) decides `:primary`/`:thread_reply`/`:listen`/`:ignore`; `route_socket_event!` claims the matching cursor, applies `should_process`, and calls the same `dispatch_*` functions as polling. Exactly one consumer — cursor claims need per-channel ts ordering (an out-of-order claim would advance the cursor past an undispatched message, which reconciliation can never recover)
 4. Delivery is at-least-once with gaps across reconnects, so `reconcile_messages!` runs as a gap-fill poll on every (re)connect and every `reconcile_interval_s` (default 300s). The `claim_*!` gates (under `MonitorState.dispatch_lock`) drop anything the other path already dispatched, including Slack redeliveries
 5. Disconnect frames (`refresh_requested` every few hours; `warning` ≈1min ahead) → reconnect with exponential backoff (reset on success); listen channels need no polling since all events arrive on the one socket
 6. `socket_housekeeping!` (background task) fires `check_scheduled!`/`check_proactive!` every `poll_interval_s` and the reconciliation poll on its own cadence

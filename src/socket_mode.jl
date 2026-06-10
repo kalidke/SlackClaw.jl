@@ -3,10 +3,13 @@ Slack Socket Mode (push) event loop.
 
 Replaces timer-driven history polling with a websocket: `apps.connections.open`
 (app-level `xapp-` token) returns a short-lived `wss://` URL; Slack pushes
-message events as envelopes. Each envelope is acked immediately (Slack's ack
-deadline is ~3s; Claude dispatch takes minutes) and then routed into the same
-dispatch paths as polling mode. The bot token and `chat.postMessage` reply path
-are unchanged — Socket Mode is events-in only.
+message events as envelopes. The read loop only parses, acks, and enqueues
+(Slack's ack deadline is ~3s and redelivers unacked envelopes; any blocking
+work in the read loop — even a rate-limit retry sleep — would starve the acks
+of queued frames). A single FIFO consumer task routes events into the same
+dispatch paths as polling mode; it must stay single so per-channel ts ordering
+holds for cursor claims. The bot token and `chat.postMessage` reply path are
+unchanged — Socket Mode is events-in only.
 
 Delivery is at-least-once with gaps across disconnects, so the cursor machinery
 (`last_ts`, per-thread `last_reply_ts`, `listen_last_ts`) is kept as a
@@ -20,6 +23,10 @@ reconciliation, and Slack redeliveries idempotent against each other.
 # or semantics and are skipped — the reconciliation poll sees canonical
 # history anyway.
 const SOCKET_MESSAGE_SUBTYPES = ("", "thread_broadcast", "file_share")
+
+# Backstop bound on events queued between the read loop and the dispatch
+# consumer; put! blocks (re-applying backpressure to reads) only beyond this.
+const SOCKET_EVENT_QUEUE_SIZE = 256
 
 """
     classify_socket_event(event, config, tracked_threads) -> (route::Symbol, msg)
@@ -95,10 +102,13 @@ function route_socket_event!(state::MonitorState, event::Dict)
 end
 
 """
-Handle one websocket frame. Returns `:ok` to keep reading or `:reconnect` when
-Slack asks for the connection to be refreshed.
+Handle one websocket frame: parse, ack, and enqueue message events onto
+`events` for the dispatch consumer. Does no Slack API work itself — the read
+loop must never block on dispatch, or queued frames miss the ~3s ack deadline
+and get redelivered. Returns `:ok` to keep reading or `:reconnect` when Slack
+asks for the connection to be refreshed.
 """
-function handle_socket_frame!(state::MonitorState, ws, raw)
+function handle_socket_frame!(state::MonitorState, ws, raw, events::Channel)
     data = try
         JSON.parse(String(raw))
     catch
@@ -130,9 +140,27 @@ function handle_socket_frame!(state::MonitorState, ws, raw)
             retry_attempt isa Integer && retry_attempt > 0 &&
                 @info "SlackClaw: redelivered envelope (cursor dedup applies)" retry_attempt
             event = get(get(data, "payload", Dict()), "event", Dict())
-            event isa Dict && route_socket_event!(state, event)
+            event isa Dict && put!(events, event)
         end
         return :ok
+    end
+end
+
+"""
+Dispatch consumer: drains the event queue in FIFO order, one event at a time.
+Exactly one consumer must run — cursor claims assume per-channel ts ordering,
+and an out-of-order claim would advance the cursor past an undispatched
+message, losing it permanently (reconciliation never refetches behind a
+cursor). Claude work still fans out via the `@async` pool inside the
+dispatch functions; only the pre-dispatch API calls are serialized here.
+"""
+function socket_event_consumer!(state::MonitorState, events::Channel)
+    for event in events
+        try
+            route_socket_event!(state, event)
+        catch e
+            @error "SlackClaw socket dispatch error" exception=(e, catch_backtrace())
+        end
     end
 end
 
@@ -165,37 +193,47 @@ Runs until `state.running` is false.
 function socket_loop!(state::MonitorState)
     config = state.config
     housekeeping = @async socket_housekeeping!(state)
+    events = Channel{Dict}(SOCKET_EVENT_QUEUE_SIZE)
+    consumer = @async socket_event_consumer!(state, events)
     backoff = 1.0
 
-    while state.running
-        connected = false
-        try
-            url = slack_apps_connections_open(config)
-            HTTP.WebSockets.open(url) do ws
-                connected = true
-                backoff = 1.0
-                # Fill the gap from before/between connections
-                @async try
-                    reconcile_messages!(state)
-                catch e
-                    @error "SlackClaw reconcile error" exception=(e, catch_backtrace())
+    try
+        while state.running
+            connected = false
+            try
+                url = slack_apps_connections_open(config)
+                HTTP.WebSockets.open(url) do ws
+                    connected = true
+                    backoff = 1.0
+                    # Fill the gap from before/between connections
+                    @async try
+                        reconcile_messages!(state)
+                    catch e
+                        @error "SlackClaw reconcile error" exception=(e, catch_backtrace())
+                    end
+                    for raw in ws
+                        state.running || break
+                        handle_socket_frame!(state, ws, raw, events) == :reconnect && break
+                    end
                 end
-                for raw in ws
-                    state.running || break
-                    handle_socket_frame!(state, ws, raw) == :reconnect && break
-                end
+            catch e
+                e isa InterruptException && rethrow()
+                state.running || break
+                @error "SlackClaw socket error" exception=(e, catch_backtrace())
             end
-        catch e
-            e isa InterruptException && rethrow()
             state.running || break
-            @error "SlackClaw socket error" exception=(e, catch_backtrace())
+            connected || (backoff = min(backoff * 2, 60.0))
+            @info "SlackClaw: socket reconnecting in $(round(backoff; digits=1))s"
+            sleep(backoff)
         end
-        state.running || break
-        connected || (backoff = min(backoff * 2, 60.0))
-        @info "SlackClaw: socket reconnecting in $(round(backoff; digits=1))s"
-        sleep(backoff)
+    finally
+        close(events)  # consumer drains what's queued, then exits
     end
 
+    try
+        wait(consumer)
+    catch
+    end
     try
         wait(housekeeping)
     catch

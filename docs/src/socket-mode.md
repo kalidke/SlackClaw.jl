@@ -51,13 +51,19 @@ proactive checks, persistence. Replies go out over the bot token
 
 1. `apps.connections.open` (authenticated with the app-level token) returns a
    short-lived `wss://` URL; SlackClaw connects with `HTTP.WebSockets`.
-2. Slack pushes each event wrapped in an envelope. SlackClaw **acks the
-   envelope immediately on receipt** — Slack redelivers envelopes that are not
-   acked within ~3 s, while a Claude dispatch runs for minutes. Ack first,
-   then dispatch.
-3. The event is classified (top-level message in the primary channel, reply in
-   a tracked thread, listen-channel message, or ignorable) and routed into the
-   same dispatch functions polling mode uses.
+2. Slack pushes each event wrapped in an envelope. The websocket read loop
+   does three things only — parse, **ack immediately**, enqueue — and never
+   touches the Slack Web API. Slack redelivers envelopes not acked within
+   ~3 s, so any blocking work in the read loop (even a single rate-limit
+   retry sleep) would starve the acks of frames queued behind it.
+3. A single FIFO consumer task drains the queue: each event is classified
+   (top-level message in the primary channel, reply in a tracked thread,
+   listen-channel message, or ignorable) and routed into the same dispatch
+   functions polling mode uses. The consumer stays single deliberately:
+   cursor claims rely on per-channel timestamp ordering, and an out-of-order
+   claim would advance a cursor past an undispatched message — a loss
+   reconciliation could never detect. Claude invocations themselves still
+   fan out to the concurrent task pool inside dispatch.
 
 ### Reliability: reconciliation and cursors
 
