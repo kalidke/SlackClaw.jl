@@ -8,7 +8,7 @@ makedocs(;
     authors="klidke@unm.edu",
     sitename="SlackClaw.jl",
     format=Documenter.HTML(;
-        canonical="https://LidkeLab.github.io/SlackClaw.jl",
+        canonical="https://kalidke.github.io/SlackClaw.jl",
         edit_link="main",
         assets=String[],
     ),
@@ -23,6 +23,6 @@ makedocs(;
 )
 
 deploydocs(;
-    repo="github.com/LidkeLab/SlackClaw.jl",
+    repo="github.com/kalidke/SlackClaw.jl",
     devbranch="main",
 )

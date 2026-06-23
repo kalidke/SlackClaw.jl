@@ -4,7 +4,7 @@ CurrentModule = SlackClaw
 
 # SlackClaw
 
-Slack-to-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) bridge: [SlackClaw](https://github.com/LidkeLab/SlackClaw.jl) watches Slack channels, dispatches messages to the `claude` CLI as subprocesses, and posts the results back as threaded replies. Messages arrive in real time over [Slack Socket Mode](socket-mode.md) (push).
+Slack-to-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) bridge: [SlackClaw](https://github.com/kalidke/SlackClaw.jl) watches Slack channels, dispatches messages to the `claude` CLI as subprocesses, and posts the results back as threaded replies. Messages arrive in real time over [Slack Socket Mode](socket-mode.md) (push).
 
 !!! note "vs. the Slack MCP plugin"
     The Slack MCP plugin gives an interactive Claude session tools to *operate*
@@ -41,7 +41,7 @@ See [Use Cases](use-cases.md) for step-by-step setup of each.
 ```julia
 using Pkg
 Pkg.add("SlackClaw")                                       # once registered in General
-# before registration: Pkg.add(url="https://github.com/LidkeLab/SlackClaw.jl")
+# before registration: Pkg.add(url="https://github.com/kalidke/SlackClaw.jl")
 ```
 
 Requires Julia ≥ 1.10 and an authenticated `claude` CLI on the host.

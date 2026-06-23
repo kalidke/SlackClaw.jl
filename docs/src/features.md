@@ -5,7 +5,7 @@ CurrentModule = SlackClaw
 # Features
 
 All features are toggles or fields on [`SlackClawConfig`](@ref). Defaults are in
-the [configuration table](https://github.com/LidkeLab/SlackClaw.jl#configuration).
+the [configuration table](https://github.com/kalidke/SlackClaw.jl#configuration).
 
 ## Agent directives
 

@@ -1,7 +1,7 @@
 # SlackClaw
 
-[![Build Status](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml?query=branch%3Amain)
-[![Coverage](https://codecov.io/gh/LidkeLab/SlackClaw.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/LidkeLab/SlackClaw.jl)
+[![Build Status](https://github.com/kalidke/SlackClaw.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/kalidke/SlackClaw.jl/actions/workflows/CI.yml?query=branch%3Amain)
+[![Coverage](https://codecov.io/gh/kalidke/SlackClaw.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/kalidke/SlackClaw.jl)
 
 Slack-to-Claude Code bridge. SlackClaw watches Slack channels, dispatches messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as subprocesses, and posts results back as threaded replies. Messages arrive in real time over [Slack Socket Mode](https://api.slack.com/apis/socket-mode) (push). Supports multi-turn sessions, concurrent tasks, multi-channel listening, proactive checks, and an agent loop with `[CONTINUE]`/`[SCHEDULE]` directives for autonomous workflows.
 
