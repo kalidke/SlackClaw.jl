@@ -316,9 +316,9 @@ end
 
 @testset "fleet validation" begin
     vf = SlackClaw.validate_fleet
-    mk(ch; bot="xoxb-1", app="xapp-1", repo="/tmp/repo_$ch", sf=".slackclaw_state.json", sock=true) =
+    mk(ch; bot="xoxb-1", app="xapp-1", repo="/tmp/repo_$ch", sf=".slackclaw_state.json") =
         SlackClawConfig(slack_bot_token=bot, slack_channel_id=ch, app_token=app,
-                        socket_mode=sock, repo_dir=repo, state_file=sf)
+                        repo_dir=repo, state_file=sf)
 
     # Valid fleet of two
     @test vf([mk("C1"), mk("C2")]) === nothing
@@ -329,7 +329,6 @@ end
     @test_throws ErrorException vf([mk("C1"), mk("C1")])                    # duplicate channel
     @test_throws ErrorException vf([mk("C1"), mk("C2"; app="xapp-2")])      # mixed app tokens
     @test_throws ErrorException vf([mk("C1"), mk("C2"; bot="xoxb-2")])      # mixed workspaces
-    @test_throws ErrorException vf([mk("C1"; sock=false), mk("C2")])        # not opted in
     @test_throws ErrorException vf([mk("C1"; app="")])                      # missing app token
 
     # Shared repo_dir + default state_file = state clobber → error
@@ -366,7 +365,6 @@ end
     @test cfg.max_active_threads == 3
     @test cfg.max_thread_idle_s == 604800
     @test cfg.max_continue == 10
-    @test cfg.socket_mode == false
     @test cfg.reconcile_interval_s == 300
     @test cfg.state_file == ".slackclaw_state.json"
     @test cfg.agent_directives == true
@@ -380,6 +378,30 @@ end
     @test cfg.proactive_enabled == false
     @test cfg.proactive_prompt == ""
     @test cfg.proactive_interval_s == 3600
+end
+
+@testset "generate_manifest" begin
+    gm = SlackClaw.generate_manifest
+    m = gm()
+    @test occursin("socket_mode_enabled: true", m)
+    @test occursin("name: SlackClaw", m)
+    @test occursin("display_name: SlackClaw", m)
+    # every scope the running monitor uses is declared
+    for s in ("channels:history", "groups:history", "chat:write", "reactions:write",
+              "files:write", "channels:join")
+        @test occursin("- $s", m)
+    end
+    for e in ("message.channels", "message.groups", "message.im")
+        @test occursin("- $e", m)
+    end
+    # custom app name flows through
+    @test occursin("name: MyBot", gm(app_name="MyBot"))
+end
+
+@testset "api()" begin
+    s = SlackClaw.api()
+    @test s isa AbstractString
+    @test occursin("SlackClaw.jl API Reference", s)
 end
 
 end

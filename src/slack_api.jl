@@ -78,6 +78,14 @@ function slack_auth_test(config::SlackClawConfig)
 end
 
 """
+    slack_auth_test_info(config) -> Dict
+
+Call `auth.test` and return the full response dict (`user_id`, `user`, `team`,
+`team_id`, `url`). Validates the bot token; used by setup for a friendly report.
+"""
+slack_auth_test_info(config::SlackClawConfig) = slack_request(:post, "auth.test", config)
+
+"""
     slack_conversations_info(config, channel_id) -> Dict
 
 Fetch channel metadata. Returns the full channel info dict.
@@ -87,6 +95,36 @@ function slack_conversations_info(config::SlackClawConfig, channel_id::AbstractS
         query=Dict("channel" => channel_id))
     return data["channel"]
 end
+
+"""
+    slack_conversations_list(config; types="public_channel,private_channel") -> Vector
+
+List channels the bot can see, following pagination. Each entry has at least
+`id` and `name`. Used by setup to resolve a channel name to its ID.
+"""
+function slack_conversations_list(config::SlackClawConfig;
+                                  types::AbstractString="public_channel,private_channel")
+    channels = Any[]
+    cursor = ""
+    for _ in 1:50  # page cap: 50 * 200 = 10k channels
+        query = Dict("types" => types, "limit" => "200", "exclude_archived" => "true")
+        isempty(cursor) || (query["cursor"] = cursor)
+        data = slack_request(:get, "conversations.list", config; query)
+        append!(channels, get(data, "channels", []))
+        cursor = get(get(data, "response_metadata", Dict()), "next_cursor", "")
+        isempty(cursor) && break
+    end
+    return channels
+end
+
+"""
+    slack_conversations_join(config, channel_id) -> Dict
+
+Join a public channel (`conversations.join`, scope `channels:join`). Private
+channels cannot be self-joined — a human must `/invite` the bot.
+"""
+slack_conversations_join(config::SlackClawConfig, channel_id::AbstractString) =
+    slack_request(:post, "conversations.join", config; body=Dict("channel" => channel_id))
 
 """
     slack_get_history(config, oldest; channel_id=config.slack_channel_id) -> Vector{Dict}

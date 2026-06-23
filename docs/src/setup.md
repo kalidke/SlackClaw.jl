@@ -1,84 +1,114 @@
-# Slack App Setup
-
-Everything SlackClaw needs on the Slack side: a bot token with the right
-scopes, a channel to watch, and — only for Socket Mode — an app-level token
-plus event subscriptions.
-
-## 1. Create the app
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**.
-2. Name it (e.g. `SlackClaw`) and pick the workspace.
-
-## 2. Bot token scopes
-
-Under **OAuth & Permissions → Bot Token Scopes** add:
-
-| Scope | Purpose |
-|-------|---------|
-| `channels:history` | Read messages in public channels |
-| `channels:read` | Resolve channel names (listen channels) |
-| `groups:history` | Read messages in private channels |
-| `chat:write` | Post messages and thread replies |
-| `reactions:write` | Status reactions (👀 ✅ ❌) |
-
-## 3. Install and collect tokens
-
-1. **Install App → Install to Workspace**, authorize.
-2. Copy the **Bot User OAuth Token** (`xoxb-...`) → `SLACK_BOT_TOKEN`.
-
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_CHANNEL_ID="C0123456789"   # step 5 below
-export SLACK_APP_TOKEN="xapp-..."       # only for Socket Mode (step 4)
+```@meta
+CurrentModule = SlackClaw
 ```
 
-## 4. Socket Mode (optional, push delivery)
+# Slack App Setup
 
-Skip if you only need polling. Three app-side switches, all required:
+SlackClaw provisions its own Slack app. The wizard automates everything that an
+API can do and groups the human-only steps into a single browser session, so
+setup is **generate → (do the browser steps once) → verify**, with no
+back-and-forth.
 
-1. **Socket Mode** (sidebar) → toggle **Enable Socket Mode**. Create the
-   prompted **app-level token** with scope `connections:write`; copy it
-   (`xapp-...`) → `SLACK_APP_TOKEN`.
+```julia
+using SlackClaw
+SlackClaw.setup()
+```
 
-   !!! note "Three token types"
-       The app-level `xapp-` token only authorizes the websocket connection.
-       It is not a bot token: replies, reactions, and uploads still use
-       `SLACK_BOT_TOKEN`. Bot tokens (`xoxb-`) cannot open Socket Mode
-       connections (`not_allowed_token_type`).
+## What you do vs. what the wizard does
 
-2. **Event Subscriptions** → **Enable Events** → **Subscribe to bot events**:
+Only three things genuinely require a human, and they are contiguous in the
+Slack web UI:
 
-   | Event | Delivers | Required bot scope |
-   |-------|----------|--------------------|
-   | `message.channels` | Public-channel messages | `channels:history` (already added) |
-   | `message.groups` | Private-channel messages | `groups:history` (already added) |
-   | `message.im` | Direct messages (optional) | `im:history` (add it if you subscribe) |
+1. **Create the app from the manifest.** At [api.slack.com/apps](https://api.slack.com/apps)
+   → **Create New App** → **From an app manifest** → pick the workspace → paste
+   the manifest the wizard printed → **Create**. The manifest pre-sets every bot
+   scope, the message-event subscriptions, and Socket Mode — there is nothing to
+   toggle by hand.
+2. **Install to workspace.** **Install App** → **Install to Workspace** →
+   **Allow**, then copy the **Bot User OAuth Token** (`xoxb-…`).
+3. **Mint the app-level token.** **Basic Information** → **App-Level Tokens** →
+   **Generate Token and Scopes** → add `connections:write` → **Generate**, then
+   copy the token (`xapp-…`).
 
-   Without these the websocket connects but never receives a message event.
+One extra step only for a **private** channel: `/invite @SlackClaw` in it.
+Public channels are joined automatically.
 
-3. **Reinstall** the app when Slack prompts (any scope/event change requires
-   it): **Install App → Reinstall to Workspace**.
+Paste the two tokens and the channel name/ID back into the wizard. From there it
+is automated — the wizard:
 
-## 5. Wire up a channel
+- validates the bot token (`auth.test`) and reports the workspace,
+- resolves the channel name to its ID,
+- **auto-joins** the channel if it is public and the bot isn't a member,
+- runs a **live Socket Mode self-test** with the app token (opens the websocket
+  and waits for Slack's `hello`),
+- writes a gitignored `slackclaw.env` (`chmod 600`) with the three values,
+- posts a confirmation to the channel,
+- prints a pass/fail checklist and the command to start the monitor.
 
-1. In the target channel: `/invite @SlackClaw`.
-2. Channel ID: right-click the channel name → **View channel details** → the
-   ID (`C0123456789`) is at the bottom → `SLACK_CHANNEL_ID`.
+## The manifest
+
+```julia
+println(SlackClaw.generate_manifest())
+```
+
+The bot scopes and events it requests, and why:
+
+| Bot scope | Purpose |
+|-----------|---------|
+| `channels:history` / `groups:history` | Read public / private channel messages |
+| `channels:read` / `groups:read` | Resolve channel names and info |
+| `channels:join` | Auto-join public channels during setup |
+| `im:history` | Direct messages (`message.im`) |
+| `chat:write` | Post messages and thread replies |
+| `reactions:write` | Status reactions (👀 ✅ ❌) |
+| `files:write` | Upload files to threads |
+
+Message events (delivered over the socket): `message.channels`,
+`message.groups`, `message.im`.
+
+!!! note "Two token types"
+    The **bot** token (`xoxb-`) does all Slack Web API work — reading history,
+    posting replies, reactions, uploads. The **app-level** token (`xapp-`, scope
+    `connections:write`) only authorizes the Socket Mode websocket; it cannot
+    call Web API methods, and a bot token cannot open a socket
+    (`not_allowed_token_type`).
+
+## Non-interactive setup
+
+For scripted or CI use, drive the two halves directly instead of the wizard:
+
+```julia
+# 1. Print the manifest to create the app from.
+println(SlackClaw.generate_manifest(; app_name = "SlackClaw"))
+
+# 2. After creating/installing the app and minting the app token, verify & wire:
+SlackClaw.verify_setup(;
+    bot_token = "xoxb-…",
+    app_token = "xapp-…",
+    channel   = "#dev",        # name or ID
+    write_env = true,          # write slackclaw.env (default)
+    announce  = true,          # post a confirmation to the channel (default)
+)
+```
+
+`verify_setup` returns `(; ok, channel_id, bot_user_id, team, checks)` and is
+safe to re-run.
 
 ## Multiple channels and workspaces
 
-- **Polling**: run one monitor instance per channel/repo pair (same bot token,
-  different `slack_channel_id`/`repo_dir`). Instances share nothing else.
-- **Socket Mode**: at most **one** socket monitor per workspace app — Slack
-  load-balances each event to exactly one open socket, so parallel socket
-  instances would each see only a random subset. Extra per-channel instances
-  must stay on polling.
+- **Many channels, one workspace:** run a single
+  [`run_socket_fleet`](socket-mode.md) process. Slack delivers each event to
+  exactly one of an app's open sockets, so
+  the whole workspace must share one connection — do not run a separate socket
+  monitor per channel under the same app.
 - **Separate workspaces** get separate apps and token sets (e.g.
-  `SLACK_BOT_TOKEN_KAL` / `SLACK_BOT_TOKEN_ATQI` resolved per instance).
+  `SLACK_BOT_TOKEN_KAL` / `SLACK_BOT_TOKEN_ATQI` resolved per process). Run
+  `setup()` once per workspace.
 
 ## Verify
 
-Start a monitor; it posts `_SlackClaw monitor started_` to the channel with
-its configuration summary (the banner includes `Socket Mode` when push is
-active). Post a message in the channel — within ~1 s (socket) or one poll
-interval (polling) the bot reacts with 👀 and replies in a thread.
+The wizard's self-test already confirms the chain end to end. To check a running
+monitor, start it: it posts `_SlackClaw monitor started_` to the channel with a
+configuration summary. Post a message — within ~1 s the bot reacts with 👀 and
+replies in a thread.
+```

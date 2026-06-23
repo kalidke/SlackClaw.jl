@@ -6,3 +6,6 @@
 /docs/build/
 .slackclaw_threads.json
 .slackclaw_state.json
+.slackclaw_crash.log
+slackclaw.env
+slackclaw_manifest.yaml

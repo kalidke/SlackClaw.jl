@@ -1,13 +1,13 @@
 """
 Slack Socket Mode (push) event loop.
 
-Replaces timer-driven history polling with a websocket: `apps.connections.open`
+Delivers Slack messages over a websocket: `apps.connections.open`
 (app-level `xapp-` token) returns a short-lived `wss://` URL; Slack pushes
 message events as envelopes. The read loop only parses, acks, and enqueues
 (Slack's ack deadline is ~3s and redelivers unacked envelopes; any blocking
 work in the read loop — even a rate-limit retry sleep — would starve the acks
 of queued frames). A single FIFO consumer task routes events into the same
-dispatch paths as polling mode; it must stay single so per-channel ts ordering
+dispatch paths shared with the reconciliation poll; it must stay single so per-channel ts ordering
 holds for cursor claims. The bot token and `chat.postMessage` reply path are
 unchanged — Socket Mode is events-in only.
 
@@ -261,7 +261,7 @@ socket_loop!(state::MonitorState) = socket_fleet_loop!([state])
 
 """
 Validate that a fleet of configs can share one socket: same workspace
-(bot/app token), socket_mode opted in, unique primary channels, and no two
+(bot/app token), a non-empty app token, unique primary channels, and no two
 channels resolving to the same state file (last-writer-wins corruption).
 """
 function validate_fleet(configs::Vector{SlackClawConfig})
@@ -269,8 +269,6 @@ function validate_fleet(configs::Vector{SlackClawConfig})
     bot = configs[1].slack_bot_token
     app = configs[1].app_token
     for c in configs
-        c.socket_mode || error("run_socket_fleet: channel $(c.slack_channel_id) has " *
-                               "socket_mode=false — fleet members must opt in explicitly")
         isempty(c.app_token) && error("run_socket_fleet: empty app_token for channel " *
                                       "$(c.slack_channel_id)")
         c.app_token == app || error("run_socket_fleet: mixed app tokens — one fleet " *
@@ -299,7 +297,7 @@ the correct shape for full-workspace push delivery. Each config gets its own
 `MonitorState` (threads, persistence, scheduled tasks, proactive checks,
 budgets); every inbound event is offered to every state, and states ignore
 channels they don't serve. All configs must share the workspace's bot and app
-tokens, opt in via `socket_mode`, and resolve to distinct state files
+tokens and resolve to distinct state files
 (override `state_file` for channels sharing a `repo_dir`).
 """
 function run_socket_fleet(configs::Vector{SlackClawConfig})

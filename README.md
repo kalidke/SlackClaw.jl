@@ -3,109 +3,94 @@
 [![Build Status](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/LidkeLab/SlackClaw.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/LidkeLab/SlackClaw.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/LidkeLab/SlackClaw.jl)
 
-Slack-to-Claude Code bridge. SlackClaw monitors Slack channels, dispatches messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as subprocesses, and posts results back as threaded replies. Supports multi-turn sessions, concurrent tasks, multi-channel listening, and an agent loop with `[CONTINUE]`/`[SCHEDULE]` directives for autonomous workflows. Messages arrive either by polling (default) or by push via [Slack Socket Mode](https://api.slack.com/apis/socket-mode) for sub-second latency.
+Slack-to-Claude Code bridge. SlackClaw watches Slack channels, dispatches messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as subprocesses, and posts results back as threaded replies. Messages arrive in real time over [Slack Socket Mode](https://api.slack.com/apis/socket-mode) (push). Supports multi-turn sessions, concurrent tasks, multi-channel listening, proactive checks, and an agent loop with `[CONTINUE]`/`[SCHEDULE]` directives for autonomous workflows.
+
+## SlackClaw vs. the Slack MCP plugin
+
+The Slack MCP plugin and SlackClaw solve opposite halves of "Slack + Claude":
+
+- The **Slack MCP plugin** gives an interactive Claude session *tools to operate Slack* — read/search channels, post, react, canvases. The direction is **outbound**: Claude, driven by a human in a Claude client, reaches into Slack. It's pull-only and in-session — nothing runs when you aren't in a Claude session, and an incoming Slack message can't trigger anything.
+- **SlackClaw** makes Slack a *frontend to autonomous Claude Code agents* on your repos. The direction is **inbound**: a Slack message arrives over Socket Mode, runs `claude` in a repo working directory, and the result posts back as a threaded reply — with no human in any Claude client.
+
+Use **SlackClaw** when you want people to *use Claude from Slack* (phone, no terminal), trigger coding agents on your own machines, and run unattended/scheduled/proactive work. Use the **MCP plugin** when you're driving Claude and want it to read or post Slack as part of your work.
+
+They're complementary, not competitors: a SlackClaw-dispatched agent can itself load the Slack MCP plugin to gain the rich read/search/canvas tooling that SlackClaw's own reply path doesn't provide.
+
+## Example use cases
+
+- **Fix a bug or add a feature from Slack.** "The CSV reader chokes on empty input — fix it and add a test." With full tool access in `repo_dir`, Claude edits files and runs the tests, then replies in the thread — ask it to commit, or set a commit policy in `system_prompt` (SlackClaw doesn't commit on its own). Reply in-thread to iterate; it resumes the same Claude session.
+- **Get a plot back as an image.** "Plot the loss curve from run 42." Claude generates the figure, saves it, and uploads it to the thread — file/image upload is built in (the bundled `bin/slack-upload` helper + the `files:write` scope).
+- **Periodically scan your repos.** With proactive mode configured, SlackClaw asks Claude on a schedule to run the checks you list (new PRs to review, failing CI, stale branches, …) and posts only when there's something worth flagging.
+- **Kick off a long job and walk away.** "Start the training run and report when it finishes." Claude launches it, can post progress by writing the status file, and uses `[SCHEDULE: 2h: check results]` to schedule a follow-up.
+- **Triage across repos from one channel.** Post in a shared hub channel; each repo's monitor picks up only what's relevant to it (relevance-filtered listening) and answers in its own channel.
+- **Ask about a codebase from your phone.** "How does the reconciliation loop avoid double-dispatch?" Claude reads the repo and explains — no terminal needed.
+
+Step-by-step setup for each is in the [Use Cases guide](docs/src/use-cases.md).
 
 ## Prerequisites
 
 - **Julia 1.10+**
 - **Claude Code CLI** (`claude`) installed and authenticated on the host machine
+- **`curl` and `jq`** on the host — only needed for file/image upload (the `bin/slack-upload` helper)
 
-## Slack App Setup (New Workspace)
+## Setup
 
-### 1. Create the Slack App
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App** > **From scratch**
-2. Name it (e.g. "SlackClaw") and select your workspace
-
-### 2. Configure Bot Permissions
-
-Navigate to **OAuth & Permissions** and add these **Bot Token Scopes**:
-
-| Scope | Purpose |
-|-------|---------|
-| `channels:history` | Read messages in public channels |
-| `channels:read` | List channels and get channel info (including listen channel names) |
-| `groups:history` | Read messages in private channels |
-| `chat:write` | Post messages and thread replies |
-| `reactions:write` | Add emoji reactions (status indicators) |
-
-### 3. Install to Workspace
-
-1. Go to **Install App** in the sidebar and click **Install to Workspace**
-2. Authorize the requested permissions
-3. Copy the **Bot User OAuth Token** (`xoxb-...`) — this is your `SLACK_BOT_TOKEN`
-
-### 4. (Optional) Enable Socket Mode — Push Delivery
-
-Skip this step if you only want polling. With Socket Mode, Slack pushes message events to SlackClaw over an outbound websocket — sub-second latency, no history polling, and no public endpoint needed (works behind firewalls/NAT). Three things must be configured on the app:
-
-1. **Enable Socket Mode**: in the app sidebar go to **Socket Mode** and toggle **Enable Socket Mode**. When prompted, create an **app-level token** with the `connections:write` scope. Copy the token (`xapp-...`) — this is your `SLACK_APP_TOKEN`. (This is a third token type, separate from the bot token: app-level tokens are workspace-app-wide and only authorize the websocket connection. Replies still go out over the bot token.)
-2. **Subscribe to message events**: go to **Event Subscriptions**, toggle **Enable Events**, expand **Subscribe to bot events**, and add:
-
-   | Event | Purpose | Required bot scope |
-   |-------|---------|--------------------|
-   | `message.channels` | Messages in public channels | `channels:history` (already added) |
-   | `message.groups` | Messages in private channels | `groups:history` (already added) |
-   | `message.im` | Direct messages (optional) | `im:history` (add if you want DMs) |
-
-   Without these subscriptions the websocket connects but receives no message events — SlackClaw will appear deaf.
-3. **Reinstall the app** if Slack prompts you to (it does whenever scopes or event subscriptions change): **Install App** > **Reinstall to Workspace**.
-
-### 5. Invite the Bot to a Channel
-
-In Slack, go to the channel you want to monitor and run:
-```
-/invite @SlackClaw
-```
-
-### 6. Get the Channel ID
-
-Right-click the channel name > **View channel details** > scroll to the bottom. The Channel ID looks like `C0123456789`. This is your `SLACK_CHANNEL_ID`.
-
-## Adding a Channel/Repo to an Existing Workspace
-
-If the Slack app is already installed in your workspace, you just need to point a new monitor instance at a different channel and repo directory.
-
-### 1. Create or Choose a Channel
-
-Create a new Slack channel for the repo, or use an existing one.
-
-### 2. Invite the Bot
-
-```
-/invite @SlackClaw
-```
-
-### 3. Get the Channel ID
-
-Right-click channel name > **View channel details** > copy the Channel ID from the bottom.
-
-### 4. Run a Monitor for That Channel/Repo
-
-Each monitor instance watches one channel and operates in one repo directory. Run a separate instance per channel:
+SlackClaw provisions its own Slack app. Run the wizard:
 
 ```julia
 using SlackClaw
-
-run_monitor(SlackClawConfig(
-    slack_bot_token = ENV["SLACK_BOT_TOKEN"],       # same token for the whole workspace
-    slack_channel_id = "C0NEW_CHANNEL_ID",          # the new channel
-    repo_dir = "/path/to/your/repo",                # working directory for Claude
-    model = "sonnet",                               # optional: claude model
-    max_budget_usd = 5.0,                           # optional: per-invocation budget cap
-))
+SlackClaw.setup()
 ```
 
-You can run multiple monitors in the same Julia process or in separate processes — they share nothing except the Slack bot token.
+It prints a Slack app **manifest** and the few browser steps only a human can do, then automates everything else — validating both tokens, resolving the channel, auto-joining public channels, a live Socket Mode self-test, and writing a gitignored `slackclaw.env`. The human steps are grouped into one browser session; there is no do-this-then-that-then-this-again back-and-forth.
 
-> **Socket Mode and multiple monitors:** the per-channel-instance pattern above applies to *polling* monitors. Slack load-balances each pushed event to exactly **one** open socket per app, so multiple Socket Mode monitors under the same app would each receive a random subset of events and miss the rest. Run at most **one** Socket Mode monitor per workspace app; keep additional per-channel instances on polling. See [Socket Mode](#socket-mode-push) below.
+The wizard walks you through these (all in one sitting at [api.slack.com/apps](https://api.slack.com/apps)):
+
+1. **Create New App → From an app manifest**, paste the manifest, **Create**. The manifest pre-sets every scope, the message events, and Socket Mode — nothing to toggle by hand.
+2. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`).
+3. **Basic Information → App-Level Tokens** → generate one with `connections:write` → copy it (`xapp-…`).
+4. *Only if your channel is private:* `/invite @SlackClaw` in it. (Public channels are auto-joined.)
+
+Paste the two tokens and the channel name back into the wizard. It verifies the whole chain and writes `slackclaw.env`.
+
+### Non-interactive
+
+```julia
+println(SlackClaw.generate_manifest())   # the YAML to paste into "From an app manifest"
+
+SlackClaw.verify_setup(;
+    bot_token = "xoxb-…",
+    app_token = "xapp-…",
+    channel   = "#dev",                  # name or ID
+)
+```
+
+### What the app uses (reference)
+
+You don't configure these by hand — the manifest does — but for transparency:
+
+| Bot scope | Purpose |
+|-----------|---------|
+| `channels:history` / `groups:history` | Read public / private channel messages |
+| `channels:read` / `groups:read` | Resolve channel names and info |
+| `channels:join` | Auto-join public channels during setup |
+| `im:history` | Direct messages (`message.im`) |
+| `chat:write` | Post messages and thread replies |
+| `reactions:write` | Status reactions (👀 ✅ ❌) |
+| `files:write` | Upload files to threads |
+
+Message events (delivered over the socket): `message.channels`, `message.groups`, `message.im`.
+
+Two tokens are involved: the **bot** token (`xoxb-`) does all Slack Web API work (reading history, posting, reactions, uploads); the **app-level** token (`xapp-`) only authorizes the Socket Mode websocket connection.
 
 ## Environment Variables
 
+`SlackClaw.setup()` writes these to `slackclaw.env` — `source` it before running. All three are **required**:
+
 ```bash
-export SLACK_BOT_TOKEN="xoxb-..."     # Bot User OAuth Token
-export SLACK_CHANNEL_ID="C0123456789" # Default channel (can override per monitor)
-export SLACK_APP_TOKEN="xapp-..."     # App-level token (only needed for socket_mode=true)
+export SLACK_BOT_TOKEN="xoxb-..."     # Bot User OAuth token (Web API)
+export SLACK_APP_TOKEN="xapp-..."     # App-level token (Socket Mode connection)
+export SLACK_CHANNEL_ID="C0123456789" # Channel to monitor
 ```
 
 ## Quick Start
@@ -114,36 +99,42 @@ export SLACK_APP_TOKEN="xapp-..."     # App-level token (only needed for socket_
 using SlackClaw
 
 # Blocking — runs until Ctrl-C
-run_monitor(SlackClawConfig())
+run_monitor(SlackClawConfig(repo_dir = "/path/to/your/repo"))
 ```
 
-Or with explicit options:
+With explicit options:
 
 ```julia
 run_monitor(SlackClawConfig(
     repo_dir = "/home/user/myproject",
     model = "sonnet",
     max_budget_usd = 1.0,
-    poll_interval_s = 30,
     max_concurrent_tasks = 3,
 ))
 ```
 
-For push delivery instead of polling (requires Slack app setup step 4):
+Serve **many channels of one workspace over a single socket** (the right shape for a whole workspace — see [one socket per workspace](#one-socket-per-workspace)):
 
 ```julia
-run_monitor(SlackClawConfig(
-    socket_mode = true,                  # SLACK_APP_TOKEN must be set
-    repo_dir = "/home/user/myproject",
-))
+bot = ENV["SLACK_BOT_TOKEN"]; app = ENV["SLACK_APP_TOKEN"]
+
+run_socket_fleet([
+    SlackClawConfig(slack_bot_token=bot, app_token=app,
+                    slack_channel_id="C_REPO_A", repo_dir="/path/to/repo-a"),
+    SlackClawConfig(slack_bot_token=bot, app_token=app,
+                    slack_channel_id="C_REPO_B", repo_dir="/path/to/repo-b"),
+])
 ```
 
-For non-blocking usage:
+Embedding (non-blocking): `start_monitor` builds the state (authenticate, load persisted state, post the banner) without looping; drive the loop yourself.
 
 ```julia
 state = start_monitor(SlackClawConfig())
-# ... do other things ...
-stop_monitor!(state)
+@async SlackClaw.socket_loop!(state)
+# ... later ...
+stop_monitor!(state)   # signals shutdown and drains in-flight tasks, but does not
+                       # force the socket closed — the loop exits at the next frame
+                       # or reconnect, so stopping an idle socket is not instant
 ```
 
 ## Configuration
@@ -152,12 +143,11 @@ All options are fields on `SlackClawConfig`:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `slack_bot_token` | `ENV["SLACK_BOT_TOKEN"]` | Bot OAuth token |
+| `slack_bot_token` | `ENV["SLACK_BOT_TOKEN"]` | Bot OAuth token (`xoxb-`) |
 | `slack_channel_id` | `ENV["SLACK_CHANNEL_ID"]` | Channel to monitor |
-| `app_token` | `get(ENV, "SLACK_APP_TOKEN", "")` | App-level `xapp-` token (Socket Mode only) |
-| `socket_mode` | `false` | Push delivery via Socket Mode instead of polling |
-| `reconcile_interval_s` | `300` | Socket Mode: seconds between gap-fill polls |
-| `poll_interval_s` | `10` | Seconds between polls |
+| `app_token` | `get(ENV, "SLACK_APP_TOKEN", "")` | **Required.** App-level `xapp-` token (`connections:write`) |
+| `reconcile_interval_s` | `300` | Seconds between gap-fill reconciliation polls |
+| `poll_interval_s` | `10` | Background housekeeping cadence (scheduled/proactive checks, reconcile tick) |
 | `repo_dir` | `pwd()` | Working directory for Claude |
 | `model` | `""` (CLI default) | Claude model name |
 | `max_budget_usd` | `0.0` (no limit) | Budget cap per invocation |
@@ -165,65 +155,54 @@ All options are fields on `SlackClawConfig`:
 | `max_turns` | `30` | Max agent turns per invocation |
 | `max_concurrent_tasks` | `5` | Parallel Claude invocations |
 | `max_active_threads` | `3` | Tracked thread sessions (oldest expire) |
+| `max_thread_idle_s` | `604800` (7 d) | Drop tracked threads idle this long (`0` = never) |
 | `max_continue` | `10` | Max consecutive `[CONTINUE]` directives |
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
 | `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
-| `allowed_tools` | `[]` | Restrict Claude to specific tools |
-| `listen_channel_ids` | `[]` | Channels to poll read-only (relevance-filtered, responses go to primary channel) |
+| `allowed_tools` | `String[]` | Restrict Claude to specific tools |
+| `listen_channel_ids` | `String[]` | Read-only channels (relevance-filtered; responses go to the primary channel) |
+| `state_file` | `.slackclaw_state.json` | Persistence file in `repo_dir` (override when channels share a `repo_dir`) |
+| `status_file` | `.slackclaw_status` | File watched during execution; its contents post as progress updates |
+| `status_poll_s` | `30` | How often to check `status_file` while Claude runs |
+| `bot_user_id` | `""` | Bot's own user ID (auto-filled at startup; used to skip self-messages) |
 | `proactive_enabled` | `false` | Enable periodic autonomous checks |
-| `proactive_prompt` | `""` | Prompt with suggestions for proactive actions |
+| `proactive_prompt` | `""` | Inline suggestions for proactive actions |
 | `proactive_interval_s` | `3600` | Seconds between proactive checks |
 
 ## How It Works
 
-1. **Poll** — Fetches new channel messages, thread replies, and listen channel messages every `poll_interval_s` seconds (or receives them by push — see Socket Mode below)
-2. **Dispatch** — Each message spawns an async Claude invocation in the configured `repo_dir`
-3. **React** — Adds emoji reactions: :eyes: (processing), :white_check_mark: (success), :x: (error)
-4. **Thread** — All responses go to the message thread, preserving conversation context
-5. **Resume** — Thread replies continue the same Claude session via `--resume`
-6. **Listen** — Messages from listen channels are relevance-filtered (irrelevant messages silently skipped) and posted to the primary channel
-7. **Proactive** — Periodically runs autonomous checks and posts if something noteworthy is found
-8. **Persist** — Sessions, scheduled tasks, and proactive timestamps survive restarts (saved to `.slackclaw_state.json`)
+1. **Receive** — Slack pushes each new message over the websocket; SlackClaw acks immediately and enqueues it.
+2. **Dispatch** — each message spawns an async Claude invocation in the configured `repo_dir`.
+3. **React** — emoji reactions track status: 👀 (processing), ✅ (success), ❌ (error).
+4. **Thread** — all responses go to the message thread, preserving conversation context; long responses split across multiple messages.
+5. **Resume** — replies in a thread continue the same Claude session via `--resume`.
+6. **Listen** — messages from listen channels are relevance-filtered (irrelevant ones silently skipped) and posted to the primary channel.
+7. **Proactive** — periodically runs autonomous checks and posts only when something is noteworthy.
+8. **Persist** — sessions, scheduled tasks, and proactive timestamps survive restarts (`.slackclaw_state.json`).
 
-### Socket Mode (Push)
+### Delivery and reliability
 
-With `socket_mode = true`, SlackClaw opens an outbound websocket (`apps.connections.open`) and Slack pushes message events as they happen. Compared to polling: latency drops from ~10s average to sub-second, per-channel history polling (and its rate-limit pressure) disappears, and listen channels are free — their events arrive on the same socket. Requires the app-level token and event subscriptions from setup step 4:
+SlackClaw opens an outbound websocket (`apps.connections.open`, authorized by the app-level token) and Slack pushes message events as they happen — sub-second latency, no public endpoint (works behind firewalls/NAT), and listen channels arrive on the same socket (the periodic reconciliation still backfills each one's history). Replies always go out over the bot token (`chat.postMessage`); the socket is events-in only.
 
-```julia
-run_monitor(SlackClawConfig(
-    socket_mode = true,
-    app_token = ENV["SLACK_APP_TOKEN"],   # xapp- token with connections:write
-    repo_dir = "/path/to/repo",
-))
-```
+Push delivery is **at-least-once with gaps** — events that fire while the connection is down are not replayed. SlackClaw keeps message cursors as a safety net: a **reconciliation poll** fetches anything newer than the cursors on every (re)connect and every `reconcile_interval_s` (default 5 min), and every message — socket or reconcile — claims its cursor exactly once before dispatch, so the two paths and any Slack redeliveries can overlap without ever double-dispatching.
 
-**Connection lifecycle.** Slack's websocket URLs are short-lived and connections are refreshed every few hours by design: Slack sends a `disconnect` frame (a `warning` about a minute ahead, then `refresh_requested`), SlackClaw reconnects with exponential backoff and requests a fresh URL each time. Each pushed envelope is acknowledged immediately on receipt — before Claude is dispatched — because unacked envelopes are redelivered after ~3 seconds while Claude runs for minutes.
+**Connection lifecycle.** Slack refreshes Socket Mode connections every few hours by design: a `disconnect` `warning` arrives ~1 min ahead (SlackClaw keeps serving), then `refresh_requested`; SlackClaw requests a fresh URL and reconnects (immediate when healthy, exponential backoff while failing). Each pushed envelope is acked on receipt — before Claude is dispatched — because unacked envelopes are redelivered after ~3 s while Claude runs for minutes.
 
-**Reliability.** Push delivery is at-least-once, and events that fire while the connection is down are not replayed by Slack. SlackClaw therefore keeps the polling cursors as a **reconciliation pass**: a gap-fill poll runs on every (re)connect and every `reconcile_interval_s` (default 5 min). Each message is claimed against its cursor exactly once, so socket events, reconciliation, and Slack redeliveries can overlap freely without a message ever being dispatched twice. State on disk (`.slackclaw_state.json`) is identical between modes — you can switch a channel between polling and Socket Mode by flipping the flag and restarting.
+See [`docs/src/socket-mode.md`](docs/src/socket-mode.md) for the full event-flow and troubleshooting reference.
 
-**Mode selection is explicit.** `socket_mode = true` with an empty `app_token` is a startup error, not a fallback to polling. Replies always go out over the bot token (`chat.postMessage`) — Socket Mode is events-in only.
+### One socket per workspace
 
-**One socket per workspace.** Slack load-balances events across an app's open sockets — each event is delivered to exactly one. Run a single Socket Mode monitor per workspace app; per-channel parallel instances must stay on polling.
-
-**Troubleshooting:**
-
-| Symptom | Likely cause |
-|---------|--------------|
-| `not_allowed_token_type` on connect | `app_token` is a bot (`xoxb-`) token — Socket Mode needs the app-level `xapp-` token |
-| `invalid_auth` on connect | App-level token revoked or from a different app |
-| Connects but never receives messages | Event subscriptions missing (setup step 4.2), or app not reinstalled after adding them |
-| Some messages arrive, others don't | Another Socket Mode connection is open for the same app (events are being split) |
-| Bot silent in one channel only | Bot not invited to that channel (`/invite @SlackClaw`) |
+Slack load-balances events across an app's open sockets — each event goes to exactly **one** of them. So a workspace must be served by exactly one connection. For multiple channels, do **not** run one socket monitor per channel under the same app (they'd each see a random subset and miss the rest) — run a single [`run_socket_fleet`](#quick-start) process that serves them all over one socket. Separate workspaces get separate apps and token sets.
 
 ### Agent Directives
 
 When `agent_directives` is enabled (default), Claude can control its own execution flow:
 
-- **`[CONTINUE]`** — Immediately re-invoke in the same session for multi-step work
-- **`[CONTINUE: next step description]`** — Re-invoke with a specific follow-up prompt
-- **`[SCHEDULE: 2h: check pipeline results]`** — Schedule a future invocation (supports `30m`, `1h`, `2h30m`, etc.)
+- **`[CONTINUE]`** — immediately re-invoke in the same session for multi-step work
+- **`[CONTINUE: next step description]`** — re-invoke with a specific follow-up prompt
+- **`[SCHEDULE: 2h: check pipeline results]`** — schedule a future invocation (`30m`, `1h`, `2h30m`, …)
 
-If no directive is present, the task is considered complete.
+If no directive is present, the task is complete.
 
 ### Multi-Channel Listening
 
@@ -231,22 +210,20 @@ A monitor can listen to additional channels beyond its primary one. Messages fro
 
 ```julia
 run_monitor(SlackClawConfig(
-    slack_channel_id = "C_PRIMARY",          # primary channel for responses
-    listen_channel_ids = ["C_GENERAL", "C_ANNOUNCE"],  # read-only channels
+    slack_channel_id = "C_PRIMARY",
+    listen_channel_ids = ["C_GENERAL", "C_ANNOUNCE"],
     repo_dir = "/path/to/repo",
 ))
 ```
 
-Channel names are resolved via the Slack API on startup and cached for the session. The bot must be invited to each listen channel. Polls are staggered between channels to stay within Slack rate limits.
-
-Listen channels use a relevance filter: Claude is asked whether each message is relevant to the instance's repo before posting. Irrelevant messages are silently dropped.
+The bot must be a member of each listen channel. Channel names are resolved on startup and cached. A relevance filter runs first: Claude is asked whether each message is relevant to the instance's repo/role before posting, and irrelevant messages are silently dropped.
 
 ### Proactive Mode
 
-When enabled, SlackClaw periodically runs Claude to autonomously check for things worth reporting. Claude reads two files in `repo_dir` at runtime:
+When enabled, SlackClaw periodically runs Claude to autonomously check for things worth reporting — but only once it has an agenda: it fires only when `.slackclaw_proactive_tasks` exists in `repo_dir` (or `proactive_prompt` is set). Claude reads two files in `repo_dir` at runtime:
 
 - **`.slackclaw_proactive_tasks`** — what to check (task suggestions). Editable anytime without restart.
-- **`.slackclaw_proactive_log`** — what was already reported (auto-appended). Prevents repetition.
+- **`.slackclaw_proactive_log`** — what was already reported (auto-appended). Gives Claude context to avoid repeats.
 
 If nothing is noteworthy, Claude responds `[SKIP]` and stays silent.
 
@@ -257,29 +234,31 @@ run_monitor(SlackClawConfig(
 ))
 ```
 
-Task suggestions go in `.slackclaw_proactive_tasks` (created by the orchestrator or manually):
+Task suggestions go in `.slackclaw_proactive_tasks` (created by an orchestrator or by hand):
+
 ```
 - Check for open PRs that need review
 - Summarize notable recent commits
 - Check if any CI pipelines are failing
 ```
 
-The `proactive_prompt` config field can provide additional inline instructions if needed, but task suggestions should go in the file for hot-reload support.
+Frequency can be adjusted live via Slack messages in the monitored channel:
 
-Frequency can be adjusted dynamically via Slack messages:
 - `proactive every 30m` — change interval
 - `proactive off` / `proactive on` — toggle
 
+### Progress updates during long tasks
+
+While Claude runs, SlackClaw watches `status_file` (`.slackclaw_status` in `repo_dir`, polled every `status_poll_s`). Any non-empty content present when it polls is posted to the thread as a progress update (a value overwritten between polls can be missed), then the file is cleared when the task finishes. This lets a long-running task narrate itself.
+
 ## Running as a Service
 
-A simple systemd unit or tmux session works well:
+A tmux session or systemd unit works well. Serve a whole workspace with one fleet process:
 
 ```bash
-# tmux approach
 tmux new -s slackclaw
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_CHANNEL_ID="C0123456789"
-julia --project=/path/to/SlackClaw -e "using SlackClaw; run_monitor(SlackClawConfig(repo_dir=\"/path/to/repo\"))"
+source slackclaw.env          # SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_CHANNEL_ID
+julia --project=/path/to/SlackClaw examples/fleet.jl
 ```
 
-For multiple channels, run one tmux pane or systemd unit per channel/repo pair.
+One Slack app == one socket == one process per workspace. For a second workspace, use its own app and token set and run a second process.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-SlackClaw is a Julia package that bridges Slack channels to Claude Code. It receives Slack messages (polling by default, or push via Socket Mode), dispatches them to the Claude CLI as subprocesses, and posts results back to threads. Supports multi-turn sessions, agent directives (`[CONTINUE]`/`[SCHEDULE]`), concurrent tasks, multi-channel listening, proactive mode, status file watching, and state persistence across restarts.
+SlackClaw is a Julia package that bridges Slack channels to Claude Code. It receives Slack messages over Slack Socket Mode (push), dispatches them to the Claude CLI as subprocesses, and posts results back to threads. Supports multi-turn sessions, agent directives (`[CONTINUE]`/`[SCHEDULE]`), concurrent tasks, multi-channel listening, proactive mode, status file watching, and state persistence across restarts.
 
 ## Commands
 
@@ -23,36 +23,37 @@ Tests cover pure logic (directive parsing, message filtering, Claude output pars
 
 ## Required Environment
 
-- `SLACK_BOT_TOKEN` — Bot token with scopes: `channels:history`, `channels:read`, `groups:history`, `chat:write`, `reactions:write`
+All three are required — run `SlackClaw.setup()` to provision the app and tokens:
+
+- `SLACK_BOT_TOKEN` — Bot token. Manifest scopes: `channels:history`, `channels:read`, `channels:join`, `groups:history`, `groups:read`, `im:history`, `chat:write`, `reactions:write`, `files:write`
 - `SLACK_CHANNEL_ID` — Target channel to monitor
-- `SLACK_APP_TOKEN` — App-level `xapp-` token with `connections:write` (only for `socket_mode=true`; app must have Socket Mode enabled and bot events `message.channels`/`message.groups`/`message.im` subscribed)
+- `SLACK_APP_TOKEN` — App-level `xapp-` token with `connections:write` (Socket Mode; create the app from the manifest so `message.channels`/`message.groups`/`message.im` are subscribed)
 
 ## Architecture
 
-Seven source files, all included from `SlackClaw.jl`:
+Eight source files, all included from `SlackClaw.jl`:
 
 - **config.jl** — `SlackClawConfig` kwdef struct with all settings (poll interval, model, budget, timeouts, directive toggles)
 - **message_types.jl** — `SlackMessage` struct; `parse_slack_messages()` and `should_process()` filtering (skips bots, self, empty)
 - **directives.jl** — Agent control flow: `parse_directives()` extracts `[CONTINUE]`/`[SCHEDULE: duration: prompt]`/done from response text via regex
 - **slack_api.jl** — HTTP wrappers for Slack Web API with rate-limit retry (exponential backoff). All channel-scoped functions accept an explicit `channel_id` kwarg (defaults to `config.slack_channel_id`)
 - **claude_runner.jl** — `run_claude()` spawns `claude --print --output-format json --dangerously-skip-permissions` subprocess; returns `ClaudeResult` (success, text, cost, session_id). Strips all `CLAUDE_*` env vars from subprocess environment to prevent session leakage. Appends `DIRECTIVE_INSTRUCTIONS` to system prompt when `agent_directives` is enabled.
-- **monitor.jl** — Core polling loop and agent loop. Contains `MonitorState`, `ThreadSession`, `ScheduledTask`, persistence via `.slackclaw_state.json`. `ThreadSession` carries `channel_id` for multi-channel thread tracking. `reconcile_messages!` is the full message-fetch pass (primary history + threads + listen channels); `claim_*!` cursor gates make dispatch idempotent. `post_response` chunks long text across multiple thread messages (`chunk_text`)
-- **socket_mode.jl** — Socket Mode (push) event loop: `socket_loop!` connects via `apps.connections.open` (app-level token), acks envelopes immediately, and routes events through `classify_socket_event` into the same dispatch paths. `socket_housekeeping!` fires scheduled/proactive checks and the periodic reconciliation poll
+- **monitor.jl** — Core agent loop, dispatch, and reconciliation. Contains `MonitorState`, `ThreadSession`, `ScheduledTask`, persistence via `.slackclaw_state.json`. `ThreadSession` carries `channel_id` for multi-channel thread tracking. `reconcile_messages!` is the full message-fetch pass (primary history + threads + listen channels); `claim_*!` cursor gates make dispatch idempotent. `post_response` chunks long text across multiple thread messages (`chunk_text`)
+- **socket_mode.jl** — Socket Mode (push) event loop: `socket_loop!` connects via `apps.connections.open` (app-level token), acks envelopes immediately, and routes events through `classify_socket_event` into the dispatch paths. `socket_housekeeping!` fires scheduled/proactive checks and the periodic reconciliation poll
+- **setup.jl** — Setup assistant. `generate_manifest()` builds the Slack app manifest (scopes + events + Socket Mode); `verify_setup()` validates tokens, resolves/joins the channel, runs a live socket self-test, writes `slackclaw.env`; `setup()` is the interactive wizard. Groups the human-only browser steps so there's no back-and-forth
 
 ### Data Flow
 
-1. `poll_once!()` fetches new channel messages → parses/filters → `dispatch_command!()` for each
-2. Also polls tracked thread sessions for replies → `dispatch_thread_reply!()`
-3. Polls listen channels → `poll_listen_channels!()` → `dispatch_listen_command!()` (relevance-filtered, posts to primary channel only if relevant)
-4. Checks and fires due `ScheduledTask`s
-5. `check_proactive!()` runs periodic autonomous checks if enabled
-6. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds eyes reaction and calls `run_agent_loop!()` as `@async` task
-6. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break
-7. Status file (`.slackclaw_status`) watched in background during execution, updates posted to thread
+1. Slack pushes message events over the websocket; `socket_event_consumer!` drains a FIFO queue and `route_socket_event!` classifies each via `classify_socket_event` (`:primary`/`:thread_reply`/`:listen`/`:ignore`)
+2. The matching `claim_*!` cursor gate runs, then `should_process` filters bots/self/empty, then the `dispatch_*` function fires
+3. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds the eyes reaction and calls `run_agent_loop!()` as an `@async` task
+4. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break
+5. `socket_housekeeping!()` (background, every `poll_interval_s`) fires `check_scheduled!`/`check_proactive!`, and runs `reconcile_messages!` every `reconcile_interval_s` as gap-fill (primary history + thread replies + listen channels) through the same `claim_*!`/`dispatch_*` path
+6. Status file (`.slackclaw_status`) watched in background during execution, updates posted to thread
 
 ### Socket Mode (Push)
 
-With `socket_mode=true`, `run_monitor` runs `socket_loop!` instead of the poll loop (explicit selection — empty `app_token` is a startup error, never a silent fallback to polling). Flow:
+`run_monitor` connects a single channel via Socket Mode (`run_socket_fleet` for many); an empty `app_token` is a startup error. Flow:
 
 1. `apps.connections.open` (app-level token) → short-lived `wss://` URL → `HTTP.WebSockets.open`
 2. Slack pushes message events as envelopes; the read loop only parses, **acks immediately** (≈3s deadline), and enqueues onto a `Channel` — it never does API work, so a rate-limit retry in dispatch can't starve acks of queued frames
@@ -65,7 +66,7 @@ Caveat for multi-instance setups: all channels of one Slack app arrive on one so
 
 ### Socket Fleet (full-workspace push)
 
-`run_socket_fleet(configs::Vector{SlackClawConfig})` serves MANY channels over ONE socket — the correct shape for a whole workspace on push. Each config gets its own `MonitorState` (threads, persistence, proactive, budgets — semantics identical to a single-channel monitor); the FIFO consumer offers every event to every state and non-matching states ignore it via `classify_socket_event`. Per-state housekeeping tasks are start-staggered (7s apart) to spread reconcile load. `validate_fleet` enforces: same bot+app token across the fleet, `socket_mode=true` everywhere, unique primary channels, and unique `(repo_dir, state_file)` pairs — channels sharing a `repo_dir` must override `config.state_file` or startup errors (state files are last-writer-wins). `socket_loop!` (single channel) is just a fleet of one.
+`run_socket_fleet(configs::Vector{SlackClawConfig})` serves MANY channels over ONE socket — the correct shape for a whole workspace on push. Each config gets its own `MonitorState` (threads, persistence, proactive, budgets — semantics identical to a single-channel monitor); the FIFO consumer offers every event to every state and non-matching states ignore it via `classify_socket_event`. Per-state housekeeping tasks are start-staggered (7s apart) to spread reconcile load. `validate_fleet` enforces: same bot+app token across the fleet, unique primary channels, and unique `(repo_dir, state_file)` pairs — channels sharing a `repo_dir` must override `config.state_file` or startup errors (state files are last-writer-wins). `socket_loop!` (single channel) is just a fleet of one.
 
 ### Concurrency
 

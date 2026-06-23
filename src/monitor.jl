@@ -241,7 +241,7 @@ end
 Authenticate with Slack, load persisted state, resolve listen-channel names,
 and post the startup banner. Returns the [`MonitorState`](@ref) without
 entering a message loop — use [`run_monitor`](@ref) for the blocking
-entry point, or drive `poll_once!` yourself and call
+entry point, or run `socket_loop!` yourself and call
 [`stop_monitor!`](@ref) when done.
 """
 function start_monitor(config::SlackClawConfig)
@@ -275,7 +275,6 @@ function start_monitor(config::SlackClawConfig)
 
     info_parts = ["Repo: `$(config.repo_dir)`"]
     !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
-    config.socket_mode && push!(info_parts, "Socket Mode")
     config.agent_directives && push!(info_parts, "Agent mode")
     !isempty(config.listen_channel_ids) && push!(info_parts,
         "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
@@ -284,38 +283,29 @@ function start_monitor(config::SlackClawConfig)
     slack_post_message(config,
         "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
 
-    if config.socket_mode
-        @info "SlackClaw: Socket Mode (reconcile every $(config.reconcile_interval_s)s)"
-    else
-        @info "SlackClaw: starting poll loop (interval=$(config.poll_interval_s)s)"
-    end
+    @info "SlackClaw: Socket Mode (reconcile every $(config.reconcile_interval_s)s)"
     return state
 end
 
 """
     run_monitor(config::SlackClawConfig)
 
-Blocking main entry point. Starts the monitor and serves messages until
-interrupted (Ctrl-C): with `config.socket_mode == false` (default) this is
-the timer-driven poll loop; with `socket_mode == true` it is the Socket Mode
-websocket loop (requires `config.app_token`; errors at startup if empty —
-there is no silent fallback to polling). Fatal errors are appended to
+Blocking entry point for a single channel. Connects via Slack Socket Mode and
+serves pushed message events until interrupted (Ctrl-C). Requires
+`config.app_token` (an `xapp-` app-level token with `connections:write`) and
+errors at startup if it is empty. To serve many channels of one workspace over
+a single socket, use [`run_socket_fleet`](@ref). Fatal errors are appended to
 `.slackclaw_crash.log` in `repo_dir` before rethrowing.
 """
 function run_monitor(config::SlackClawConfig)
     crash_log = joinpath(config.repo_dir, ".slackclaw_crash.log")
     try
-        if config.socket_mode && isempty(config.app_token)
-            error("socket_mode=true but app_token is empty — set SLACK_APP_TOKEN " *
-                  "(xapp- token with connections:write). There is no fallback to polling.")
-        end
+        isempty(config.app_token) &&
+            error("app_token is empty — set SLACK_APP_TOKEN (xapp- token with " *
+                  "connections:write scope). Run SlackClaw.setup() to provision it.")
         state = start_monitor(config)
         try
-            if config.socket_mode
-                socket_loop!(state)
-            else
-                poll_loop!(state)
-            end
+            socket_loop!(state)
         catch e
             e isa InterruptException || rethrow()
         finally
@@ -332,34 +322,12 @@ function run_monitor(config::SlackClawConfig)
     end
 end
 
-"""Polling-mode main loop. Runs until `state.running` is false."""
-function poll_loop!(state::MonitorState)
-    while state.running
-        try
-            poll_once!(state)
-        catch e
-            @error "SlackClaw poll error" exception=(e, catch_backtrace())
-        end
-        for _ in 1:state.config.poll_interval_s
-            state.running || break
-            sleep(1)
-        end
-    end
-end
-
-function poll_once!(state::MonitorState)
-    state.running || return
-    reconcile_messages!(state)
-    check_scheduled!(state)
-    check_proactive!(state)
-end
-
 """
-Fetch and dispatch anything newer than the cursors: primary-channel history,
-tracked thread replies, listen channels. The whole message path of polling
-mode; in Socket Mode this runs as the gap-fill reconciliation (on reconnect
-and every `reconcile_interval_s`) — cursor claims drop anything the socket
-already dispatched.
+Gap-fill reconciliation: fetch and dispatch anything newer than the cursors —
+primary-channel history, tracked thread replies, and listen channels. Socket
+Mode delivery is at-least-once with gaps across reconnects, so this runs on
+every (re)connect and every `reconcile_interval_s`; the `claim_*!` cursor gates
+drop anything the live socket already dispatched.
 """
 function reconcile_messages!(state::MonitorState)
     state.running || return

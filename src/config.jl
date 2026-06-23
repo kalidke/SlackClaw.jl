@@ -1,20 +1,24 @@
 """
 Configuration for SlackClaw monitor.
 
-All fields have sensible defaults. `slack_bot_token` and `slack_channel_id`
-default to reading from environment variables.
+All fields have sensible defaults. `slack_bot_token`, `slack_channel_id`, and
+`app_token` default to reading `SLACK_BOT_TOKEN` / `SLACK_CHANNEL_ID` /
+`SLACK_APP_TOKEN` from the environment. `app_token` is required — SlackClaw
+delivers messages exclusively over Slack Socket Mode. Run `SlackClaw.setup()`
+to provision the app and tokens.
 """
 Base.@kwdef mutable struct SlackClawConfig
     slack_bot_token::String = ENV["SLACK_BOT_TOKEN"]
     slack_channel_id::String = ENV["SLACK_CHANNEL_ID"]
-    app_token::String = get(ENV, "SLACK_APP_TOKEN", "")  # app-level xapp- token (Socket Mode)
-    socket_mode::Bool = false           # true = Socket Mode (push), false = polling; no silent fallback
-    reconcile_interval_s::Int = 300     # Socket Mode: gap-fill poll cadence
-    poll_interval_s::Int = 10
+    app_token::String = get(ENV, "SLACK_APP_TOKEN", "")  # app-level xapp- token, REQUIRED (connections:write)
+    reconcile_interval_s::Int = 300     # gap-fill reconciliation poll cadence
+    poll_interval_s::Int = 10           # background housekeeping cadence (scheduled/proactive + reconcile tick)
     repo_dir::String = pwd()
     max_budget_usd::Float64 = 0.0  # 0 = no limit flag passed
     model::String = ""              # empty = use CLI default
     claude_timeout_s::Int = 3600
+    claude_max_retries::Int = 2             # retry a transient non-zero exit (rate limit/overload) this many times
+    claude_retry_backoff_s::Float64 = 3.0   # base backoff between retries (grows exponentially)
     max_turns::Int = 30
     allowed_tools::Vector{String} = String[]
     max_concurrent_tasks::Int = 5

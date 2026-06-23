@@ -1,14 +1,15 @@
 using SlackClaw
 
-# Requires SLACK_BOT_TOKEN and SLACK_CHANNEL_ID environment variables.
-# The bot token needs: channels:history, channels:read, chat:write, reactions:write scopes.
+# First-time setup (interactive) — provisions the Slack app, scopes, Socket Mode,
+# and both tokens for you, then writes them to slackclaw.env:
+#
+#   julia --project -e 'using SlackClaw; SlackClaw.setup()'
+#
+# After that, `source slackclaw.env` to load SLACK_BOT_TOKEN, SLACK_APP_TOKEN,
+# and SLACK_CHANNEL_ID, then run a single-channel monitor:
 
-monitor = start_monitor(SlackClawConfig(
-    repo_dir = "/home/kalidke/julia_shared_dev/SMLMAnalysis",
+run_monitor(SlackClawConfig(
+    repo_dir = "/path/to/your/repo",
     model = "sonnet",
     max_budget_usd = 1.0,
-    poll_interval_s = 60,
 ))
-
-# Monitor runs in background via Timer. Stop with:
-# stop_monitor!(monitor)

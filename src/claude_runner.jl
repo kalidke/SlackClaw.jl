@@ -10,6 +10,17 @@ struct ClaudeResult
 end
 
 """
+Appended to the system prompt when the upload helper and a Slack thread are
+available, so Claude knows it can post files/images back to the thread.
+"""
+const UPLOAD_INSTRUCTIONS = """
+To send a file or image back to Slack (for example a plot you generated), run the \
+uploader at the \$SLACKCLAW_UPLOAD environment variable: \
+`\$SLACKCLAW_UPLOAD <file_path> ["caption"]`. It attaches the file to the current \
+thread. Save the figure to a file first, then upload it.
+"""
+
+"""
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
 
 Run `claude` CLI in `--print` mode with JSON output. Blocks until complete or timeout.
@@ -30,10 +41,16 @@ function run_claude(prompt::String, config::SlackClawConfig;
         push!(args, "--resume", session_id)
     end
 
-    # Build system prompt: user config + directive instructions
+    # Upload helper availability: needs the script plus a thread to post into.
+    upload_bin = normpath(joinpath(@__DIR__, "..", "bin", "slack-upload"))
+    can_upload = isfile(upload_bin) && !isempty(thread_ts) &&
+                 !isempty(channel_id) && !isempty(config.slack_bot_token)
+
+    # Build system prompt: user config + directives + upload helper
     sys_parts = String[]
     !isempty(config.system_prompt) && push!(sys_parts, config.system_prompt)
     config.agent_directives && push!(sys_parts, DIRECTIVE_INSTRUCTIONS)
+    can_upload && push!(sys_parts, UPLOAD_INSTRUCTIONS)
     if !isempty(sys_parts)
         push!(args, "--system-prompt", join(sys_parts, "\n\n"))
     end
@@ -53,66 +70,84 @@ function run_claude(prompt::String, config::SlackClawConfig;
     # Build clean environment without Claude session vars
     filtered_env = String["$(k)=$(v)" for (k, v) in ENV if !startswith(k, "CLAUDE")]
 
-    # Inject SlackClaw context for file upload support
-    if !isempty(thread_ts)
-        push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")
-    end
-    if !isempty(channel_id)
-        push!(filtered_env, "SLACKCLAW_CHANNEL_ID=$channel_id")
-    end
-    if !isempty(config.slack_bot_token)
-        push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
-    end
-    # Path to the upload helper script (sibling to this package's src/)
-    upload_bin = normpath(joinpath(@__DIR__, "..", "bin", "slack-upload"))
-    if isfile(upload_bin)
-        push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
-    end
+    # Inject SlackClaw context so the upload helper can post into this thread.
+    !isempty(thread_ts) && push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")
+    !isempty(channel_id) && push!(filtered_env, "SLACKCLAW_CHANNEL_ID=$channel_id")
+    !isempty(config.slack_bot_token) && push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
+    isfile(upload_bin) && push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
 
     cmd = setenv(`$args`, filtered_env; dir=config.repo_dir)
 
     t_start = time()
-    output = ""
-    timed_out = false
 
-    task = @async try
-        read(cmd, String)
-    catch e
-        if e isa ProcessFailedException
-            "Process failed (exit code non-zero)"
-        else
-            rethrow()
-        end
-    end
-
-    # Wait with timeout
-    timer = Timer(config.claude_timeout_s)
-    @async begin
-        wait(timer)
-        if !istaskdone(task)
-            timed_out = true
-            # Kill the process group -- schedule_kill triggers SIGTERM
-            try
-                Base.throwto(task, InterruptException())
-            catch; end
-        end
-    end
-
-    try
-        output = fetch(task)
-    catch e
-        output = "Error: $e"
-    finally
-        close(timer)
+    # Run with retry. A non-zero exit from `claude` is usually transient (rate
+    # limit / overload / brief usage cap), so retry with exponential backoff
+    # before giving up. stderr is captured (not discarded) so the real reason is
+    # surfaced. We do NOT retry a timeout, nor a non-zero exit that already
+    # produced stdout (it may have done partial work).
+    res = _run_claude_once(cmd, config.claude_timeout_s)
+    attempt = 0
+    while !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
+          attempt < config.claude_max_retries
+        attempt += 1
+        backoff = config.claude_retry_backoff_s * 2.0^(attempt - 1)
+        @warn "SlackClaw: claude exited non-zero — retrying" attempt exitcode=res.exitcode backoff_s=backoff stderr=last(strip(res.stderr), 300)
+        sleep(backoff)
+        res = _run_claude_once(cmd, config.claude_timeout_s)
     end
 
     duration_ms = round(Int, (time() - t_start) * 1000)
 
-    if timed_out
+    if res.timed_out
+        @warn "SlackClaw: claude timed out" timeout_s=config.claude_timeout_s
         return ClaudeResult(false, "Timed out after $(config.claude_timeout_s)s", duration_ms, 0.0, "")
     end
 
-    return parse_claude_output(output, duration_ms)
+    if res.exitcode != 0
+        reason = strip(res.stderr)
+        msg = isempty(reason) ? "Claude exited non-zero (code $(res.exitcode))" :
+              "Claude exited non-zero (code $(res.exitcode)): $(last(reason, 500))"
+        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode stderr=reason
+        return ClaudeResult(false, msg, duration_ms, 0.0, "")
+    end
+
+    return parse_claude_output(res.stdout, duration_ms)
+end
+
+"""
+    _run_claude_once(cmd, timeout_s) -> NamedTuple
+
+Run `cmd` once, capturing stdout and stderr separately and enforcing a hard
+timeout (SIGTERM on overrun). Never throws on a non-zero exit; the caller
+inspects `exitcode` / `stdout` / `stderr` / `timed_out`.
+"""
+function _run_claude_once(cmd::Base.AbstractCmd, timeout_s::Real)
+    out = Pipe()
+    err = Pipe()
+    timed_out = false
+    proc = try
+        run(pipeline(ignorestatus(cmd), stdout=out, stderr=err); wait=false)
+    catch e
+        # Couldn't even spawn (e.g. `claude` not on PATH)
+        return (exitcode = -1, stdout = "",
+                stderr = "failed to spawn claude: $(sprint(showerror, e))", timed_out = false)
+    end
+    close(out.in)
+    close(err.in)
+    sout = @async read(out, String)
+    serr = @async read(err, String)
+    timer = Timer(timeout_s) do _
+        if Base.process_running(proc)
+            timed_out = true
+            try; kill(proc); catch; end   # SIGTERM
+        end
+    end
+    try
+        wait(proc)
+    finally
+        close(timer)
+    end
+    return (exitcode = proc.exitcode, stdout = fetch(sout), stderr = fetch(serr), timed_out = timed_out)
 end
 
 """
