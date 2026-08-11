@@ -90,6 +90,8 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `max_continue::Int = 10` — max consecutive `[CONTINUE]`
 - `system_prompt::String` — a Slack-formatting brevity prompt (full literal below)
 - `agent_directives::Bool = true` — enable `[CONTINUE]`/`[SCHEDULE]`
+- `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no reaction; thread session still tracked). Mechanism only — tell Claude about the convention via `system_prompt`
+- `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
 - `state_file::String = ".slackclaw_state.json"`
 - `status_file::String = ".slackclaw_status"`
 - `status_poll_s::Int = 30`

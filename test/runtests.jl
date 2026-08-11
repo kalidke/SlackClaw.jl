@@ -378,6 +378,42 @@ end
     @test cfg.proactive_enabled == false
     @test cfg.proactive_prompt == ""
     @test cfg.proactive_interval_s == 3600
+    @test cfg.allow_skip == false
+    @test cfg.announce_startup == false
+end
+
+@testset "should_skip_response" begin
+    ssr = SlackClaw.should_skip_response
+
+    # Exact match with the gate enabled — surrounding whitespace is stripped
+    @test ssr("[SKIP]", true)
+    @test ssr("  [SKIP] \n", true)
+
+    # Gate disabled (the default) never skips
+    @test !ssr("[SKIP]", false)
+
+    # EXACT match only, deliberately stricter than the listen/proactive
+    # startswith gates: anything beyond the bare token is a real answer
+    @test !ssr("[SKIP] — but here is why I skip some messages", true)
+    @test !ssr("The [SKIP] convention works like this", true)
+    @test !ssr("[skip]", true)   # case-sensitive
+    @test !ssr("", true)
+
+    # One shared token across all three gate sites
+    @test SlackClaw.SKIP_TOKEN == "[SKIP]"
+    @test occursin(SlackClaw.SKIP_TOKEN, SlackClaw.LISTEN_RELEVANCE_PREFIX)
+    @test occursin(SlackClaw.SKIP_TOKEN, SlackClaw.PROACTIVE_PREFIX)
+end
+
+@testset "resolve_self_mentions" begin
+    rsm = SlackClaw.resolve_self_mentions
+
+    @test rsm("hey <@UBOT> can you check CI?", "UBOT") == "hey @you can you check CI?"
+    # Only the bot's own ID is rewritten; other users' mentions stay raw
+    @test rsm("<@UBOT> ask <@UOTHER>, then <@UBOT>", "UBOT") == "@you ask <@UOTHER>, then @you"
+    @test rsm("no mentions here", "UBOT") == "no mentions here"
+    # Unresolved bot ID (auth not run) → no-op
+    @test rsm("<@UBOT>", "") == "<@UBOT>"
 end
 
 @testset "generate_manifest" begin
@@ -402,6 +438,53 @@ end
     s = SlackClaw.api()
     @test s isa AbstractString
     @test occursin("SlackClaw.jl API Reference", s)
+end
+
+# KEEP LAST: overwrites SlackClaw methods (run_claude, post_response,
+# slack_add_reaction) with stubs for the rest of the process. Runs the real
+# run_agent_loop! to pin the skip gate's placement: a skipped reply must post
+# nothing and add no reaction, but MUST still record the thread session —
+# later in-thread replies need that continuity.
+@testset "skip gate keeps session bookkeeping" begin
+    posted = String[]
+    reacted = String[]
+    Core.eval(SlackClaw, quote
+        run_claude(prompt::String, config::SlackClawConfig;
+                   session_id::String="", thread_ts::String="", channel_id::String="") =
+            ClaudeResult(true, "[SKIP]", 1, 0.0, "sess-skip")
+        post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
+                      channel_id::AbstractString=config.slack_channel_id) =
+            push!($posted, String(text))
+        slack_add_reaction(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
+                           channel_id::AbstractString=config.slack_channel_id) =
+            push!($reacted, String(emoji))
+    end)
+
+    mkstate(cfg) = SlackClaw.MonitorState(
+        cfg, "100.0", true, Task[], nothing,
+        Dict{String,SlackClaw.ThreadSession}(), Dict{String,Float64}(),
+        SlackClaw.ScheduledTask[], Dict{String,String}(),
+        Dict{String,String}(), 0.0, ReentrantLock())
+
+    # Gate ON: nothing posted, no checkmark, session still tracked
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0",
+                          repo_dir=mktempdir(), allow_skip=true)
+    state = mkstate(cfg)
+    SlackClaw.run_agent_loop!(state, "999.0", "hi", ""; react_ts="999.0")
+    foreach(wait, state.active_tasks)
+    @test isempty(posted)
+    @test isempty(reacted)
+    @test haskey(state.threads, "999.0")
+    @test state.threads["999.0"].session_id == "sess-skip"
+
+    # Gate OFF (default): 0.4.x behavior preserved — the literal token is posted
+    cfg_off = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0",
+                              repo_dir=mktempdir())
+    state_off = mkstate(cfg_off)
+    SlackClaw.run_agent_loop!(state_off, "888.0", "hi", ""; react_ts="888.0")
+    foreach(wait, state_off.active_tasks)
+    @test posted == ["[SKIP]"]
+    @test reacted == ["white_check_mark"]
 end
 
 end

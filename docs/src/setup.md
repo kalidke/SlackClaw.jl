@@ -108,7 +108,8 @@ safe to re-run.
 ## Verify
 
 The wizard's self-test already confirms the chain end to end. To check a running
-monitor, start it: it posts `_SlackClaw monitor started_` to the channel with a
-configuration summary. Post a message — within ~1 s the bot reacts with 👀 and
-replies in a thread.
+monitor, start it (with `announce_startup=true` it posts `_SlackClaw monitor
+started_` to the channel with a configuration summary; the banner is off by
+default). Post a message — within ~1 s the bot reacts with 👀 and replies in a
+thread.
 ```

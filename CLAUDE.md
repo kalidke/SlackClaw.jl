@@ -47,7 +47,7 @@ Eight source files, all included from `SlackClaw.jl`:
 1. Slack pushes message events over the websocket; `socket_event_consumer!` drains a FIFO queue and `route_socket_event!` classifies each via `classify_socket_event` (`:primary`/`:thread_reply`/`:listen`/`:ignore`)
 2. The matching `claim_*!` cursor gate runs, then `should_process` filters bots/self/empty, then the `dispatch_*` function fires
 3. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds the eyes reaction and calls `run_agent_loop!()` as an `@async` task
-4. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break
+4. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break. With `allow_skip=true`, a reply of exactly `[SKIP]` (exact match, stricter than the `startswith` listen/proactive gates — a false positive here eats a real answer) posts nothing and adds no checkmark, but still updates the thread session. Mentions of the bot itself are rewritten `<@U…>` → `@you` in `run_claude` so Claude can tell when it was tagged. Start/stop banners post only with `announce_startup=true` (default off — supervised crash-loops would spam the channel)
 5. `socket_housekeeping!()` (background, every `poll_interval_s`) fires `check_scheduled!`/`check_proactive!`, and runs `reconcile_messages!` every `reconcile_interval_s` as gap-fill (primary history + thread replies + listen channels) through the same `claim_*!`/`dispatch_*` path
 6. Status file (`.slackclaw_status`) watched in background during execution, updates posted to thread
 

@@ -21,14 +21,29 @@ thread. Save the figure to a file first, then upload it.
 """
 
 """
+    resolve_self_mentions(text, bot_user_id) -> String
+
+Rewrite Slack mentions of the bot itself (`<@U…>`) to `@you`. Slack delivers
+mentions as raw member IDs, which carry no meaning for Claude — it cannot tell
+that IT was tagged, which is the basis for deciding whether a message is
+addressed to it (e.g. the `allow_skip` teammate behavior). Other users' IDs are
+left untouched (resolving them needs `users.info` + the `users:read` scope).
+"""
+resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
+    isempty(bot_user_id) ? String(text) : replace(text, "<@$(bot_user_id)>" => "@you")
+
+"""
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
 
 Run `claude` CLI in `--print` mode with JSON output. Blocks until complete or timeout.
+Mentions of the bot itself in the prompt are rewritten to `@you`
+([`resolve_self_mentions`](@ref)).
 """
 function run_claude(prompt::String, config::SlackClawConfig;
                     session_id::String="",
                     thread_ts::String="",
                     channel_id::String="")
+    prompt = resolve_self_mentions(prompt, config.bot_user_id)
     args = String[
         "claude", "-p", prompt,
         "--print",

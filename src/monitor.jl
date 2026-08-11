@@ -44,6 +44,23 @@ const SLACK_MAX_TEXT = 3900
 const MAX_RESPONSE_CHUNKS = 10
 const STATE_FILE = ".slackclaw_state.json"
 
+"""Reply token by which Claude declines to post (listen relevance, proactive, and — when
+`allow_skip` is set — the primary/thread path)."""
+const SKIP_TOKEN = "[SKIP]"
+
+"""
+    should_skip_response(text, allow_skip) -> Bool
+
+Whether a primary/thread-path response should be silently dropped. Requires an
+EXACT match (`strip(text) == SKIP_TOKEN`), unlike the `startswith` checks on the
+listen and proactive paths: there a false positive only suppresses optional
+chatter, but here it would eat a real answer in the user's own channel — e.g. a
+reply that legitimately opens by quoting the token while explaining this
+feature. Missing a skip is cheap; eating an answer is not.
+"""
+should_skip_response(text::AbstractString, allow_skip::Bool) =
+    allow_skip && strip(text) == SKIP_TOKEN
+
 # --- Persistence ---
 
 """Save full monitor state (threads, last_ts, scheduled tasks) to disk."""
@@ -273,15 +290,17 @@ function start_monitor(config::SlackClawConfig)
                          Dict{String,Float64}(), scheduled, listen_last_ts,
                          channel_names, last_proactive, ReentrantLock())
 
-    info_parts = ["Repo: `$(config.repo_dir)`"]
-    !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
-    config.agent_directives && push!(info_parts, "Agent mode")
-    !isempty(config.listen_channel_ids) && push!(info_parts,
-        "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
-    config.proactive_enabled && push!(info_parts,
-        "Proactive: every $(div(config.proactive_interval_s, 60))m")
-    slack_post_message(config,
-        "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
+    if config.announce_startup
+        info_parts = ["Repo: `$(config.repo_dir)`"]
+        !isempty(config.model) && push!(info_parts, "Model: `$(config.model)`")
+        config.agent_directives && push!(info_parts, "Agent mode")
+        !isempty(config.listen_channel_ids) && push!(info_parts,
+            "Listening: $(join(["#$(get(channel_names, c, c))" for c in config.listen_channel_ids], ", "))")
+        config.proactive_enabled && push!(info_parts,
+            "Proactive: every $(div(config.proactive_interval_s, 60))m")
+        slack_post_message(config,
+            "_SlackClaw monitor started_ — watching this channel. " * join(info_parts, " | "))
+    end
 
     @info "SlackClaw: Socket Mode (reconcile every $(config.reconcile_interval_s)s)"
     return state
@@ -392,7 +411,7 @@ function poll_listen_channels!(state::MonitorState)
 end
 
 const LISTEN_RELEVANCE_PREFIX = """You are monitoring a shared Slack channel for messages relevant to your repo/role. \
-If the following message is NOT relevant to your project, respond with exactly "[SKIP]" and nothing else. \
+If the following message is NOT relevant to your project, respond with exactly "$(SKIP_TOKEN)" and nothing else. \
 If it IS relevant, respond normally.\n\n"""
 
 """Dispatch a message from a listen channel -- only post to primary channel if Claude deems it relevant."""
@@ -415,7 +434,7 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
 
             # Skip if Claude says not relevant, errored, or empty
             response_text = strip(result.result_text)
-            if !result.success || isempty(response_text) || startswith(response_text, "[SKIP]")
+            if !result.success || isempty(response_text) || startswith(response_text, SKIP_TOKEN)
                 @info "SlackClaw: listen message skipped (not relevant)" channel=ch_name
                 return
             end
@@ -542,7 +561,7 @@ const PROACTIVE_LOG_FILE = ".slackclaw_proactive_log"
 const PROACTIVE_TASKS_FILE = ".slackclaw_proactive_tasks"
 
 const PROACTIVE_PREFIX = """You are running a proactive check. \
-If nothing is worth posting, respond with exactly "[SKIP]" and nothing else. \
+If nothing is worth posting, respond with exactly "$(SKIP_TOKEN)" and nothing else. \
 Only post if you have something genuinely useful or interesting.
 
 Read the proactive tasks file at "%TASKS_PATH%" for your current task suggestions. \
@@ -585,7 +604,7 @@ function check_proactive!(state::MonitorState)
             result = run_claude(prompt, config)
 
             response_text = strip(result.result_text)
-            if !result.success || isempty(response_text) || startswith(response_text, "[SKIP]")
+            if !result.success || isempty(response_text) || startswith(response_text, SKIP_TOKEN)
                 @info "SlackClaw: proactive check — nothing to report"
                 return
             end
@@ -684,8 +703,13 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     (DIRECTIVE_DONE, result.result_text)
                 end
 
-                # Post the clean response (directive-only messages leave clean_text empty)
-                if !isempty(strip(clean_text))
+                # Post the clean response (directive-only messages leave clean_text empty).
+                # The skip gate sits here, AFTER the session bookkeeping above — a skipped
+                # message must still update thread state so later replies keep continuity.
+                skipped = should_skip_response(clean_text, config.allow_skip)
+                if skipped
+                    @info "SlackClaw: primary message skipped by $(SKIP_TOKEN)" thread_ts channel_id
+                elseif !isempty(strip(clean_text))
                     post_response(config, clean_text, thread_ts; channel_id)
                 elseif directive.type == :done
                     # Claude did work (tool use) but produced no text response
@@ -717,7 +741,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     break
 
                 else  # :done
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
+                    # No checkmark on a deliberately skipped message — it would itself be noise
+                    !isempty(react_ts) && !skipped &&
+                        slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
                     break
                 end
             end
@@ -816,9 +842,14 @@ function stop_monitor!(state::MonitorState)
         try wait(t) catch; end
     end
     empty!(state.active_tasks)
-    try
-        slack_post_message(state.config, "_SlackClaw monitor stopped._")
-    catch; end
+    # Same gate as the startup banner: `run_monitor`'s `finally` reaches here on
+    # crashes too, so an ungated notice spams the channel on every supervised
+    # (systemd Restart=) crash-loop cycle exactly like the startup banner would.
+    if state.config.announce_startup
+        try
+            slack_post_message(state.config, "_SlackClaw monitor stopped._")
+        catch; end
+    end
     @info "SlackClaw: stopped."
     return nothing
 end

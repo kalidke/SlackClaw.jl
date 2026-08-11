@@ -4,6 +4,39 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [0.5.0] — 2026-08-11
+
+Teammate-behavior release. Both new config fields default **off**, so existing
+deployments that don't opt in behave as before (the one deliberate default
+change: the start/stop banners no longer post unless enabled).
+
+### Added
+
+- **`allow_skip::Bool = false`** — the primary/thread path can now decline to
+  answer: a Claude reply of exactly `[SKIP]` posts nothing and adds no
+  reaction. Previously the literal `[SKIP]` string was posted to the channel.
+  The match is **exact** (`strip(text) == "[SKIP]"`), deliberately stricter
+  than the `startswith` checks on the listen/proactive paths — a false positive
+  here would eat a real answer in the user's own channel. A skipped message
+  still updates the thread session, so later in-thread replies keep continuity.
+  Mechanism only: instruct Claude about the convention via `system_prompt`.
+- **Self-mentions legible to Claude** — mentions of the bot itself are
+  rewritten `<@U…>` → `@you` in dispatched prompts (all paths), so Claude can
+  tell when *it* was tagged — the basis for deciding to skip. Other users' IDs
+  are left raw (resolving them needs `users.info` + `users:read`; follow-up).
+- **`announce_startup::Bool = false`** — the `_SlackClaw monitor started_` /
+  `_… stopped_` banners are now opt-in. Under supervised restarts
+  (systemd `Restart=always`) a crash-loop posted both banners every cycle.
+- `SKIP_TOKEN` constant shared by all three skip sites (listen relevance,
+  proactive, primary gate).
+
+## [0.4.1] — 2026-06-29
+
+### Changed
+
+- Compat only: widened `HTTP` to `"1, 2"` and `JSON` to `"0.21, 1"`. No code
+  changes.
+
 ## [0.4.0] — 2026-06-23
 
 ### Changed (breaking)

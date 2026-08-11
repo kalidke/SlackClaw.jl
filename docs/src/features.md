@@ -42,6 +42,20 @@ resolved on startup and cached. Listen-channel events arrive live on the same
 socket as the primary channel; the only extra cost is that the periodic
 reconciliation also backfills each listen channel's history.
 
+## Declining to answer (`allow_skip`)
+
+In a shared channel full of people, teammate-like behavior means answering when
+useful and staying out of exchanges aimed at other people. With
+`allow_skip = true`, a reply of exactly `[SKIP]` on the primary/thread path
+posts nothing and adds no reaction (the thread's Claude session is still
+tracked, so later in-thread replies keep continuity). The match is **exact**
+(`strip(text) == "[SKIP]"`), stricter than the listen/proactive filters — on
+this path a false positive would swallow a real answer in the user's own
+channel. This is only the mechanism: instruct Claude *when* to skip via
+`system_prompt`. To help it tell when it was tagged, mentions of the bot itself
+reach Claude as `@you` instead of a raw `<@U…>` ID. Default **off** — existing
+deployments behave as before.
+
 ## Proactive mode
 
 When `proactive_enabled = true`, SlackClaw periodically runs Claude to check for
