@@ -32,6 +32,9 @@ left untouched (resolving them needs `users.info` + the `users:read` scope).
 resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
     isempty(bot_user_id) ? String(text) : replace(text, "<@$(bot_user_id)>" => "@you")
 
+# `CLAUDE_CODE_`-prefixed vars exempt from the nested-session strip below.
+const CHILD_ENV_PASSTHROUGH = ("CLAUDE_CODE_OAUTH_TOKEN",)
+
 """
     filtered_child_env(env) -> Vector{String}
 
@@ -40,10 +43,16 @@ nested-session detection vars (`CLAUDECODE`, `CLAUDE_CODE_*`). Other `CLAUDE_*`
 vars are user configuration and must pass through — in particular
 `CLAUDE_CONFIG_DIR`, which redirects child transcripts off the default
 `~/.claude`; stripping it silently reverts every child to the default path.
-(Issue #11: when the env allowlist lands, it must include `CLAUDE_CONFIG_DIR`.)
+Credentials under the `CLAUDE_CODE_` prefix are exempted via
+[`CHILD_ENV_PASSTHROUGH`](@ref): `CLAUDE_CODE_OAUTH_TOKEN` is the child's only
+auth path when authenticated via `claude setup-token` (which prints the token
+without storing it), so stripping it leaves every child unauthenticated.
+(Issue #11: when the env allowlist lands, it must include both
+`CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`.)
 """
 filtered_child_env(env) =
-    String["$(k)=$(v)" for (k, v) in env if !(k == "CLAUDECODE" || startswith(k, "CLAUDE_CODE_"))]
+    String["$(k)=$(v)" for (k, v) in env if
+           !(k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH)))]
 
 """
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult

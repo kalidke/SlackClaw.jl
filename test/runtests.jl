@@ -422,6 +422,7 @@ end
     parent = Dict(
         "CLAUDECODE" => "1",
         "CLAUDE_CODE_ENTRYPOINT" => "cli",
+        "CLAUDE_CODE_OAUTH_TOKEN" => "dummy-token-for-test",
         "CLAUDE_CONFIG_DIR" => "/var/lib/clawbot/claude",
         "PATH" => "/usr/bin",
     )
@@ -434,6 +435,9 @@ end
     # transcripts back to the default ~/.claude)
     @test "CLAUDE_CONFIG_DIR=/var/lib/clawbot/claude" in child
     @test "PATH=/usr/bin" in child
+    # The setup-token credential survives the CLAUDE_CODE_ prefix strip —
+    # it is the child's only auth path (stripping it broke every child's auth)
+    @test "CLAUDE_CODE_OAUTH_TOKEN=dummy-token-for-test" in child
 end
 
 @testset "generate_manifest" begin
