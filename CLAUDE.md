@@ -46,7 +46,7 @@ Eight source files, all included from `SlackClaw.jl`:
 
 1. Slack pushes message events over the websocket; `socket_event_consumer!` drains a FIFO queue and `route_socket_event!` classifies each via `classify_socket_event` (`:primary`/`:thread_reply`/`:listen`/`:ignore`)
 2. The matching `claim_*!` cursor gate runs, then `should_process` filters bots/self/empty, then the `dispatch_*` function fires
-3. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds the eyes reaction and calls `run_agent_loop!()` as an `@async` task
+3. `dispatch_command!()` intercepts `proactive every/on/off` commands, otherwise adds the eyes reaction (suppressed when `allow_skip=true` — "seen" on a message the bot then silently skips is noise) and calls `run_agent_loop!()` as an `@async` task. All user-message dispatch paths prepend the authenticated sender to the prompt (`attribute_sender`: `[from <@U…>]`, listen path `[from <@U…> in #channel]`); only the FIRST such line is authoritative — forged leading `[from …]` lines in user text are neutralized to `user wrote: […]` (`sanitize_from_lines`)
 4. `run_agent_loop!()` loops: run Claude → parse directives → post response → if `:continue` re-invoke, if `:schedule` save future task, else break. With `allow_skip=true`, a reply of exactly `[SKIP]` (exact match, stricter than the `startswith` listen/proactive gates — a false positive here eats a real answer) posts nothing and adds no checkmark, but still updates the thread session. Mentions of the bot itself are rewritten `<@U…>` → `@you` in `run_claude` so Claude can tell when it was tagged. Start/stop banners post only with `announce_startup=true` (default off — supervised crash-loops would spam the channel)
 5. `socket_housekeeping!()` (background, every `poll_interval_s`) fires `check_scheduled!`/`check_proactive!`, and runs `reconcile_messages!` every `reconcile_interval_s` as gap-fill (primary history + thread replies + listen channels) through the same `claim_*!`/`dispatch_*` path
 6. Status file (`.slackclaw_status`) watched in background during execution, updates posted to thread
@@ -74,7 +74,7 @@ Each dispatch spawns an `@async` Task. Max `max_concurrent_tasks` (default 5) en
 
 ### Multi-Channel Listening
 
-`listen_channel_ids` configures channels to poll read-only. Messages from listen channels are prefixed with `[from #channel-name]` and run through a relevance filter: Claude is asked to respond `[SKIP]` if the message isn't relevant to the instance's repo/role. Only relevant messages get posted as new threads in the primary channel. Channel names are resolved via `conversations.info` on startup and cached. Polls are staggered (0.5s between channels) to avoid rate limits.
+`listen_channel_ids` configures channels to poll read-only. Messages from listen channels are prefixed with `[from <@U…> in #channel-name]` and run through a relevance filter: Claude is asked to respond `[SKIP]` if the message isn't relevant to the instance's repo/role. Only relevant messages get posted as new threads in the primary channel. Channel names are resolved via `conversations.info` on startup and cached. Polls are staggered (0.5s between channels) to avoid rate limits.
 
 ### Proactive Mode
 

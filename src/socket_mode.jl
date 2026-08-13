@@ -94,9 +94,7 @@ function route_socket_event!(state::MonitorState, event::Dict)
                 ch
             end
         end
-        prefixed = SlackMessage(msg.ts, msg.user, "[from #$(ch_name)] $(msg.text)",
-                                msg.thread_ts)
-        dispatch_listen_command!(state, prefixed, ch_name)
+        dispatch_listen_command!(state, listen_attributed_message(msg, ch_name), ch_name)
     end
     return nothing
 end

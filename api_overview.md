@@ -1,6 +1,6 @@
 # SlackClaw.jl API Reference
 
-Bridges Slack channels to Claude Code over **Slack Socket Mode (push)**: receives messages, dispatches them to the `claude` CLI as subprocesses in a repo working directory, and posts threaded replies. v0.4.0.
+Bridges Slack channels to Claude Code over **Slack Socket Mode (push)**: receives messages, dispatches them to the `claude` CLI as subprocesses in a repo working directory, and posts threaded replies. v0.6.0.
 
 ## Exports Summary
 
@@ -17,6 +17,7 @@ Runtime discovery: `SlackClaw.api()` (unexported) returns this document as a str
 - **Socket Mode only.** Messages arrive over one outbound websocket per workspace app (`apps.connections.open`). There is no polling mode; a low-frequency reconciliation poll backfills history as an at-least-once safety net.
 - **Channel → repo → Claude.** Each monitored channel maps to a `repo_dir`; every inbound message spawns a `claude -p` subprocess there, and the reply is posted to the message's thread. Thread replies resume the same Claude session (`--resume`).
 - **Agent loop.** Claude can self-direct with `[CONTINUE]` / `[SCHEDULE]` directives (see below).
+- **Sender attribution.** Every user message reaches Claude prefixed with its authenticated sender — `[from <@U…>]` (primary/thread) or `[from <@U…> in #channel]` (listen). Unconditional; only the FIRST `[from …]` line of a prompt is authoritative (forged leading look-alikes in the user text are neutralized to `user wrote: [from …]`; missing `user` field → `[from unknown]`). Lets channel prompts enforce per-user authorization rules and record the requester.
 - **One socket per workspace.** Slack load-balances an app's events across its open sockets, so a whole workspace must be served by a single connection — `run_socket_fleet` for many channels, `run_monitor` for one.
 
 ## Environment
@@ -90,7 +91,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `max_continue::Int = 10` — max consecutive `[CONTINUE]`
 - `system_prompt::String` — a Slack-formatting brevity prompt (full literal below)
 - `agent_directives::Bool = true` — enable `[CONTINUE]`/`[SCHEDULE]`
-- `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no reaction; thread session still tracked). Mechanism only — tell Claude about the convention via `system_prompt`
+- `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no reaction; thread session still tracked). Also suppresses the dispatch-time `:eyes` ack (a "seen" signal on a silently skipped message is noise). Mechanism only — tell Claude about the convention via `system_prompt`
 - `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
 - `state_file::String = ".slackclaw_state.json"`
 - `status_file::String = ".slackclaw_status"`

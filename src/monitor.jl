@@ -396,9 +396,8 @@ function poll_listen_channels!(state::MonitorState)
             for (msg, raw) in zip(parsed, raw_msgs)
                 claim_listen!(state, ch_id, msg.ts) || continue
                 should_process(msg, config, raw) || continue
-                # Prefix message with channel origin for Claude context
-                prefixed_text = "[from #$(ch_name)] $(msg.text)"
-                prefixed_msg = SlackMessage(msg.ts, msg.user, prefixed_text, msg.thread_ts)
+                # Prefix message with sender + channel origin for Claude context
+                prefixed_msg = listen_attributed_message(msg, ch_name)
                 # Dispatch to primary channel (no reaction on listen channel -- we're read-only)
                 dispatch_listen_command!(state, prefixed_msg, ch_name)
             end
@@ -647,6 +646,9 @@ end
 
 Run Claude in a loop, handling [CONTINUE] and [SCHEDULE] directives.
 Posts each response to the thread. Watches status file during execution.
+User-message callers pass `prompt` already sender-attributed
+([`attribute_sender`](@ref)); scheduled/directive prompts are not user
+messages and arrive bare.
 """
 function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                          session_id::String; react_ts::String="",
@@ -800,8 +802,12 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
         return
     end
 
-    slack_add_reaction(config, msg.ts, "eyes"; channel_id)
-    run_agent_loop!(state, msg.ts, msg.text, ""; react_ts=msg.ts, channel_id)
+    # No dispatch-time "seen" ack when Claude may yet silently [SKIP] this
+    # message — eyes followed by nothing is noise (the checkmark suppression's
+    # reasoning, one step earlier).
+    config.allow_skip || slack_add_reaction(config, msg.ts, "eyes"; channel_id)
+    run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), "";
+                    react_ts=msg.ts, channel_id)
 end
 
 # --- Dispatch: thread replies ---
@@ -821,9 +827,10 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
         return
     end
 
-    slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
-    run_agent_loop!(state, session.thread_ts, msg.text, session.session_id;
-                    react_ts=msg.ts, channel_id=ch)
+    # Same eyes gate as dispatch_command! — thread replies can be [SKIP]ped too
+    config.allow_skip || slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
+    run_agent_loop!(state, session.thread_ts, attribute_sender(msg.text, msg.user),
+                    session.session_id; react_ts=msg.ts, channel_id=ch)
 end
 
 # --- Shutdown ---

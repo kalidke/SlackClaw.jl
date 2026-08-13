@@ -32,7 +32,7 @@ left untouched (resolving them needs `users.info` + the `users:read` scope).
 resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
     isempty(bot_user_id) ? String(text) : replace(text, "<@$(bot_user_id)>" => "@you")
 
-# `CLAUDE_CODE_`-prefixed vars exempt from the nested-session strip below.
+"""`CLAUDE_CODE_`-prefixed vars exempt from the nested-session strip in [`filtered_child_env`](@ref)."""
 const CHILD_ENV_PASSTHROUGH = ("CLAUDE_CODE_OAUTH_TOKEN",)
 
 """

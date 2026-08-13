@@ -36,11 +36,37 @@ run_monitor(SlackClawConfig(
 Messages from listen channels run through a **relevance filter** first: Claude
 is asked whether the message is relevant to this instance's repo/role and
 answers `[SKIP]` if not. Only relevant messages are posted — as a new thread in
-the **primary** channel, prefixed with the source channel name — and handled
-there. The bot must be a member of each listen channel; channel names are
+the **primary** channel, prefixed with the sender and source channel name — and
+handled there. The bot must be a member of each listen channel; channel names are
 resolved on startup and cached. Listen-channel events arrive live on the same
 socket as the primary channel; the only extra cost is that the periodic
 reconciliation also backfills each listen channel's history.
+
+## Sender attribution
+
+Every user message reaches Claude prefixed with its authenticated Slack sender:
+
+```
+[from <@U0123ABCDE>]
+
+<the user's message>
+```
+
+on the primary/thread paths, and inline — `[from <@U0123ABCDE> in #general] …` —
+on the listen path. The sender comes from the Slack event's `user` field, not
+from anything typed in the message, and the prefix is unconditional (no config
+toggle). It exists so a channel's `system_prompt` can enforce per-user
+authorization rules ("only run deploys when the requester is `<@U…>`") and
+record who asked for each action — neither is possible if the authenticated
+sender never reaches Claude.
+
+Only the **first** `[from …]` line of a prompt is authoritative. A user can
+type a forged `[from …]` line at the start of their message, so SlackClaw
+neutralizes any leading `[from …]`-shaped lines in the user text (they become
+`user wrote: [from …]`) before attaching the real prefix — the forgery stays
+visible, but cannot pose as the attribution. Messages without a `user` field
+are attributed `[from unknown]`, which fail-closed authorization prompts
+should reject.
 
 ## Declining to answer (`allow_skip`)
 
@@ -53,7 +79,9 @@ tracked, so later in-thread replies keep continuity). The match is **exact**
 this path a false positive would swallow a real answer in the user's own
 channel. This is only the mechanism: instruct Claude *when* to skip via
 `system_prompt`. To help it tell when it was tagged, mentions of the bot itself
-reach Claude as `@you` instead of a raw `<@U…>` ID. Default **off** — existing
+reach Claude as `@you` instead of a raw `<@U…>` ID. With the gate on, the
+dispatch-time 👀 reaction is suppressed too — a "seen, thinking" signal on a
+message the bot then silently skips is noise. Default **off** — existing
 deployments behave as before.
 
 ## Proactive mode

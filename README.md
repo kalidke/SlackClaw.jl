@@ -158,6 +158,8 @@ All options are fields on `SlackClawConfig`:
 | `max_thread_idle_s` | `604800` (7 d) | Drop tracked threads idle this long (`0` = never) |
 | `max_continue` | `10` | Max consecutive `[CONTINUE]` directives |
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
+| `allow_skip` | `false` | Honor an exact `[SKIP]` reply on the primary/thread path (post nothing; also suppresses the dispatch-time 👀) |
+| `announce_startup` | `false` | Post start/stop banners to the primary channel |
 | `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
 | `allowed_tools` | `String[]` | Restrict Claude to specific tools |
 | `listen_channel_ids` | `String[]` | Read-only channels (relevance-filtered; responses go to the primary channel) |
@@ -172,8 +174,8 @@ All options are fields on `SlackClawConfig`:
 ## How It Works
 
 1. **Receive** — Slack pushes each new message over the websocket; SlackClaw acks immediately and enqueues it.
-2. **Dispatch** — each message spawns an async Claude invocation in the configured `repo_dir`.
-3. **React** — emoji reactions track status: 👀 (processing), ✅ (success), ❌ (error).
+2. **Dispatch** — each message spawns an async Claude invocation in the configured `repo_dir`; the prompt is prefixed with the authenticated sender (`[from <@U…>]`), so channel prompts can enforce per-user rules.
+3. **React** — emoji reactions track status: 👀 (processing; suppressed when `allow_skip` is on), ✅ (success), ❌ (error).
 4. **Thread** — all responses go to the message thread, preserving conversation context; long responses split across multiple messages.
 5. **Resume** — replies in a thread continue the same Claude session via `--resume`.
 6. **Listen** — messages from listen channels are relevance-filtered (irrelevant ones silently skipped) and posted to the primary channel.
@@ -204,9 +206,13 @@ When `agent_directives` is enabled (default), Claude can control its own executi
 
 If no directive is present, the task is complete.
 
+### Sender Attribution
+
+Every user message reaches Claude prefixed with its authenticated Slack sender — `[from <@U0123ABCDE>]` on the primary/thread paths, `[from <@U0123ABCDE> in #channel]` on the listen path. The prefix comes from the Slack event's `user` field (not the message text), is always first, and only that **first** `[from …]` line is authoritative: a forged `[from …]` line typed at the start of a message is visibly neutralized (`user wrote: [from …]`) before the real prefix is attached. This lets a channel's system prompt enforce per-user authorization ("only act when the requester is `<@U…>`") and record who requested each action.
+
 ### Multi-Channel Listening
 
-A monitor can listen to additional channels beyond its primary one. Messages from listen channels are posted as new threads in the primary channel (prefixed with the source channel name) and processed there:
+A monitor can listen to additional channels beyond its primary one. Messages from listen channels are posted as new threads in the primary channel (prefixed with the sender and source channel name) and processed there:
 
 ```julia
 run_monitor(SlackClawConfig(
