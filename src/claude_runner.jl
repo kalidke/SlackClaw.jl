@@ -33,6 +33,19 @@ resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
     isempty(bot_user_id) ? String(text) : replace(text, "<@$(bot_user_id)>" => "@you")
 
 """
+    filtered_child_env(env) -> Vector{String}
+
+Build the child environment for the `claude` subprocess, dropping only the
+nested-session detection vars (`CLAUDECODE`, `CLAUDE_CODE_*`). Other `CLAUDE_*`
+vars are user configuration and must pass through — in particular
+`CLAUDE_CONFIG_DIR`, which redirects child transcripts off the default
+`~/.claude`; stripping it silently reverts every child to the default path.
+(Issue #11: when the env allowlist lands, it must include `CLAUDE_CONFIG_DIR`.)
+"""
+filtered_child_env(env) =
+    String["$(k)=$(v)" for (k, v) in env if !(k == "CLAUDECODE" || startswith(k, "CLAUDE_CODE_"))]
+
+"""
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
 
 Run `claude` CLI in `--print` mode with JSON output. Blocks until complete or timeout.
@@ -83,7 +96,7 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     # Build clean environment without Claude session vars
-    filtered_env = String["$(k)=$(v)" for (k, v) in ENV if !startswith(k, "CLAUDE")]
+    filtered_env = filtered_child_env(ENV)
 
     # Inject SlackClaw context so the upload helper can post into this thread.
     !isempty(thread_ts) && push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")

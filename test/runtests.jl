@@ -416,6 +416,26 @@ end
     @test rsm("<@UBOT>", "") == "<@UBOT>"
 end
 
+@testset "filtered_child_env" begin
+    fce = SlackClaw.filtered_child_env
+
+    parent = Dict(
+        "CLAUDECODE" => "1",
+        "CLAUDE_CODE_ENTRYPOINT" => "cli",
+        "CLAUDE_CONFIG_DIR" => "/var/lib/clawbot/claude",
+        "PATH" => "/usr/bin",
+    )
+    child = fce(parent)
+
+    # Nested-session detection vars are stripped
+    @test !any(startswith("CLAUDECODE="), child)
+    @test !any(startswith("CLAUDE_CODE_ENTRYPOINT="), child)
+    # User config vars pass through (stripping CLAUDE_CONFIG_DIR sent child
+    # transcripts back to the default ~/.claude)
+    @test "CLAUDE_CONFIG_DIR=/var/lib/clawbot/claude" in child
+    @test "PATH=/usr/bin" in child
+end
+
 @testset "generate_manifest" begin
     gm = SlackClaw.generate_manifest
     m = gm()
