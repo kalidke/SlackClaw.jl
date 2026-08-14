@@ -248,3 +248,26 @@ function slack_add_reaction(config::SlackClawConfig, ts::AbstractString, emoji::
         contains(msg, "already_reacted") || rethrow()
     end
 end
+
+"""
+    slack_reactions_remove(config, ts, emoji; channel_id=config.slack_channel_id)
+
+Remove an emoji reaction from a message (`reactions.remove`; the existing
+`reactions:write` scope covers it). Swallows ALL errors — `no_reaction`,
+deleted messages, a race with a manual un-react: a failed un-react is always
+benign, and this runs inside the agent loop, which it must never take down.
+"""
+function slack_reactions_remove(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
+                                channel_id::AbstractString=config.slack_channel_id)
+    body = Dict(
+        "channel" => channel_id,
+        "timestamp" => ts,
+        "name" => emoji,
+    )
+    try
+        slack_request(:post, "reactions.remove", config; body)
+    catch e
+        @debug "SlackClaw: reactions.remove failed (benign)" exception=e
+    end
+    return nothing
+end

@@ -28,12 +28,14 @@ function parse_slack_messages(messages::Vector)
 end
 
 """
-    should_process(msg::SlackMessage, config::SlackClawConfig, raw::Dict) -> Bool
+    should_process(msg::SlackMessage, config::SlackClawConfig, raw::AbstractDict) -> Bool
 
 Return `true` if this message should be dispatched to Claude.
 Skips bot messages, messages from our own bot user, and empty text.
+`raw` is parsed JSON — `AbstractDict`, not `Dict`: JSON.jl v1 parses objects
+as `JSON.Object` (0.21 returned `Dict`), and both must be accepted.
 """
-function should_process(msg::SlackMessage, config::SlackClawConfig, raw::Dict)
+function should_process(msg::SlackMessage, config::SlackClawConfig, raw::AbstractDict)
     haskey(raw, "bot_id") && return false
     get(raw, "subtype", "") == "bot_message" && return false
     msg.user == config.bot_user_id && return false

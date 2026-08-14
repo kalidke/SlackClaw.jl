@@ -711,6 +711,10 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 skipped = should_skip_response(clean_text, config.allow_skip)
                 if skipped
                     @info "SlackClaw: primary message skipped by $(SKIP_TOKEN)" thread_ts channel_id
+                    # Eyes-as-intent: take back the dispatch-time "seen" mark —
+                    # lingering eyes would promise a reply that never comes;
+                    # their removal signals "saw it, deliberately staying out"
+                    !isempty(react_ts) && slack_reactions_remove(config, react_ts, "eyes"; channel_id)
                 elseif !isempty(strip(clean_text))
                     post_response(config, clean_text, thread_ts; channel_id)
                 elseif directive.type == :done
@@ -802,10 +806,11 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
         return
     end
 
-    # No dispatch-time "seen" ack when Claude may yet silently [SKIP] this
-    # message — eyes followed by nothing is noise (the checkmark suppression's
-    # reasoning, one step earlier).
-    config.allow_skip || slack_add_reaction(config, msg.ts, "eyes"; channel_id)
+    # Eyes-as-intent: eyes go on at dispatch on ALL channels — on allow_skip
+    # channels the skip branch of run_agent_loop! takes them back OFF when the
+    # reply is [SKIP]. Lingering eyes = reply coming; vanished eyes = seen,
+    # deliberately staying out.
+    slack_add_reaction(config, msg.ts, "eyes"; channel_id)
     run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), "";
                     react_ts=msg.ts, channel_id)
 end
@@ -827,8 +832,9 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
         return
     end
 
-    # Same eyes gate as dispatch_command! — thread replies can be [SKIP]ped too
-    config.allow_skip || slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
+    # Same eyes-as-intent contract as dispatch_command! — a [SKIP]ped thread
+    # reply gets its eyes removed in the agent loop's skip branch
+    slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
     run_agent_loop!(state, session.thread_ts, attribute_sender(msg.text, msg.user),
                     session.session_id; react_ts=msg.ts, channel_id=ch)
 end

@@ -42,7 +42,7 @@ Bot/self/empty filtering is NOT done here: the dispatcher applies
 `should_process` after claiming the cursor, mirroring the poll paths (cursors
 advance past bot messages too, which keeps reconciliation cheap).
 """
-function classify_socket_event(event::Dict, config::SlackClawConfig, tracked_threads)
+function classify_socket_event(event::AbstractDict, config::SlackClawConfig, tracked_threads)
     get(event, "type", "") == "message" || return (:ignore, nothing)
     get(event, "subtype", "") in SOCKET_MESSAGE_SUBTYPES || return (:ignore, nothing)
     ts = get(event, "ts", "")
@@ -62,7 +62,7 @@ function classify_socket_event(event::Dict, config::SlackClawConfig, tracked_thr
 end
 
 """Route one Socket Mode message event into the regular dispatch paths."""
-function route_socket_event!(state::MonitorState, event::Dict)
+function route_socket_event!(state::MonitorState, event::AbstractDict)
     config = state.config
     route, msg = classify_socket_event(event, config, keys(state.threads))
     route == :ignore && return nothing
@@ -113,7 +113,7 @@ function handle_socket_frame!(ws, raw, events::Channel)
         @warn "SlackClaw: unparseable socket frame"
         return :ok
     end
-    data isa Dict || return :ok
+    data isa AbstractDict || return :ok  # AbstractDict: JSON v1 parses objects as JSON.Object, not Dict
     t = get(data, "type", "")
 
     if t == "hello"
@@ -138,7 +138,7 @@ function handle_socket_frame!(ws, raw, events::Channel)
             retry_attempt isa Integer && retry_attempt > 0 &&
                 @info "SlackClaw: redelivered envelope (cursor dedup applies)" retry_attempt
             event = get(get(data, "payload", Dict()), "event", Dict())
-            event isa Dict && put!(events, event)
+            event isa AbstractDict && put!(events, event)
         end
         return :ok
     end
@@ -200,7 +200,7 @@ function socket_fleet_loop!(states::Vector{MonitorState})
         sleep((i - 1) * 7.0)  # stagger per-channel reconciles off each other
         socket_housekeeping!(st)
     end for (i, st) in enumerate(states)]
-    events = Channel{Dict}(SOCKET_EVENT_QUEUE_SIZE)
+    events = Channel{AbstractDict}(SOCKET_EVENT_QUEUE_SIZE)
     consumer = @async socket_event_consumer!(states, events)
     backoff = 1.0
 

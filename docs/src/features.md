@@ -73,16 +73,20 @@ should reject.
 In a shared channel full of people, teammate-like behavior means answering when
 useful and staying out of exchanges aimed at other people. With
 `allow_skip = true`, a reply of exactly `[SKIP]` on the primary/thread path
-posts nothing and adds no reaction (the thread's Claude session is still
+posts nothing and adds no checkmark (the thread's Claude session is still
 tracked, so later in-thread replies keep continuity). The match is **exact**
 (`strip(text) == "[SKIP]"`), stricter than the listen/proactive filters — on
 this path a false positive would swallow a real answer in the user's own
 channel. This is only the mechanism: instruct Claude *when* to skip via
 `system_prompt`. To help it tell when it was tagged, mentions of the bot itself
-reach Claude as `@you` instead of a raw `<@U…>` ID. With the gate on, the
-dispatch-time 👀 reaction is suppressed too — a "seen, thinking" signal on a
-message the bot then silently skips is noise. Default **off** — existing
-deployments behave as before.
+reach Claude as `@you` instead of a raw `<@U…>` ID.
+
+The 👀 reaction doubles as an intent signal on `allow_skip` channels: eyes go
+on at dispatch (as on every channel), and come back **off** when the reply is
+`[SKIP]`. Lingering eyes mean a reply is coming; vanished eyes mean the bot saw
+the message and is deliberately staying out. Failures to remove the reaction
+(deleted message, manual un-react race) are swallowed — an un-react is always
+benign. Default **off** — existing deployments behave as before.
 
 ## Proactive mode
 

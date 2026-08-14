@@ -199,7 +199,7 @@ function parse_claude_output(output::String, duration_ms::Int)
         data = JSON.parse(output)
         # CLI returns a JSON array — find the result entry
         entry = if data isa Vector
-            idx = findlast(d -> d isa Dict && get(d, "type", "") == "result", data)
+            idx = findlast(d -> d isa AbstractDict && get(d, "type", "") == "result", data)
             idx === nothing ? Dict() : data[idx]
         else
             data  # legacy single-object format

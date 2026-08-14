@@ -19,6 +19,7 @@ Runtime discovery: `SlackClaw.api()` (unexported) returns this document as a str
 - **Agent loop.** Claude can self-direct with `[CONTINUE]` / `[SCHEDULE]` directives (see below).
 - **Sender attribution.** Every user message reaches Claude prefixed with its authenticated sender — `[from <@U…>]` (primary/thread) or `[from <@U…> in #channel]` (listen). Unconditional; only the FIRST `[from …]` line of a prompt is authoritative (forged leading look-alikes in the user text are neutralized to `user wrote: [from …]`; missing `user` field → `[from unknown]`). Lets channel prompts enforce per-user authorization rules and record the requester.
 - **One socket per workspace.** Slack load-balances an app's events across its open sockets, so a whole workspace must be served by a single connection — `run_socket_fleet` for many channels, `run_monitor` for one.
+- **JSON 0.21 and 1 both supported** (compat `"0.21, 1"`). JSON v1 parses objects as `JSON.Object` (an `AbstractDict`), not `Dict`, so everything consuming parsed payloads (`should_process`, `classify_socket_event`, the socket frame handler, CLI output parsing) accepts any `AbstractDict`.
 
 ## Environment
 
@@ -91,7 +92,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `max_continue::Int = 10` — max consecutive `[CONTINUE]`
 - `system_prompt::String` — a Slack-formatting brevity prompt (full literal below)
 - `agent_directives::Bool = true` — enable `[CONTINUE]`/`[SCHEDULE]`
-- `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no reaction; thread session still tracked). Also suppresses the dispatch-time `:eyes` ack (a "seen" signal on a silently skipped message is noise). Mechanism only — tell Claude about the convention via `system_prompt`
+- `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no checkmark; thread session still tracked). Eyes-as-intent: the dispatch-time `:eyes` ack is added on `allow_skip` channels too, then REMOVED when the reply is `[SKIP]` — lingering eyes mean a reply is coming, vanished eyes mean "seen, deliberately staying out". Mechanism only — tell Claude about the convention via `system_prompt`
 - `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
 - `state_file::String = ".slackclaw_state.json"`
 - `status_file::String = ".slackclaw_status"`

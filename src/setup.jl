@@ -131,7 +131,7 @@ function socket_selftest(config::SlackClawConfig; timeout_s::Real=15)
         HTTP.WebSockets.open(url) do ws
             for raw in ws
                 data = try JSON.parse(String(raw)) catch; nothing end
-                if data isa Dict && get(data, "type", "") == "hello"
+                if data isa AbstractDict && get(data, "type", "") == "hello"
                     got_hello[] = true
                     break
                 end
