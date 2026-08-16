@@ -52,14 +52,27 @@ const SKIP_TOKEN = "[SKIP]"
     should_skip_response(text, allow_skip) -> Bool
 
 Whether a primary/thread-path response should be silently dropped. Requires an
-EXACT match (`strip(text) == SKIP_TOKEN`), unlike the `startswith` checks on the
-listen and proactive paths: there a false positive only suppresses optional
-chatter, but here it would eat a real answer in the user's own channel — e.g. a
-reply that legitimately opens by quoting the token while explaining this
-feature. Missing a skip is cheap; eating an answer is not.
+EXACT match (`strip(text) == SKIP_TOKEN`), unlike the [`is_decline`](@ref)
+containment checks on the listen and proactive paths: there a false positive
+only suppresses optional chatter, but here it would eat a real answer in the
+user's own channel — e.g. a reply that legitimately opens by quoting the token
+while explaining this feature. Missing a skip is cheap; eating an answer is not.
 """
 should_skip_response(text::AbstractString, allow_skip::Bool) =
     allow_skip && strip(text) == SKIP_TOKEN
+
+"""
+    is_decline(text) -> Bool
+
+Whether a listen/proactive response declines to post: CONTAINMENT match
+(`occursin(SKIP_TOKEN, text)`). Models reliably narrate a decline and leave the
+token at the END ("…nothing new to report. [SKIP]"), which the old prefix check
+posted verbatim as channel spam — and prompt hardening empirically failed to
+stop it. On these two paths the cost asymmetry is the OPPOSITE of
+[`should_skip_response`](@ref): a false positive merely suppresses an optional
+post (silent, cheap), a false negative is user-visible spam.
+"""
+is_decline(text::AbstractString) = occursin(SKIP_TOKEN, text)
 
 # --- Persistence ---
 
@@ -433,7 +446,7 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
 
             # Skip if Claude says not relevant, errored, or empty
             response_text = strip(result.result_text)
-            if !result.success || isempty(response_text) || startswith(response_text, SKIP_TOKEN)
+            if !result.success || isempty(response_text) || is_decline(response_text)
                 @info "SlackClaw: listen message skipped (not relevant)" channel=ch_name
                 return
             end
@@ -570,6 +583,26 @@ If you do post something, keep it concise.
 
 """
 
+"""
+    append_proactive_log(log_path, text; suppressed=false)
+
+Append one flattened line to the proactive log. Posted entries are truncated to
+a one-liner; suppressed entries keep the FULL text — the next cycle's dedup
+reads this log, and a suppressed run's reasoning is its only trace
+(suppressed != lost). Errors are swallowed: the log is best-effort and must
+never take down the proactive task.
+"""
+function append_proactive_log(log_path::String, text::AbstractString; suppressed::Bool=false)
+    try
+        ts_str = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM")
+        entry = replace(suppressed ? text : first(text, 200), '\n' => ' ')
+        tag = suppressed ? " [suppressed]" : ""
+        open(log_path, "a") do io
+            println(io, "[$ts_str]$tag $entry")
+        end
+    catch; end
+end
+
 """Check if a proactive run is due, and if so, run Claude with the proactive prompt."""
 function check_proactive!(state::MonitorState)
     config = state.config
@@ -603,24 +636,23 @@ function check_proactive!(state::MonitorState)
             result = run_claude(prompt, config)
 
             response_text = strip(result.result_text)
-            if !result.success || isempty(response_text) || startswith(response_text, SKIP_TOKEN)
+            if !result.success || isempty(response_text)
                 @info "SlackClaw: proactive check — nothing to report"
+                return
+            end
+            if is_decline(response_text)
+                # Narrated decline: suppress the post, but preserve any
+                # reasoning around the token for the next cycle's dedup
+                response_text != SKIP_TOKEN &&
+                    append_proactive_log(log_path, response_text; suppressed=true)
+                @info "SlackClaw: proactive check — declined ($(SKIP_TOKEN))"
                 return
             end
 
             # Post as new top-level message in primary channel
             thread_ts = slack_post_message(config, response_text; channel_id=primary)
 
-            # Append to proactive log
-            try
-                ts_str = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM")
-                # Truncate response to a one-liner for the log
-                summary = first(response_text, 200)
-                summary = replace(summary, '\n' => ' ')
-                open(log_path, "a") do io
-                    println(io, "[$ts_str] $summary")
-                end
-            catch; end
+            append_proactive_log(log_path, response_text)
 
             # Track thread for follow-up replies
             if !isempty(result.session_id)

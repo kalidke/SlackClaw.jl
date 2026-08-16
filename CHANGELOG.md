@@ -4,6 +4,31 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [0.6.2] — 2026-08-16
+
+Patch: narrated-`[SKIP]` spam fix. (0.5.1–0.6.1 were released without
+changelog entries; see the GitHub releases for their notes.)
+
+### Fixed
+
+- **Narrated declines no longer post as channel spam.** Models reliably
+  narrate a skip and leave the token at the END ("…nothing new to report.
+  `[SKIP]`"); the listen/proactive suppression was a prefix check, so the
+  whole narration posted. Prompt-side hardening empirically failed to stop
+  it, so both paths now suppress on **containment** (`occursin`, new
+  `is_decline` helper) — on these paths a false positive merely suppresses an
+  optional post, while a false negative is user-visible spam. The
+  primary/thread `allow_skip` gate is **unchanged** (exact match): there the
+  asymmetry runs the other way — a false positive would eat a real answer in
+  the user's own thread (the 0.5.0 rationale).
+
+### Added
+
+- A containment-suppressed proactive run still appends its **full** text to
+  `.slackclaw_proactive_log`, tagged `[suppressed]`, so the next cycle's
+  dedup keeps the reasoning (suppressed ≠ lost). Posted entries keep the old
+  truncated one-liner format (both via the new `append_proactive_log`).
+
 ## [0.5.0] — 2026-08-11
 
 Teammate-behavior release. Both new config fields default **off**, so existing

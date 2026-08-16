@@ -446,7 +446,7 @@ end
     @test !ssr("[SKIP]", false)
 
     # EXACT match only, deliberately stricter than the listen/proactive
-    # startswith gates: anything beyond the bare token is a real answer
+    # containment gates: anything beyond the bare token is a real answer
     @test !ssr("[SKIP] — but here is why I skip some messages", true)
     @test !ssr("The [SKIP] convention works like this", true)
     @test !ssr("[skip]", true)   # case-sensitive
@@ -456,6 +456,54 @@ end
     @test SlackClaw.SKIP_TOKEN == "[SKIP]"
     @test occursin(SlackClaw.SKIP_TOKEN, SlackClaw.LISTEN_RELEVANCE_PREFIX)
     @test occursin(SlackClaw.SKIP_TOKEN, SlackClaw.PROACTIVE_PREFIX)
+end
+
+@testset "is_decline (listen/proactive containment)" begin
+    isd = SlackClaw.is_decline
+
+    # Pure token — suppressed, as before
+    @test isd("[SKIP]")
+
+    # Narrated skip with the token at the END — the spam class the old
+    # prefix check posted verbatim ("…Nothing new to report. [SKIP]")
+    @test isd("Checked the CI queue — nothing new to report. [SKIP]")
+
+    # Containment: token anywhere in the text suppresses
+    @test isd("[SKIP] — not relevant to this repo")
+    @test isd("thinking… [SKIP] …done")
+
+    # No token — real content posts
+    @test !isd("Deploy finished, all green")
+    @test !isd("")
+    @test !isd("[skip]")   # case-sensitive, same as the other gates
+
+    # The primary/thread path is deliberately NOT this loose: narration
+    # around the token still POSTS there (0.5.0 semantics unchanged)
+    @test !SlackClaw.should_skip_response("[SKIP] but here is an answer", true)
+    @test SlackClaw.should_skip_response("[SKIP]", true)
+end
+
+@testset "append_proactive_log" begin
+    mktempdir() do dir
+        log = joinpath(dir, "plog")
+
+        # Posted entries: flattened one-liner, truncated to 200 chars
+        SlackClaw.append_proactive_log(log, "posted content\nsecond line")
+        SlackClaw.append_proactive_log(log, repeat("x", 300))
+
+        # Suppressed entries: tagged, FULL text kept for the next cycle's dedup
+        SlackClaw.append_proactive_log(log, "long reasoning, nothing new. [SKIP]"; suppressed=true)
+        SlackClaw.append_proactive_log(log, repeat("y", 300); suppressed=true)
+
+        lines = readlines(log)
+        @test length(lines) == 4
+        @test occursin("posted content second line", lines[1])
+        @test !occursin("[suppressed]", lines[1])
+        @test !occursin(repeat("x", 201), lines[2])
+        @test occursin("[suppressed]", lines[3])
+        @test occursin("[SKIP]", lines[3])
+        @test occursin(repeat("y", 300), lines[4])
+    end
 end
 
 @testset "resolve_self_mentions" begin
@@ -584,14 +632,20 @@ end
 end
 
 # KEEP LAST: overwrites SlackClaw methods (run_claude, post_response,
-# slack_add_reaction, slack_reactions_remove) with stubs for the rest of the
-# process, then runs the real run_agent_loop! / dispatch functions against them.
+# slack_post_message, slack_add_reaction, slack_reactions_remove) with stubs
+# for the rest of the process, then runs the real run_agent_loop! / dispatch
+# functions against them.
 posted = String[]
+top_posted = String[]
 reacted = String[]
 unreacted = String[]
 prompts = String[]
 claude_reply = Ref("[SKIP]")
 Core.eval(SlackClaw, quote
+    slack_post_message(config::SlackClawConfig, text::AbstractString;
+                       thread_ts::AbstractString="",
+                       channel_id::AbstractString=config.slack_channel_id) =
+        (push!($top_posted, String(text)); "500.0")
     run_claude(prompt::String, config::SlackClawConfig;
                session_id::String="", thread_ts::String="", channel_id::String="") =
         (push!($prompts, prompt); ClaudeResult(true, $claude_reply[], 1, 0.0, "sess-skip"))
@@ -706,6 +760,80 @@ end
     @test isempty(unreacted)
     @test posted == ["[SKIP]"]
     @test prompts == ["[from <@U9>]\n\nhello"]
+end
+
+# The 0.6.2 spam fix, end-to-end: a narrated decline ("…nothing new. [SKIP]")
+# must suppress the post on the proactive and listen paths — the old prefix
+# check posted the whole narration as channel spam. Suppressed proactive
+# narration still lands in the log (next cycle's dedup); real content still posts.
+@testset "proactive: narrated [SKIP] suppressed, reasoning logged" begin
+    proactive_cfg() = SlackClawConfig(
+        slack_bot_token="fake", slack_channel_id="C0", repo_dir=mktempdir(),
+        proactive_enabled=true, proactive_prompt="check things")
+    plog(cfg) = joinpath(cfg.repo_dir, SlackClaw.PROACTIVE_LOG_FILE)
+
+    # Narrated skip: nothing posted, FULL reasoning logged as suppressed
+    cfg = proactive_cfg()
+    state = mkstate(cfg)
+    claude_reply[] = "Checked the queue and the logs. Nothing new to report. [SKIP]"
+    empty!(top_posted); empty!(posted)
+    SlackClaw.check_proactive!(state)
+    foreach(wait, state.active_tasks)
+    @test isempty(top_posted)
+    @test isempty(posted)
+    lines = readlines(plog(cfg))
+    @test length(lines) == 1
+    @test occursin("[suppressed]", lines[1])
+    @test occursin("Nothing new to report. [SKIP]", lines[1])
+
+    # Pure [SKIP]: nothing posted, nothing logged (no reasoning to preserve)
+    cfg = proactive_cfg()
+    state = mkstate(cfg)
+    claude_reply[] = "[SKIP]"
+    empty!(top_posted)
+    SlackClaw.check_proactive!(state)
+    foreach(wait, state.active_tasks)
+    @test isempty(top_posted)
+    @test !isfile(plog(cfg))
+
+    # Real content: posted top-level and logged without the suppressed tag
+    cfg = proactive_cfg()
+    state = mkstate(cfg)
+    claude_reply[] = "CI has been red for 2 hours on main."
+    empty!(top_posted)
+    SlackClaw.check_proactive!(state)
+    foreach(wait, state.active_tasks)
+    @test top_posted == ["CI has been red for 2 hours on main."]
+    lines = readlines(plog(cfg))
+    @test length(lines) == 1
+    @test !occursin("[suppressed]", lines[1])
+    claude_reply[] = "[SKIP]"
+end
+
+@testset "listen: narrated [SKIP] suppressed, relevant content posts" begin
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0",
+                          repo_dir=mktempdir())
+    state = mkstate(cfg)
+
+    # Narrated irrelevance verdict: no header, no response posted
+    claude_reply[] = "This is about another team's repo, not ours. [SKIP]"
+    empty!(top_posted); empty!(posted)
+    SlackClaw.dispatch_listen_command!(state,
+        SlackMessage("600.0", "U9", "FYI: upgrading the fooservice", ""), "general")
+    foreach(wait, state.active_tasks)
+    @test isempty(top_posted)
+    @test isempty(posted)
+
+    # Relevant: header posted top-level, response threaded under it
+    claude_reply[] = "That upgrade affects our deploy scripts — details follow."
+    empty!(top_posted); empty!(posted)
+    SlackClaw.dispatch_listen_command!(state,
+        SlackMessage("601.0", "U9", "FYI: upgrading the fooservice", ""), "general")
+    foreach(wait, state.active_tasks)
+    @test length(top_posted) == 1
+    @test occursin("general", top_posted[1])
+    @test posted == ["That upgrade affects our deploy scripts — details follow."]
+    claude_reply[] = "[SKIP]"
 end
 
 end

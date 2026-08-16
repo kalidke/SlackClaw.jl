@@ -35,7 +35,11 @@ run_monitor(SlackClawConfig(
 
 Messages from listen channels run through a **relevance filter** first: Claude
 is asked whether the message is relevant to this instance's repo/role and
-answers `[SKIP]` if not. Only relevant messages are posted — as a new thread in
+answers `[SKIP]` if not. The check is a **containment** match (`[SKIP]`
+anywhere in the reply): models reliably narrate their verdict and leave the
+token at the end, and a stricter check would post that narration as spam —
+here a false positive only suppresses an optional post.
+Only relevant messages are posted — as a new thread in
 the **primary** channel, prefixed with the sender and source channel name — and
 handled there. The bot must be a member of each listen channel; channel names are
 resolved on startup and cached. Listen-channel events arrive live on the same
@@ -75,9 +79,9 @@ useful and staying out of exchanges aimed at other people. With
 `allow_skip = true`, a reply of exactly `[SKIP]` on the primary/thread path
 posts nothing and adds no checkmark (the thread's Claude session is still
 tracked, so later in-thread replies keep continuity). The match is **exact**
-(`strip(text) == "[SKIP]"`), stricter than the listen/proactive filters — on
-this path a false positive would swallow a real answer in the user's own
-channel. This is only the mechanism: instruct Claude *when* to skip via
+(`strip(text) == "[SKIP]"`), stricter than the containment match on the
+listen/proactive filters — on this path a false positive would swallow a real
+answer in the user's own channel. This is only the mechanism: instruct Claude *when* to skip via
 `system_prompt`. To help it tell when it was tagged, mentions of the bot itself
 reach Claude as `@you` instead of a raw `<@U…>` ID.
 
@@ -102,7 +106,11 @@ at runtime:
   Claude reads it to avoid repeating itself.
 
 If nothing is noteworthy, Claude responds `[SKIP]` and stays silent; only real
-content is posted as a top-level message in the primary channel.
+content is posted as a top-level message in the primary channel. As on the
+listen path, the check is a **containment** match — a narrated decline
+("checked everything, nothing new. `[SKIP]`") is suppressed rather than posted.
+A suppressed run's full text is still appended to the log (tagged
+`[suppressed]`) so the next cycle's dedup keeps its reasoning.
 
 ```julia
 run_monitor(SlackClawConfig(
