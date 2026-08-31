@@ -423,6 +423,7 @@ end
     @test cfg.agent_directives == true
     @test cfg.claude_timeout_s == 3600
     @test cfg.max_turns == 30
+    @test cfg.permission_mode == "auto"
     @test isempty(cfg.allowed_tools)
     @test isempty(cfg.listen_channel_ids)
     @test cfg.max_budget_usd == 0.0

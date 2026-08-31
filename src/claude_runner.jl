@@ -58,8 +58,10 @@ filtered_child_env(env) =
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
 
 Run `claude` CLI in `--print` mode with JSON output. Blocks until complete or timeout.
-Mentions of the bot itself in the prompt are rewritten to `@you`
-([`resolve_self_mentions`](@ref)).
+Permissions are governed by `--permission-mode \$(config.permission_mode)` (default
+`"auto"`, the classifier mode); a denial returns promptly as an `is_error` result
+rather than hanging the dispatch. Mentions of the bot itself in the prompt are
+rewritten to `@you` ([`resolve_self_mentions`](@ref)).
 """
 function run_claude(prompt::String, config::SlackClawConfig;
                     session_id::String="",
@@ -70,7 +72,7 @@ function run_claude(prompt::String, config::SlackClawConfig;
         "claude", "-p", prompt,
         "--print",
         "--output-format", "json",
-        "--dangerously-skip-permissions",
+        "--permission-mode", config.permission_mode,
         "--max-turns", string(config.max_turns),
     ]
 

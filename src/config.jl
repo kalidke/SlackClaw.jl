@@ -20,6 +20,12 @@ Base.@kwdef mutable struct SlackClawConfig
     claude_max_retries::Int = 2             # retry a transient non-zero exit (rate limit/overload) this many times
     claude_retry_backoff_s::Float64 = 3.0   # base backoff between retries (grows exponentially)
     max_turns::Int = 30
+    permission_mode::String = "auto"    # claude --permission-mode: auto (classifier), acceptEdits,
+                                        # bypassPermissions, manual, dontAsk, plan. "auto" trusts the repo
+                                        # + its remotes but NOT slack.com — an upload helper post may be
+                                        # judged exfiltration unless the deploying account's settings add an
+                                        # autoMode.environment trust block. Set "bypassPermissions" to restore
+                                        # the pre-0.7 unrestricted behavior for a channel that needs it.
     allowed_tools::Vector{String} = String[]
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 3
