@@ -35,6 +35,8 @@ Pure routing decision for a Socket Mode message event. Routes:
 
 - `:primary`       — top-level message in the monitored channel
 - `:thread_reply`  — reply inside a tracked thread
+- `:thread_revive` — reply inside an UNtracked thread in the primary channel
+                     (expired or never tracked); dispatch re-tracks it
 - `:listen`        — top-level message in a configured listen channel
 - `:ignore`        — everything else
 
@@ -54,7 +56,8 @@ function classify_socket_event(event::AbstractDict, config::SlackClawConfig, tra
 
     if !isempty(msg.thread_ts) && msg.thread_ts != msg.ts
         msg.thread_ts in tracked_threads && return (:thread_reply, msg)
-        return (:ignore, nothing)  # reply in a thread we don't track
+        ch == config.slack_channel_id && return (:thread_revive, msg)
+        return (:ignore, nothing)  # untracked-thread reply outside the primary channel
     end
     ch == config.slack_channel_id && return (:primary, msg)
     ch in config.listen_channel_ids && return (:listen, msg)
@@ -80,6 +83,17 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
         claim_thread_reply!(state, session, msg.ts) || return nothing
         save_state!(state)
         should_process(msg, config, event) || return nothing
+        dispatch_thread_reply!(state, msg, session)
+
+    elseif route == :thread_revive
+        # should_process runs BEFORE the claim, inverting the usual order: this
+        # claim CREATES the session, and a bot/self message must never re-track
+        # a thread — the bot's own trailing post into a just-expired thread
+        # would otherwise resurrect it indefinitely.
+        should_process(msg, config, event) || return nothing
+        session = claim_thread_revive!(state, msg, get(event, "channel", ""))
+        session === nothing && return nothing
+        save_state!(state)
         dispatch_thread_reply!(state, msg, session)
 
     elseif route == :listen

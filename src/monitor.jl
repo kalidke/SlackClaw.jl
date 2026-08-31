@@ -231,6 +231,24 @@ function claim_thread_reply!(state::MonitorState, session::ThreadSession, ts::Ab
     end
 end
 
+"""
+Claim a user reply that arrived in an expired/untracked thread by atomically
+re-tracking it. Creates a fresh `ThreadSession` — empty Claude `session_id`,
+since the expired session's context is gone; the reply starts a new session in
+the same Slack thread — with `last_reply_ts = msg.ts`, so a redelivery of this
+message routes as `:thread_reply` and fails `claim_thread_reply!`. Returns the
+new session, or `nothing` when the thread is already tracked (another delivery
+won the race).
+"""
+function claim_thread_revive!(state::MonitorState, msg::SlackMessage, channel_id::AbstractString)
+    lock(state.dispatch_lock) do
+        haskey(state.threads, msg.thread_ts) && return nothing
+        session = ThreadSession(msg.thread_ts, "", msg.ts, time(), String(channel_id))
+        state.threads[msg.thread_ts] = session
+        return session
+    end
+end
+
 """Claim a listen-channel message against that channel's cursor."""
 function claim_listen!(state::MonitorState, ch_id::AbstractString, ts::AbstractString)
     lock(state.dispatch_lock) do
@@ -510,18 +528,16 @@ end
 Drop threads idle beyond `max_thread_idle_s`, then enforce the
 `max_active_threads` count cap (oldest first). Every tracked thread costs a
 `conversations.replies` call per poll/reconcile cycle, so unbounded idle
-threads become permanent rate-limit pressure.
+threads become permanent rate-limit pressure. Expiry is SILENT — no notice is
+posted (a bookkeeping announcement only pulls readers back into a dead
+thread). A later user reply in an expired thread re-tracks it via the
+`:thread_revive` route (fresh Claude session, same Slack thread), so expiry
+costs the user nothing but the dropped conversation context.
 """
 function expire_threads!(state::MonitorState)
     dropped = 0
 
     for s in idle_expired_threads(state.threads, state.config.max_thread_idle_s, time())
-        idle_d = round(Int, (time() - thread_last_active(s)) / 86400)
-        try
-            slack_post_message(state.config,
-                "_Thread closed after $(idle_d)d idle. Start a new thread to continue._";
-                thread_ts=s.thread_ts, channel_id=s.channel_id)
-        catch; end
         delete!(state.threads, s.thread_ts)
         dropped += 1
     end
@@ -530,13 +546,7 @@ function expire_threads!(state::MonitorState)
     if length(state.threads) > max
         sorted = sort(collect(values(state.threads)); by=s -> s.created)
         for i in 1:(length(sorted) - max)
-            s = sorted[i]
-            try
-                slack_post_message(state.config,
-                    "_Thread closed — I can only track $(max) threads at a time. Start a new thread to continue._";
-                    thread_ts=s.thread_ts, channel_id=s.channel_id)
-            catch; end
-            delete!(state.threads, s.thread_ts)
+            delete!(state.threads, sorted[i].thread_ts)
             dropped += 1
         end
     end

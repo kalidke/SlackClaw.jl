@@ -253,8 +253,16 @@ end
     @test route == :thread_reply
     @test msg.thread_ts == "111.000"
 
-    # Reply in an untracked thread ignored
+    # Reply in an untracked thread in the PRIMARY channel revives it
     d = copy(base); d["thread_ts"] = "999.0"
+    route, msg = cse(d, cfg, tracked)
+    @test route == :thread_revive
+    @test msg.thread_ts == "999.0"
+
+    # Untracked-thread reply outside the primary channel stays ignored
+    d = copy(base); d["thread_ts"] = "999.0"; d["channel"] = "CLISTEN"
+    @test cse(d, cfg, tracked)[1] == :ignore
+    d = copy(base); d["thread_ts"] = "999.0"; d["channel"] = "CX"
     @test cse(d, cfg, tracked)[1] == :ignore
 
     # Thread parent (thread_ts == ts) is a top-level message
@@ -334,6 +342,34 @@ end
     @test SlackClaw.claim_listen!(state, "CL", "101.0")
     @test !SlackClaw.claim_listen!(state, "CL", "101.0")
     @test state.listen_last_ts["CL"] == "101.0"
+end
+
+@testset "thread revive claim" begin
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0")
+    state = SlackClaw.MonitorState(cfg, "0", true, Task[], nothing,
+        Dict{String,SlackClaw.ThreadSession}(), Dict{String,Float64}(),
+        SlackClaw.ScheduledTask[], Dict{String,String}(),
+        Dict{String,String}(), 0.0, ReentrantLock())
+    msg = SlackClaw.SlackMessage("205.0", "U1", "hi again", "999.0")
+
+    # First delivery re-tracks the thread with a fresh (empty) session
+    session = SlackClaw.claim_thread_revive!(state, msg, "C0")
+    @test session !== nothing
+    @test session.session_id == ""
+    @test session.last_reply_ts == "205.0"
+    @test session.channel_id == "C0"
+    @test haskey(state.threads, "999.0")
+
+    # A redelivery loses the race: thread now tracked
+    @test SlackClaw.claim_thread_revive!(state, msg, "C0") === nothing
+
+    # ...and once tracked it classifies as a plain thread reply whose
+    # reply-cursor claim rejects the same ts
+    ev = Dict("type" => "message", "channel" => "C0", "user" => "U1",
+              "text" => "hi again", "ts" => "205.0", "thread_ts" => "999.0")
+    @test SlackClaw.classify_socket_event(ev, cfg, keys(state.threads))[1] == :thread_reply
+    @test !SlackClaw.claim_thread_reply!(state, session, "205.0")
+    @test SlackClaw.claim_thread_reply!(state, session, "206.0")
 end
 
 @testset "thread expiry" begin
