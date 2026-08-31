@@ -370,6 +370,16 @@ end
     @test SlackClaw.classify_socket_event(ev, cfg, keys(state.threads))[1] == :thread_reply
     @test !SlackClaw.claim_thread_reply!(state, session, "205.0")
     @test SlackClaw.claim_thread_reply!(state, session, "206.0")
+
+    # Revived (context-less) session: prompt carries the lost-context note,
+    # then the normal sender attribution. A session with resumable context
+    # gets the plain attributed prompt.
+    p = SlackClaw.thread_prompt(session, msg)
+    @test startswith(p, SlackClaw.REVIVED_THREAD_NOTE)
+    @test occursin(SlackClaw.attribute_sender(msg.text, msg.user), p)
+    live = SlackClaw.ThreadSession("999.0", "sid123", "205.0", 0.0, "C0")
+    @test SlackClaw.thread_prompt(live, msg) ==
+          SlackClaw.attribute_sender(msg.text, msg.user)
 end
 
 @testset "thread expiry" begin

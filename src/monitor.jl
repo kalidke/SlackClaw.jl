@@ -859,6 +859,28 @@ end
 
 # --- Dispatch: thread replies ---
 
+"""
+Prepended to the prompt when dispatching into a revived thread (empty
+`session_id`): the Slack thread looks continuous to the user, but the expired
+Claude session's context is gone. The note makes Claude disclose that only
+when the message actually depends on the missing context — an unconditional
+"context expired" reply would be the same bookkeeping noise the silent-expiry
+change removed.
+"""
+const REVIVED_THREAD_NOTE = """
+[note from the dispatcher: this reply revives an expired Slack thread — the earlier \
+conversation in this thread is NOT available to you. If the message relies on that \
+earlier content, say the thread's context expired and ask the user to restate what \
+you need; do not guess. If the message stands on its own, just answer it and do not \
+mention this.]"""
+
+"""Prompt for a thread dispatch: sender-attributed text, with
+[`REVIVED_THREAD_NOTE`](@ref) prepended when the session has no Claude context
+to resume."""
+thread_prompt(session::ThreadSession, msg::SlackMessage) =
+    (isempty(session.session_id) ? REVIVED_THREAD_NOTE * "\n" : "") *
+    attribute_sender(msg.text, msg.user)
+
 function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session::ThreadSession)
     config = state.config
     ch = session.channel_id
@@ -877,7 +899,7 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
     # Same eyes-as-intent contract as dispatch_command! — a [SKIP]ped thread
     # reply gets its eyes removed in the agent loop's skip branch
     slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
-    run_agent_loop!(state, session.thread_ts, attribute_sender(msg.text, msg.user),
+    run_agent_loop!(state, session.thread_ts, thread_prompt(session, msg),
                     session.session_id; react_ts=msg.ts, channel_id=ch)
 end
 
