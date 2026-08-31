@@ -24,7 +24,11 @@ Base.@kwdef mutable struct SlackClawConfig
                                         # bypassPermissions, manual, dontAsk, plan. "auto" trusts the repo
                                         # + its remotes but NOT slack.com — an upload helper post may be
                                         # judged exfiltration unless the deploying account's settings add an
-                                        # autoMode.environment trust block. Set "bypassPermissions" to restore
+                                        # autoMode.environment trust block. Caveat when adding one: setting
+                                        # autoMode.environment REPLACES the ~20 shipped default rules rather
+                                        # than extending them (a partial block silently drops e.g. 'Trusted
+                                        # repo', breaking git push) — merge with the output of
+                                        # `claude auto-mode defaults`. Set "bypassPermissions" to restore
                                         # the pre-0.7 unrestricted behavior for a channel that needs it.
     allowed_tools::Vector{String} = String[]
     max_concurrent_tasks::Int = 5
