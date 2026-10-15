@@ -121,9 +121,10 @@ function run_claude(prompt::String, config::SlackClawConfig;
 
     # Run with retry. A non-zero exit from `claude` is usually transient (rate
     # limit / overload / brief usage cap), so retry with exponential backoff
-    # before giving up. stderr is captured (not discarded) so the real reason is
-    # surfaced. We do NOT retry a timeout, nor a non-zero exit that already
-    # produced stdout (it may have done partial work).
+    # before giving up. The failure reason is the stdout result text first, then
+    # stderr as a fallback (see `exit_failure_message`). We do NOT retry a
+    # timeout, nor a non-zero exit that already produced stdout (it may have done
+    # partial work).
     res = _run_claude_once(cmd, config.claude_timeout_s)
     attempt = 0
     while !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
@@ -143,10 +144,8 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     if res.exitcode != 0
-        reason = strip(res.stderr)
-        msg = isempty(reason) ? "Claude exited non-zero (code $(res.exitcode))" :
-              "Claude exited non-zero (code $(res.exitcode)): $(last(reason, 500))"
-        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode stderr=reason
+        msg = exit_failure_message(res.exitcode, res.stdout, res.stderr)
+        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg stderr=strip(res.stderr)
         return ClaudeResult(false, msg, duration_ms, 0.0, "")
     end
 
@@ -222,4 +221,23 @@ function parse_claude_output(output::String, duration_ms::Int)
             "",
         )
     end
+end
+
+"""
+    exit_failure_message(exitcode, stdout, stderr) -> String
+
+Describe a non-zero `claude` exit for the Slack reply. With `--output-format json`
+the CLI prints its result object to stdout even when it fails, so the reason is
+that object's `result` text (raw stdout if it is not JSON). Only when stdout
+carries no reason is the stderr tail used, labelled `stderr:` because it is
+evidence rather than a parsed reason.
+"""
+function exit_failure_message(exitcode::Integer, stdout::String, stderr::String)
+    reason = strip(parse_claude_output(stdout, 0).result_text)
+    if !isempty(reason)
+        return "Claude exited non-zero (code $(exitcode)): $(last(reason, 500))"
+    end
+    err = strip(stderr)
+    isempty(err) && return "Claude exited non-zero (code $(exitcode))"
+    return "Claude exited non-zero (code $(exitcode)), stderr: $(last(err, 500))"
 end

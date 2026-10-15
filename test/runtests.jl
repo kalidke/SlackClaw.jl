@@ -183,6 +183,87 @@ end
     @test r.session_id == "s1"
 end
 
+# Non-zero exit: the reason posted to Slack comes from the CLI's result object on
+# stdout, then the stderr tail (labelled), then the bare code. Driven through the
+# real run_claude with a stand-in `claude` on PATH. KEEP ABOVE the "KEEP LAST"
+# block below, which replaces run_claude with a stub.
+@testset "run_claude non-zero exit reason" begin
+    # Stand-in `claude`: prints the fixture files, appends one line to a counter
+    # per call, exits 1. Fixtures are files so JSON quoting ("You've") never
+    # reaches the shell. Logs go to `logger`, so the journal lines can be checked.
+    logger = Test.TestLogger()
+    function fake_claude_run(stdout_text::String, stderr_text::String; max_retries::Int=0)
+        dir = mktempdir()
+        calls = joinpath(dir, "calls")
+        out_f = joinpath(dir, "stdout.txt")
+        err_f = joinpath(dir, "stderr.txt")
+        write(out_f, stdout_text)
+        write(err_f, stderr_text)
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            echo call >> '$calls'
+            cat '$out_f'
+            cat '$err_f' >&2
+            exit 1
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        cfg = SlackClawConfig(slack_bot_token="", slack_channel_id="C0TEST",
+                              repo_dir=dir, claude_max_retries=max_retries,
+                              claude_retry_backoff_s=0.01)
+        res = withenv("PATH" => dir * ":" * ENV["PATH"]) do
+            Base.CoreLogging.with_logger(logger) do
+                SlackClaw.run_claude("hi", cfg)
+            end
+        end
+        return res, (isfile(calls) ? countlines(calls) : 0)
+    end
+
+    json_err = """{"type":"result","subtype":"success","is_error":true,"result":"You've hit your weekly limit · resets 6am","session_id":"s-a","total_cost_usd":0,"num_turns":1}"""
+    warn_err = "Warning: claude.ai MCP server blocked by enterprise policy: claude.ai AIMicroGraph\n"
+
+    if Sys.isunix()
+        # (a) the CLI's result text is the reason; the stderr warning is not
+        r, n = fake_claude_run(json_err * "\n", warn_err; max_retries=2)
+        @test r.success == false
+        @test r.result_text == "Claude exited non-zero (code 1): You've hit your weekly limit · resets 6am"
+        @test !occursin("Warning", r.result_text)
+        # the journal carries the same reason as the Slack reply
+        @test any(l -> l.level == Base.CoreLogging.Error &&
+                       get(l.kwargs, :reason, "") == r.result_text, logger.logs)
+        # (e) stdout was non-empty, so the failure is not retried
+        @test n == 1
+
+        # (b) no JSON on stdout: the raw stdout is the reason, stderr is ignored
+        r, _ = fake_claude_run("Usage limit reached for this account.\n", "Warning: noise\n")
+        @test r.success == false
+        @test r.result_text == "Claude exited non-zero (code 1): Usage limit reached for this account."
+
+        # (c) empty stdout: the stderr tail is the fallback, labelled as evidence
+        r, _ = fake_claude_run("", "Failed to authenticate: token expired\n")
+        @test r.result_text == "Claude exited non-zero (code 1), stderr: Failed to authenticate: token expired"
+
+        # (d) nothing on either stream: the bare exit code
+        r, _ = fake_claude_run("", "")
+        @test r.result_text == "Claude exited non-zero (code 1)"
+
+        # (e) empty stdout is retried: one run per attempt, so 1 + max_retries
+        _, n = fake_claude_run("", "Failed to authenticate: token expired\n"; max_retries=1)
+        @test n == 2
+    end
+
+    # exit_failure_message directly (no subprocess)
+    @test SlackClaw.exit_failure_message(1,
+        """[{"type":"system"},{"type":"result","is_error":true,"result":"Failed to authenticate: OAuth session expired"}]""",
+        "Warning: noise\n") == "Claude exited non-zero (code 1): Failed to authenticate: OAuth session expired"
+    # a JSON result with empty text falls back to the labelled stderr tail
+    @test SlackClaw.exit_failure_message(1,
+        """{"type":"result","is_error":true,"result":""}""", "boom\n") ==
+        "Claude exited non-zero (code 1), stderr: boom"
+    # the stderr tail is capped at its last 500 characters
+    @test SlackClaw.exit_failure_message(2, "", "x"^600 * "END") ==
+        "Claude exited non-zero (code 2), stderr: " * "x"^497 * "END"
+end
+
 @testset "chunk_text" begin
     ct = SlackClaw.chunk_text
 
