@@ -491,6 +491,22 @@ end
         """{"type":"message","subtype":"file_share","channel":"C0","user":"U1","text":"","ts":"550.0","files":[{"id":"F5","name":null,"title":"Holiday pic","mimetype":"image/jpeg"},{"id":"F6","mode":"tombstone"},{"id":"F7","name":"notes.txt"}]}""")
     route, m = cse(raw, cfg, Set{String}())
     @test m.text == "[attached file: Holiday pic (image/jpeg, id F5)]\n[attached file: unnamed file (id F6)]\n[attached file: notes.txt (id F7)]"
+
+    # caption_of inverts message_text: the caption comes back exactly, and a
+    # file-only post has no caption (command matching reads only this)
+    raw = SlackClaw.JSON.parse(
+        """{"type":"message","subtype":"file_share","channel":"C0","user":"U1","text":"look at these","ts":"560.0","files":[{"id":"F1","name":"a.png","mimetype":"image/png"},{"id":"F2","name":"b.png","mimetype":"image/png"}]}""")
+    @test SlackClaw.caption_of(SlackClaw.message_text(raw)) == "look at these"
+    raw = SlackClaw.JSON.parse(
+        """{"type":"message","channel":"C0","user":"U1","text":"hi","ts":"561.0"}""")
+    @test SlackClaw.caption_of(SlackClaw.message_text(raw)) == "hi"
+    raw = SlackClaw.JSON.parse(
+        """{"type":"message","subtype":"file_share","channel":"C0","user":"U1","text":"","ts":"562.0","files":[{"id":"F1","name":"a.png","mimetype":"image/png"}]}""")
+    @test SlackClaw.caption_of(SlackClaw.message_text(raw)) == ""
+    # A caption that ends in a newline keeps it: only the one separator is dropped
+    raw = SlackClaw.JSON.parse(
+        """{"type":"message","subtype":"file_share","channel":"C0","user":"U1","text":"two lines\\n","ts":"563.0","files":[{"id":"F1","name":"a.png","mimetype":"image/png"}]}""")
+    @test SlackClaw.caption_of(SlackClaw.message_text(raw)) == "two lines\n"
 end
 
 @testset "cursor claims" begin
@@ -982,6 +998,41 @@ end
     @test isempty(unreacted)
     @test posted == ["[SKIP]"]
     @test prompts == ["[from <@U9>]\n\nhello"]
+end
+
+# A proactive command is matched against the caption only: a file named like a
+# command is an attachment and dispatches normally, while a caption that is a
+# command still runs with files attached.
+@testset "file posts: proactive commands match the caption only" begin
+    cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0",
+                          repo_dir=mktempdir(), proactive_enabled=true)
+    state = mkstate(cfg)
+    cse = SlackClaw.classify_socket_event
+    file_post(ts, text, name) = SlackClaw.JSON.parse(
+        """{"type":"message","subtype":"file_share","channel":"C0","user":"U1","text":"$text","ts":"$ts","files":[{"id":"F1","name":"$name","mimetype":"text/plain"}]}""")
+
+    empty!(top_posted); empty!(posted); empty!(prompts)
+    _, m = cse(file_post("600.0", "", "proactive off.txt"), cfg, Set{String}())
+    SlackClaw.dispatch_command!(state, m)
+    foreach(wait, state.active_tasks)
+    @test cfg.proactive_enabled
+    @test isempty(top_posted)
+    @test prompts == ["[from <@U1>]\n\n[attached file: proactive off.txt (text/plain, id F1)]"]
+
+    empty!(prompts)
+    interval = cfg.proactive_interval_s
+    _, m = cse(file_post("601.0", "", "proactive every 2h.txt"), cfg, Set{String}())
+    SlackClaw.dispatch_command!(state, m)
+    foreach(wait, state.active_tasks)
+    @test cfg.proactive_interval_s == interval
+    @test length(prompts) == 1
+
+    empty!(top_posted); empty!(prompts)
+    _, m = cse(file_post("602.0", "proactive off", "IMG_1234.jpg"), cfg, Set{String}())
+    SlackClaw.dispatch_command!(state, m)
+    @test !cfg.proactive_enabled
+    @test top_posted == ["_Proactive mode disabled._"]
+    @test isempty(prompts)
 end
 
 # The 0.6.2 spam fix, end-to-end: a narrated decline ("…nothing new. [SKIP]")

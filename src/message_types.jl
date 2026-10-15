@@ -58,6 +58,29 @@ function message_text(raw::AbstractDict)
 end
 
 """
+    caption_of(text::AbstractString) -> String
+
+Caption recovered from a [`message_text`](@ref): the text without its trailing
+`[attached file: …]` lines and the blank separator line before them. Command
+matching reads this, so a file name cannot toggle a command. The split is
+deterministic because the notes are always the trailing lines of `message_text`
+and never contain a newline ([`attachment_note`](@ref) flattens them): every
+trailing line that starts with `[attached file: ` is a note, and exactly one
+blank line before the first note is the separator. A whitespace-only caption is
+dropped by `message_text`, so it comes back as `""`.
+"""
+function caption_of(text::AbstractString)
+    lines = String.(split(text, '\n'; keepempty=true))
+    notes = false
+    while !isempty(lines) && startswith(last(lines), "[attached file: ")
+        pop!(lines)
+        notes = true
+    end
+    notes && !isempty(lines) && isempty(last(lines)) && pop!(lines)
+    return join(lines, "\n")
+end
+
+"""
     parse_slack_messages(messages::Vector) -> Vector{SlackMessage}
 
 Parse raw Slack API message dicts into `SlackMessage` structs.

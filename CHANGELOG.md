@@ -25,6 +25,9 @@ in the prompt.
 - Bot and self filtering is unchanged: the bot's own uploads and `bot_id`
   posts are still dropped, and a message with neither text nor files is still
   dropped.
+- **Proactive commands read the caption only.** `proactive on`, `proactive off`
+  and `proactive every …` are matched against the caption, so a file named
+  `proactive off.txt` cannot toggle proactive mode.
 
 ## [0.7.2] — 2026-10-15
 
