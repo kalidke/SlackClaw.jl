@@ -4,6 +4,28 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [0.7.3] — 2026-10-15
+
+Patch: a message with files and no text is dispatched, and its files are named
+in the prompt.
+
+### Fixed
+
+- **File-only posts are dispatched.** `should_process` dropped any message
+  whose text was blank, so a caption-less photo never ran. A message with files
+  now dispatches, whatever its caption.
+- **Attachments are named in the prompt.** Each file adds one line,
+  `[attached file: IMG_1234.jpg (image/jpeg, id F0ABC)]`, after the caption,
+  separated from it by a blank line (with no caption the lines are the whole
+  text). The socket and reconcile paths build the text in the same helper
+  (`message_text`), so they agree. Only the name, mimetype and id reach the
+  prompt; the file is not downloaded. Missing fields fall back to the title,
+  then to `unnamed file`. File names are user-controlled, so line breaks in
+  them become spaces: a name cannot forge a `[from …]` line.
+- Bot and self filtering is unchanged: the bot's own uploads and `bot_id`
+  posts are still dropped, and a message with neither text nor files is still
+  dropped.
+
 ## [0.7.2] — 2026-10-15
 
 Patch: a failed `claude` run now names the real reason. (0.7.0–0.7.1 were

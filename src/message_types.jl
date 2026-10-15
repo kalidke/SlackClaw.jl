@@ -9,6 +9,55 @@ struct SlackMessage
 end
 
 """
+    attachment_note(file::AbstractDict) -> String
+
+Prompt line for one file on a message: `[attached file: name (mimetype, id)]`.
+The name falls back to the title, then to `unnamed file` (tombstoned or
+hidden files carry little more than an id); the parenthetical lists only the
+fields present. File names are user-controlled, so line breaks are flattened
+to spaces: a name cannot start a line of its own, and so cannot pose as a
+`[from …]` attribution.
+"""
+function attachment_note(file::AbstractDict)
+    name = clean_field(get(file, "name", nothing))
+    isempty(name) && (name = clean_field(get(file, "title", nothing)))
+    isempty(name) && (name = "unnamed file")
+    details = String[]
+    mimetype = clean_field(get(file, "mimetype", nothing))
+    isempty(mimetype) || push!(details, mimetype)
+    id = clean_field(get(file, "id", nothing))
+    isempty(id) || push!(details, "id $id")
+    suffix = isempty(details) ? "" : " (" * join(details, ", ") * ")"
+    return "[attached file: $name$suffix]"
+end
+
+"""Slack file field as prompt text: non-strings count as missing."""
+function clean_field(value)
+    value isa AbstractString || return ""
+    return strip(replace(value, r"[\p{Cc}\p{Zl}\p{Zp}]" => " "))
+end
+
+"""
+    message_text(raw::AbstractDict) -> String
+
+Text a Slack message contributes to dispatch: the caption (`text`, unchanged),
+then one [`attachment_note`](@ref) line per file. A non-empty caption is
+separated from the notes by a blank line; with no caption the notes are the
+whole text. The socket and reconcile paths both build text here, so a message
+reads the same on either path. Entries in `files` that are not objects (JSON
+`null`s) are skipped.
+"""
+function message_text(raw::AbstractDict)
+    text = get(raw, "text", "")
+    files = get(raw, "files", nothing)
+    files isa AbstractVector || return text
+    notes = [attachment_note(f) for f in files if f isa AbstractDict]
+    isempty(notes) && return text
+    isempty(strip(text)) && return join(notes, "\n")
+    return text * "\n\n" * join(notes, "\n")
+end
+
+"""
     parse_slack_messages(messages::Vector) -> Vector{SlackMessage}
 
 Parse raw Slack API message dicts into `SlackMessage` structs.
@@ -20,7 +69,7 @@ function parse_slack_messages(messages::Vector)
         push!(result, SlackMessage(
             get(msg, "ts", ""),
             get(msg, "user", ""),
-            get(msg, "text", ""),
+            message_text(msg),
             get(msg, "thread_ts", ""),
         ))
     end
@@ -31,7 +80,8 @@ end
     should_process(msg::SlackMessage, config::SlackClawConfig, raw::AbstractDict) -> Bool
 
 Return `true` if this message should be dispatched to Claude.
-Skips bot messages, messages from our own bot user, and empty text.
+Skips bot messages, messages from our own bot user, and messages with neither
+text nor files (`msg.text` already carries the file notes).
 `raw` is parsed JSON — `AbstractDict`, not `Dict`: JSON.jl v1 parses objects
 as `JSON.Object` (0.21 returned `Dict`), and both must be accepted.
 """
