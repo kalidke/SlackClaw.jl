@@ -21,7 +21,10 @@ released without changelog entries; see the GitHub releases for their notes.)
   stdout carries none, labelled `stderr:` because it is evidence, not a parsed
   reason. The `@error` journal line records the same reason. The retry
   condition is unchanged (a non-zero exit is retried only when stdout is
-  empty), so these failures are still not retried.
+  empty), so these failures are still not retried. A `result` that is null or
+  not a string gives no reason (the stderr tail is used) instead of posting the
+  raw JSON. Reasons are capped at 500 characters with a `…` marker: a parsed
+  result keeps its head, raw stdout and the stderr tail keep their end.
 
 ## [0.6.2] — 2026-08-16
 

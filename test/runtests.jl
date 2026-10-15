@@ -259,9 +259,28 @@ end
     @test SlackClaw.exit_failure_message(1,
         """{"type":"result","is_error":true,"result":""}""", "boom\n") ==
         "Claude exited non-zero (code 1), stderr: boom"
-    # the stderr tail is capped at its last 500 characters
+    # a null result in an array is no reason: the stderr tail is used, not the raw JSON
+    @test SlackClaw.exit_failure_message(1,
+        """[{"type":"assistant","message":"X"},{"type":"result","result":null}]""",
+        "Authentication failed\n") == "Claude exited non-zero (code 1), stderr: Authentication failed"
+    # a non-string result is no reason either
+    @test SlackClaw.exit_failure_message(1,
+        """{"type":"result","is_error":true,"result":42}""", "Authentication failed\n") ==
+        "Claude exited non-zero (code 1), stderr: Authentication failed"
+    # a result beside a null field still gives its text
+    @test SlackClaw.exit_failure_message(1,
+        """{"result":"Not logged in","duration_ms":null}""", "Warning: noise\n") ==
+        "Claude exited non-zero (code 1): Not logged in"
+    # a long parsed result keeps its head, marked with " …"
+    long_result = "Not logged in. " * "x"^600
+    @test SlackClaw.exit_failure_message(1, """{"type":"result","result":"$(long_result)"}""", "") ==
+        "Claude exited non-zero (code 1): Not logged in. " * "x"^485 * " …"
+    # long raw stdout (not JSON) keeps its tail, marked with "… "
+    @test SlackClaw.exit_failure_message(2, "x"^600 * "END", "") ==
+        "Claude exited non-zero (code 2): … " * "x"^497 * "END"
+    # the stderr tail is capped at its last 500 characters, marked with "… "
     @test SlackClaw.exit_failure_message(2, "", "x"^600 * "END") ==
-        "Claude exited non-zero (code 2), stderr: " * "x"^497 * "END"
+        "Claude exited non-zero (code 2), stderr: … " * "x"^497 * "END"
 end
 
 @testset "chunk_text" begin
