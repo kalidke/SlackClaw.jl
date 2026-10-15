@@ -4,6 +4,28 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [0.7.2] — 2026-10-15
+
+Patch: a failed `claude` run now names the real reason. (0.7.0–0.7.1 were
+released without changelog entries; see the GitHub releases for their notes.)
+
+### Fixed
+
+- **Non-zero exits post the CLI's reason, not stderr noise.** With
+  `--output-format json` the CLI prints its result object to stdout even when
+  it fails, and that object's `result` text is the reason (a weekly limit, an
+  expired login). `run_claude` built its message from stderr alone, so a
+  failure posted an unrelated MCP policy warning as the cause, or only the
+  bare exit code when stderr was empty. The reason now comes from the stdout
+  result text (new `exit_failure_message`); a stderr tail is used only when
+  stdout carries none, labelled `stderr:` because it is evidence, not a parsed
+  reason. The `@error` journal line records the same reason. The retry
+  condition is unchanged (a non-zero exit is retried only when stdout is
+  empty), so these failures are still not retried. A `result` that is null or
+  not a string gives no reason (the stderr tail is used) instead of posting the
+  raw JSON. Reasons are capped at 500 characters with a `…` marker: a parsed
+  result keeps its head, raw stdout and the stderr tail keep their end.
+
 ## [0.6.2] — 2026-08-16
 
 Patch: narrated-`[SKIP]` spam fix. (0.5.1–0.6.1 were released without

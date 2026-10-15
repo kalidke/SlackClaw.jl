@@ -121,9 +121,10 @@ function run_claude(prompt::String, config::SlackClawConfig;
 
     # Run with retry. A non-zero exit from `claude` is usually transient (rate
     # limit / overload / brief usage cap), so retry with exponential backoff
-    # before giving up. stderr is captured (not discarded) so the real reason is
-    # surfaced. We do NOT retry a timeout, nor a non-zero exit that already
-    # produced stdout (it may have done partial work).
+    # before giving up. The failure reason is the stdout result text first, then
+    # stderr as a fallback (see `exit_failure_message`). We do NOT retry a
+    # timeout, nor a non-zero exit that already produced stdout (it may have done
+    # partial work).
     res = _run_claude_once(cmd, config.claude_timeout_s)
     attempt = 0
     while !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
@@ -143,10 +144,8 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     if res.exitcode != 0
-        reason = strip(res.stderr)
-        msg = isempty(reason) ? "Claude exited non-zero (code $(res.exitcode))" :
-              "Claude exited non-zero (code $(res.exitcode)): $(last(reason, 500))"
-        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode stderr=reason
+        msg = exit_failure_message(res.exitcode, res.stdout, res.stderr)
+        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg stderr=strip(res.stderr)
         return ClaudeResult(false, msg, duration_ms, 0.0, "")
     end
 
@@ -222,4 +221,56 @@ function parse_claude_output(output::String, duration_ms::Int)
             "",
         )
     end
+end
+
+"""
+    stdout_failure_reason(stdout) -> String
+
+The reason a failed `claude` run printed to stdout: the `result` text of its JSON
+result object (the last `"type" => "result"` entry of an array, or the object
+itself), or the raw stdout when it is not JSON. Decoded here, not by
+`parse_claude_output`, whose catch-all would post the whole JSON envelope when
+`result` is null or not a string. Returns "" when there is no string reason.
+"""
+function stdout_failure_reason(stdout::AbstractString)
+    data = try
+        JSON.parse(stdout)
+    catch
+        # Not valid JSON -- the raw stdout is the reason
+        return _clip_tail(String(strip(stdout)))
+    end
+    entry = if data isa AbstractVector
+        idx = findlast(d -> d isa AbstractDict && get(d, "type", "") == "result", data)
+        idx === nothing ? nothing : data[idx]
+    else
+        data
+    end
+    entry isa AbstractDict || return ""
+    text = get(entry, "result", nothing)
+    text isa AbstractString || return ""
+    return _clip_head(String(strip(text)))
+end
+
+# Reasons are capped at 500 characters with an explicit marker. A parsed result
+# keeps its head (where the reason is); raw stdout and the stderr tail keep their end.
+_clip_head(s::AbstractString) = length(s) > 500 ? first(s, 500) * " …" : s
+_clip_tail(s::AbstractString) = length(s) > 500 ? "… " * last(s, 500) : s
+
+"""
+    exit_failure_message(exitcode, stdout, stderr) -> String
+
+Describe a non-zero `claude` exit for the Slack reply. With `--output-format json`
+the CLI prints its result object to stdout even when it fails, so the reason is
+that object's `result` text (see `stdout_failure_reason`). Only when stdout carries
+no reason is the stderr tail used, labelled `stderr:` because it is evidence
+rather than a parsed reason.
+"""
+function exit_failure_message(exitcode::Integer, stdout::String, stderr::String)
+    reason = stdout_failure_reason(stdout)
+    if !isempty(reason)
+        return "Claude exited non-zero (code $(exitcode)): $(reason)"
+    end
+    err = strip(stderr)
+    isempty(err) && return "Claude exited non-zero (code $(exitcode))"
+    return "Claude exited non-zero (code $(exitcode)), stderr: $(_clip_tail(String(err)))"
 end
