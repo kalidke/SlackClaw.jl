@@ -50,7 +50,7 @@ function classify_socket_event(event::AbstractDict, config::SlackClawConfig, tra
     ts = get(event, "ts", "")
     isempty(ts) && return (:ignore, nothing)
 
-    msg = SlackMessage(ts, get(event, "user", ""), get(event, "text", ""),
+    msg = SlackMessage(ts, get(event, "user", ""), message_text(event),
                        get(event, "thread_ts", ""))
     ch = get(event, "channel", "")
 

@@ -820,8 +820,10 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
                           channel_id::String=state.config.slack_channel_id)
     config = state.config
 
-    # Dynamic proactive frequency adjustment
-    m = match(r"proactive\s+(?:every|interval)\s+(\d+[hm]\w*)"i, msg.text)
+    # Dynamic proactive frequency adjustment. Matched against the caption only:
+    # a file named "proactive off.txt" must not toggle anything.
+    caption = caption_of(msg.text)
+    m = match(r"proactive\s+(?:every|interval)\s+(\d+[hm]\w*)"i, caption)
     if m !== nothing
         new_interval = parse_duration(String(m.captures[1]))
         config.proactive_interval_s = new_interval
@@ -830,7 +832,7 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
             thread_ts=msg.ts, channel_id)
         return
     end
-    m = match(r"proactive\s+(on|off)"i, msg.text)
+    m = match(r"proactive\s+(on|off)"i, caption)
     if m !== nothing
         config.proactive_enabled = lowercase(m.captures[1]) == "on"
         status = config.proactive_enabled ? "enabled" : "disabled"
