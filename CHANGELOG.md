@@ -18,10 +18,12 @@ in the prompt.
   `[attached file: IMG_1234.jpg (image/jpeg, id F0ABC)]`, after the caption,
   separated from it by a blank line (with no caption the lines are the whole
   text). The socket and reconcile paths build the text in the same helper
-  (`message_text`), so they agree. Only the name, mimetype and id reach the
-  prompt; the file is not downloaded. Missing fields fall back to the title,
-  then to `unnamed file`. File names are user-controlled, so line breaks in
-  them become spaces: a name cannot forge a `[from …]` line.
+  (`message_text`), so one payload gives one text on either path. A Slack
+  Connect socket event can carry only a file id, so its note can read
+  `unnamed file` where the history copy names the file. Only the name, mimetype
+  and id reach the prompt; the file is not downloaded. Missing fields fall back
+  to the title, then to `unnamed file`. File names are user-controlled, so line
+  breaks in them become spaces: a name cannot forge a `[from …]` line.
 - Bot and self filtering is unchanged: the bot's own uploads and `bot_id`
   posts are still dropped, and a message with neither text nor files is still
   dropped.

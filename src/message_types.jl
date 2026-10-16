@@ -43,9 +43,11 @@ end
 Text a Slack message contributes to dispatch: the caption (`text`, unchanged),
 then one [`attachment_note`](@ref) line per file. A non-empty caption is
 separated from the notes by a blank line; with no caption the notes are the
-whole text. The socket and reconcile paths both build text here, so a message
-reads the same on either path. Entries in `files` that are not objects (JSON
-`null`s) are skipped.
+whole text. The socket and reconcile paths both build text here, so one payload
+gives the same text on either path. A Slack Connect socket event can carry only
+a file id (a `check_file_info` stub), so its note can read `unnamed file` where
+the history copy of the same message names the file. Entries in `files` that are
+not objects (JSON `null`s) are skipped.
 """
 function message_text(raw::AbstractDict)
     text = get(raw, "text", "")
