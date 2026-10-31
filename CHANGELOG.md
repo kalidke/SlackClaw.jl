@@ -8,6 +8,10 @@ Notable changes to SlackClaw.jl. Format follows
 
 ### Added
 
+- **Chat file transfers.** Private downloads stream into exclusive, bounded
+  destinations and forward bot authorization only to Slack hosts. External
+  uploads stream original file bytes, refuse changed sources, and share once
+  with recoverable person or row attribution and explicit uncertain outcomes.
 - **Chat Web API client.** A separate, unexported client returns bounded typed
   errors and mutation outcomes without retrying. Channel and thread history
   pages carry query-bound cursors and report incomplete pagination explicitly.

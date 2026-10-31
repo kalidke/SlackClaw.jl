@@ -9,12 +9,27 @@ struct ChatHTTPResponse
     body::Vector{UInt8}
 end
 
+"""Private signal: HTTP 2.x should close a response with no selected sink."""
+struct ChatHTTPDiscard <: Exception end
+
+"""HTTP 2.x response sink, selected by its response-head trace before any write."""
+mutable struct ChatHTTPStreamSink <: IO
+    sink::Union{IO,Nothing}
+end
+
+function Base.unsafe_write(stream::ChatHTTPStreamSink, data::Ptr{UInt8}, count::UInt)
+    return unsafe_write(stream.sink::IO, data, count)
+end
+
+Base.write(stream::ChatHTTPStreamSink, byte::UInt8) = write(stream, Ref(byte))
+
 """
     http_transport(method, url, headers; body=nothing, response_stream=nothing, timeout_s=20)
 
 Make one HTTP request, without redirects, status exceptions or retries. A supplied
-response stream owns the response bytes instead of the returned body. HTTP.jl 1.x
-requires fractional timeouts to round up to whole seconds; 2.x accepts them directly.
+callback receives the status and headers and selects an IO sink, or nothing to
+discard at most 64 KiB. An IO can also be supplied directly as the response sink.
+HTTP.jl 1.x rounds fractional timeouts up to seconds; 2.x accepts them directly.
 """
 function http_transport(method::String, url::String, headers::Vector{Pair{String,String}};
                         body=nothing, response_stream=nothing, timeout_s::Real=20)
@@ -32,11 +47,92 @@ function http_transport(method::String, url::String, headers::Vector{Pair{String
         options = (; options..., readtimeout=seconds, connect_timeout=min(10, seconds),
                    closeimmediately=true, logerrors=false)
     end
-    if response_stream !== nothing
-        options = (; options..., response_stream)
+    if CHAT_HTTP_V2
+        # Both open's writes and request's IOStream normalization buffer the
+        # whole request in 2.x. CallbackBody keeps uploads incremental. Its
+        # length defaults to unknown, so set the prepared request's public
+        # content_length at RequestEvent, before HTTP/1 framing is chosen.
+        request_body = body
+        content_length = nothing
+        if body isa IOStream
+            length_header = findfirst(h -> lowercase(first(h)) == "content-length", request_headers)
+            content_length = length_header === nothing ? stat(body).size - position(body) :
+                parse(Int64, last(request_headers[length_header]))
+            request_body = HTTP.CallbackBody(dst -> readbytes!(body, dst, length(dst)), () -> nothing)
+        end
+        streamed = nothing
+        sink = response_stream isa Function ? ChatHTTPStreamSink(nothing) : response_stream
+        trace = function(event)
+            if event isa HTTP.RequestEvent && content_length !== nothing
+                event.request.content_length = content_length
+            elseif event isa HTTP.ResponseHeadEvent && response_stream isa Function
+                response = event.response
+                response_headers = Pair{String,String}[String(k) => String(v) for (k, v) in response.headers]
+                streamed = ChatHTTPResponse(Int(response.status), response_headers, UInt8[])
+                sink.sink = response_stream(streamed.status, response_headers)
+                # A trace error closes the incoming body without reading it.
+                # Discard zero bytes, within the 64 KiB allowance, rather than
+                # depend on the size of HTTP's subsequent body-copy chunks.
+                sink.sink === nothing && throw(ChatHTTPDiscard())
+            end
+        end
+        response = try
+            # The 1.x open path copies raw entity bytes. Keep that behavior
+            # for file callbacks, including Content-Encoding: gzip responses.
+            HTTP.request(method, url, request_headers, request_body;
+                         response_stream=sink, trace,
+                         decompress=response_stream isa Function ? false : nothing, options...)
+        catch e
+            # HTTP 2.x closes the incoming body on trace/sink errors. Only our
+            # intentional bounded discard is a successful, empty response.
+            e isa ChatHTTPDiscard || rethrow()
+            return streamed
+        end
+    elseif response_stream isa Function
+        streamed = nothing
+        discarded = false
+        try
+            HTTP.open(method, url, request_headers; options...) do http
+                try
+                    body === nothing || write(http, body)
+                    HTTP.closewrite(http)
+                    response = HTTP.startread(http)
+                    response_headers = Pair{String,String}[String(k) => String(v) for (k, v) in response.headers]
+                    streamed = ChatHTTPResponse(Int(response.status), response_headers, UInt8[])
+                    sink = response_stream(streamed.status, response_headers)
+                    if sink === nothing
+                        remaining = 65536
+                        while remaining > 0 && !eof(http)
+                            chunk = read(http, min(8192, remaining))
+                            isempty(chunk) && break
+                            remaining -= length(chunk)
+                        end
+                        if remaining == 0
+                            # HTTP.open's cleanup would otherwise drain the rest without a bound.
+                            discarded = true
+                            close(http.stream)
+                        end
+                    else
+                        while !eof(http)
+                            chunk = read(http, 65536)
+                            isempty(chunk) && break
+                            write(sink, chunk)
+                        end
+                    end
+                catch
+                    # Also stop cleanup from draining a rejected or oversized response.
+                    close(http.stream)
+                    rethrow()
+                end
+            end
+        catch
+            discarded || rethrow()
+        end
+        return streamed
+    else
+        response = HTTP.request(method, url, request_headers, body === nothing ? UInt8[] : body;
+                                response_stream, options...)
     end
-    response = HTTP.request(method, url, request_headers, body === nothing ? UInt8[] : body;
-                            options...)
     bytes = response_stream === nothing ? Vector{UInt8}(response.body) : UInt8[]
     return ChatHTTPResponse(Int(response.status),
         Pair{String,String}[String(k) => String(v) for (k, v) in response.headers], bytes)
@@ -334,12 +430,20 @@ function chat_own_origin(raw::AbstractDict, text::String)
             attribution === nothing || return (attribution..., text)
         end
     end
-    prefix = match(r"\A([^\r\n\p{Zl}\p{Zp}]+) \((person|row) via Ship of Tools\): ", text)
+    prefix = match(r"\A([^\r\n\p{Zl}\p{Zp}]+) \((person|row) via Ship of Tools\)(?:: |\z)", text)
     if prefix !== nothing
         attribution = chat_attribution(prefix.captures[2], prefix.captures[1]; bounded_marker=true)
         attribution === nothing || return (attribution..., String(chopprefix(text, prefix.match)))
     end
     return ("bot", "", text)
+end
+
+"""Return a MIME token without parameters, refusing URLs and recognizable secrets."""
+function chat_file_mime(value::AbstractString)
+    mime = lowercase(strip(first(split(value, ';'; limit=2))))
+    valid = occursin(r"\A[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\z", mime)
+    secret = occursin(r"(?:xox[baprs]-|xapp-)", mime)
+    return valid && !secret ? String(mime) : "application/octet-stream"
 end
 
 """Summarize up to eight valid files without exposing private download URLs."""
@@ -363,7 +467,7 @@ function chat_message_files(raw::AbstractDict)
         bytes = size isa Integer && !(size isa Bool) && 0 <= size <= typemax(Int) ? Int(size) : nothing
         push!(files, Dict{String,Any}(
             "id" => String(id), "name" => stub ? "" : name,
-            "mime" => stub ? "" : chat_clean_field(get(entry, "mimetype", ""), 128),
+            "mime" => stub ? "" : chat_file_mime(chat_string(entry, "mimetype")),
             "bytes" => stub ? nothing : bytes,
             "thumbnail" => !stub && any(k -> get(entry, k, nothing) isa AbstractString,
                                          ("thumb_360", "thumb_480", "thumb_160", "thumb_720"))))
@@ -561,6 +665,21 @@ function chat_history(ws::ChatWorkspace, req::AbstractDict)
     return result
 end
 
+"""Validate an author once and share the recoverable label with posts and file shares."""
+function chat_author_label(author)
+    author isa AbstractDict || throw(ChatError(:bad_request, "Author is required"))
+    kind = get(author, "kind", nothing)
+    kind in ("person", "row") || throw(ChatError(:bad_request, "Invalid author kind"))
+    raw_name = get(author, "name", nothing)
+    raw_name isa AbstractString && ncodeunits(raw_name) <= 160 ||
+        throw(ChatError(:bad_request, "Invalid author name"))
+    name = clean_field(raw_name)
+    isempty(name) && throw(ChatError(:bad_request, "Author name is required"))
+    kind == "row" && !startswith(name, "@") && (name = "@" * name)
+    ncodeunits(name) <= 160 || throw(ChatError(:bad_request, "Author name exceeds 160 bytes"))
+    return kind, name, "$name ($kind via Ship of Tools)"
+end
+
 """
     chat_post(ws, req::AbstractDict) -> Dict{String,Any}
 
@@ -576,18 +695,7 @@ function chat_post(ws::ChatWorkspace, req::AbstractDict)
         text = get(req, "text", nothing)
         text isa AbstractString && !isempty(strip(text)) || throw(ChatError(:bad_request, "Text is required"))
         ncodeunits(text) <= 8192 || throw(ChatError(:too_large, "Text exceeds 8192 bytes"))
-        author = get(req, "author", nothing)
-        author isa AbstractDict || throw(ChatError(:bad_request, "Author is required"))
-        kind = get(author, "kind", nothing)
-        kind in ("person", "row") || throw(ChatError(:bad_request, "Invalid author kind"))
-        raw_name = get(author, "name", nothing)
-        raw_name isa AbstractString && ncodeunits(raw_name) <= 160 ||
-            throw(ChatError(:bad_request, "Invalid author name"))
-        name = clean_field(raw_name)
-        isempty(name) && throw(ChatError(:bad_request, "Author name is required"))
-        kind == "row" && !startswith(name, "@") && (name = "@" * name)
-        ncodeunits(name) <= 160 || throw(ChatError(:bad_request, "Author name exceeds 160 bytes"))
-        label = "$name ($kind via Ship of Tools)"
+        kind, name, label = chat_author_label(get(req, "author", nothing))
         body = Dict{String,Any}("channel" => channel,
             "text" => ws.posting_form == :prefix ? "$label: $text" : String(text),
             "metadata" => Dict{String,Any}("event_type" => "sot_chat_post",

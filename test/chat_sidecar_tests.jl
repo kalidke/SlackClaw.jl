@@ -25,12 +25,23 @@ function chat_test_transport(handler::Function)
     transport = function(method::String, url::String, headers::Vector{Pair{String,String}};
                          body=nothing, response_stream=nothing, timeout_s::Real=20)
         call = Dict{String,Any}("method" => method, "url" => url, "headers" => copy(headers),
-            "query" => chat_test_query(url), "body" => body === nothing ? nothing : SlackClaw.JSON.parse(body),
+            "query" => chat_test_query(url), "body" => body isa AbstractString ? SlackClaw.JSON.parse(body) : body,
             "timeout_s" => timeout_s, "response_stream" => response_stream)
         push!(calls, call)
         answer = handler(call)
         answer isa Exception && throw(answer)
-        return chat_test_response(answer)
+        response = chat_test_response(answer)
+        if response_stream !== nothing
+            sink = response_stream(response.status, response.headers)
+            if sink !== nothing
+                # Small chunks exercise the bounded sink across multiple writes.
+                for first_byte in 1:3:length(response.body)
+                    write(sink, response.body[first_byte:min(first_byte + 2, length(response.body))])
+                end
+            end
+            return SlackClaw.ChatHTTPResponse(response.status, response.headers, UInt8[])
+        end
+        return response
     end
     return transport, calls
 end
@@ -53,6 +64,10 @@ function chat_test_error(f::Function)
     end
     error("Expected a chat failure")
 end
+
+"""Build only the timeout constructor provided by the installed HTTP version."""
+chat_test_timeout() = pkgversion(SlackClaw.HTTP).major >= 2 ?
+    SlackClaw.HTTP.TimeoutError("request", 20_000_000_000) : SlackClaw.HTTP.TimeoutError(20)
 
 """Compare fixture timestamps using exact integers, independently of production code."""
 function chat_test_time(ts::AbstractString)
@@ -335,7 +350,7 @@ end
         http_request = SlackClaw.HTTP.Request("POST", "/api/chat.postMessage", ["Authorization" => "Bearer $token"])
         append!(errors, [
             (SlackClaw.HTTP.RequestError(http_request, ErrorException(token)), :io_error, :unknown),
-            (SlackClaw.HTTP.RequestError(http_request, SlackClaw.HTTP.TimeoutError(20)), :timeout, :unknown),
+            (SlackClaw.HTTP.RequestError(http_request, chat_test_timeout()), :timeout, :unknown),
             (SlackClaw.HTTP.RequestError(http_request,
                 SlackClaw.HTTP.ConnectError("https://slack.com/$token", ErrorException(token))), :unavailable, :refused)])
     end
@@ -543,6 +558,11 @@ end
         @test file["thumbnail"] === true
         @test !occursin("private-url", SlackClaw.JSON.json(file))
     end
+    for mime in ("https://cdn.example.org/private/key", "image/xoxb-fake")
+        raw["files"] = [Dict("id" => "F1", "mimetype" => mime)]
+        record = normalize(ws, raw, "C1")
+        @test record["files"][1]["mime"] == "application/octet-stream"
+    end
     raw["files"] = [Dict{String,Any}("id" => "F1", "file_access" => "check_file_info", "name" => "hidden", "size" => 12),
                     Dict{String,Any}("id" => "F2", "title" => "fallback", "size" => "12", "thumb_480" => "url")]
     record = normalize(ws, raw, "C1")
@@ -628,4 +648,553 @@ end
     @test fetch(lookup) == "Fresh Name"
     @test fetch(cached) == "Cached Name"
     @test length(recorded) == 1
+end
+
+@testset "chat_private_fetch_bounds_bytes_and_redirect_authorization" begin
+    fetch_file = SlackClaw.chat_fetch_file
+    response = SlackClaw.ChatHTTPResponse
+    token = "fake-file-bot-token-do-not-print"
+    original_url = "https://files.slack.com/private/$token/original"
+    redirected_url = "https://files-origin.slack.com/private/$token/original"
+    bytes = UInt8[0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x80, 0x0a, 0x0d, 0x42]
+    file_info = Dict{String,Any}("id" => "F1", "channels" => ["C1"], "size" => length(bytes),
+        "mimetype" => "image/png", "url_private_download" => original_url,
+        "url_private" => "https://files.slack.com/fallback", "thumb_360" => "https://files.slack.com/small")
+    download = response(200, ["Content-Type" => "image/png", "Content-Length" => string(length(bytes))], bytes)
+    redirect(url) = response(302, ["Location" => url], collect(codeunits("discard this redirect body")))
+    errors = Any[]
+    mktempdir() do dir
+        request(fields=Dict{String,Any}()) = merge(Dict{String,Any}("channel" => "C1", "file_id" => "F1",
+            "variant" => "original", "destination" => tempname(dir), "max_bytes" => length(bytes)), fields)
+        function scenario(answers; file=copy(file_info), fields=Dict{String,Any}())
+            fake, calls = chat_test_script(Any[Dict("ok" => true, "file" => file), answers...])
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            return ws, calls, request(fields)
+        end
+
+        ws, calls, req = scenario([redirect(redirected_url), download])
+        @test fetch_file(ws, req) == Dict("bytes" => length(bytes), "mime" => "image/png")
+        @test read(req["destination"]) == bytes
+        if Sys.isunix()
+            @test (filemode(req["destination"]) & 0o777) == 0o600
+        end
+        @test [c["url"] for c in calls[2:end]] == [original_url, redirected_url]
+        @test all(c -> ("Authorization" => "Bearer $token") in c["headers"], calls)
+        @test all(c -> c["response_stream"] isa Function, calls[2:end])
+
+        # Authorization is decided anew at every hop, including returning to Slack.
+        cdn_url = "https://cdn.example.org/private/asset"
+        ws, calls, req = scenario([redirect(cdn_url), redirect(redirected_url), download])
+        @test fetch_file(ws, req)["bytes"] == length(bytes)
+        @test read(req["destination"]) == bytes
+        @test isempty(calls[3]["headers"])
+        @test ("Authorization" => "Bearer $token") in calls[4]["headers"]
+        for host in ("slack.com", "FILES.SLACK.COM", "slack.com.example.org", "evilslack.com")
+            ws, calls, req = scenario([redirect("https://$host/asset"), download])
+            fetch_file(ws, req)
+            authorized = any(h -> lowercase(first(h)) == "authorization", calls[end]["headers"])
+            @test authorized == (lowercase(host) in ("slack.com", "files.slack.com"))
+        end
+
+        ws, calls, req = scenario([redirect("../next?part=1"), download])
+        fetch_file(ws, req)
+        @test calls[end]["url"] == "https://files.slack.com/private/next?part=1"
+        ws, calls, req = scenario([redirect("//cdn.example.org/relative"), download])
+        fetch_file(ws, req)
+        @test calls[end]["url"] == "https://cdn.example.org/relative"
+        @test isempty(calls[end]["headers"])
+
+        for url in ("http://cdn.example.org/$token", "https://user:secret@files.slack.com/file", "https://files.slack.com\\@evil.example/file")
+            ws, calls, req = scenario([redirect(url)])
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err isa SlackClaw.ChatError
+            @test err.code == :forbidden
+            @test length(calls) == 2
+            @test !ispath(req["destination"])
+        end
+        ws, calls, req = scenario([redirect(redirected_url) for _ in 1:6])
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :io_error
+        @test length(calls) == 7 # files.info, initial GET, and five followed redirects.
+        @test !ispath(req["destination"])
+        ws, calls, req = scenario(vcat([redirect(redirected_url) for _ in 1:5], [download]))
+        @test fetch_file(ws, req)["bytes"] == length(bytes)
+
+        # Metadata and response lengths reject before any destination is created.
+        ws, calls, req = scenario(Any[]; file=merge(file_info, Dict("size" => length(bytes) + 1)))
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :too_large
+        @test length(calls) == 1
+        @test !ispath(req["destination"])
+        for length_header in (string(length(bytes) + 1), "9"^40)
+            ws, calls, req = scenario([response(200, ["cOnTeNt-LeNgTh" => length_header], bytes)])
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err.code == :too_large
+            @test !ispath(req["destination"])
+        end
+        ws, calls, req = scenario([response(200, Pair{String,String}[], vcat(bytes, [0x01]))])
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :too_large
+        @test !ispath(req["destination"])
+        ws, calls, req = scenario([response(200, ["cOnTeNt-TyPe" => "text/html; charset=utf-8"], bytes)])
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :unauthorized
+        @test err.detail == "Slack returned a sign-in page instead of the file"
+        @test !ispath(req["destination"])
+        # Preserve callback errors and overflow flags through wrapping or a swallowed exception.
+        for mode in (:wrapped, :swallowed), (answer, code) in (
+            (response(200, ["Content-Length" => "99999"], bytes), :too_large),
+            (response(200, ["Content-Type" => "text/html"], bytes), :unauthorized),
+            (response(200, Pair{String,String}[], vcat(bytes, [0x01])), :too_large))
+            fake, calls = chat_test_script(Any[Dict("ok" => true, "file" => file_info), answer])
+            wrapped = function(method, url, headers; kwargs...)
+                try
+                    return fake(method, url, headers; kwargs...)
+                catch
+                    mode == :wrapped && error("wrapped $token $original_url")
+                    return response(200, Pair{String,String}[], UInt8[])
+                end
+            end
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=wrapped)
+            req = request()
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err.code == code
+            @test !ispath(req["destination"])
+        end
+        ws, calls, req = scenario([download]; file=merge(file_info, Dict("mimetype" => "text/html")))
+        @test fetch_file(ws, req)["mime"] == "text/html"
+        # MIME fields can contain URLs or token-shaped strings, neither of
+        # which may escape in the result, even though the latter is a token.
+        for mime in ("https://cdn.example.org/private/key", "image/xoxb-fake",
+                     "text", "image/", "image/" * "a"^65, "image/pn\ng")
+            ws, calls, req = scenario([download]; file=merge(file_info, Dict("mimetype" => mime)))
+            @test fetch_file(ws, req)["mime"] == "application/octet-stream"
+            ws, calls, req = scenario([response(200, ["Content-Type" => mime], bytes)];
+                fields=Dict("variant" => "thumbnail"))
+            @test fetch_file(ws, req)["mime"] == "application/octet-stream"
+        end
+        ws, calls, req = scenario([download]; file=merge(file_info, Dict("mimetype" => "IMAGE/PNG; charset=binary")))
+        @test fetch_file(ws, req)["mime"] == "image/png"
+
+        existing = joinpath(dir, "existing")
+        write(existing, "keep this")
+        ws, calls, req = scenario(Any[]; fields=Dict("destination" => existing))
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :bad_request
+        @test isempty(calls)
+        @test read(existing, String) == "keep this"
+        for target in (existing, joinpath(dir, "missing-target"))
+            destination = tempname(dir)
+            fake, calls = chat_test_transport() do call
+                if occursin("/files.info?", call["url"])
+                    return Dict("ok" => true, "file" => file_info)
+                end
+                symlink(target, destination) # Plant it after validation, before the exclusive create.
+                return download
+            end
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> fetch_file(ws, request(Dict("destination" => destination))))
+            push!(errors, err)
+            @test err.code == :bad_request
+            @test islink(destination)
+            @test readlink(destination) == target
+            @test read(existing, String) == "keep this"
+            @test !ispath(joinpath(dir, "missing-target"))
+        end
+        for substitute in (false, true)
+            req = request()
+            fake = function(method, url, headers; response_stream=nothing, kwargs...)
+                response_stream === nothing && return chat_test_response(Dict("ok" => true, "file" => file_info))
+                sink = response_stream(200, Pair{String,String}[])
+                write(sink, bytes[1:3])
+                if substitute
+                    rm(req["destination"])
+                    symlink(existing, req["destination"])
+                end
+                error("partial transfer failed $token $original_url")
+            end
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err.code == :io_error
+            if substitute
+                @test islink(req["destination"])
+                @test readlink(req["destination"]) == existing
+                @test read(existing, String) == "keep this"
+            else
+                @test !ispath(req["destination"])
+            end
+        end
+
+        for sharing in (Dict("groups" => ["C1"]), Dict("ims" => ["C1"]),
+                        Dict("shares" => FakeJSONObject("public" => FakeJSONObject("C1" => Any[]))),
+                        Dict("shares" => FakeJSONObject("private" => FakeJSONObject("C1" => Any[]))))
+            file = merge(file_info, Dict("channels" => Any[]), sharing)
+            ws, calls, req = scenario([download]; file)
+            @test fetch_file(ws, req)["bytes"] == length(bytes)
+        end
+        ws, calls, req = scenario(Any[]; file=merge(file_info, Dict("channels" => ["COTHER"])))
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :forbidden
+        @test length(calls) == 1
+        @test !ispath(req["destination"])
+
+        # An AbstractDict request and metadata also exercise the JSON v1 contract.
+        thumb_headers = ["Content-Type" => "image/jpeg; charset=binary"]
+        ws, calls, req = scenario([response(200, thumb_headers, bytes)];
+            file=FakeJSONObject(pairs(merge(file_info, Dict("size" => 999999)))...), fields=Dict("variant" => "thumbnail"))
+        @test fetch_file(ws, FakeJSONObject(pairs(req)...)) == Dict("bytes" => length(bytes), "mime" => "image/jpeg")
+        @test calls[end]["url"] == file_info["thumb_360"]
+        for (removed, expected) in ((["thumb_360"], "thumb_160"), (["thumb_360", "thumb_160"], "thumb_480"))
+            file = merge(file_info, Dict("thumb_160" => "https://files.slack.com/160", "thumb_480" => "https://files.slack.com/480"))
+            foreach(key -> delete!(file, key), removed)
+            ws, calls, req = scenario([download]; file, fields=Dict("variant" => "thumbnail"))
+            fetch_file(ws, req)
+            @test calls[end]["url"] == file[expected]
+        end
+        file = copy(file_info)
+        delete!(file, "url_private_download")
+        ws, calls, req = scenario([download]; file)
+        fetch_file(ws, req)
+        @test calls[end]["url"] == file_info["url_private"]
+        delete!(file, "url_private")
+        ws, calls, req = scenario(Any[]; file)
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :not_found
+
+        for (status, code) in ((401, :unauthorized), (403, :forbidden), (404, :not_found),
+                               (429, :rate_limited), (503, :unavailable), (418, :io_error))
+            ws, calls, req = scenario([response(status, ["Retry-After" => "9"], bytes)])
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err.code == code
+            @test err.outcome == :none
+            @test err.retry_after_s == (status == 429 ? 9 : nothing)
+            @test !ispath(req["destination"])
+        end
+        for fields in (Dict("max_bytes" => 0), Dict("max_bytes" => true), Dict("max_bytes" => 1.5),
+                       Dict("variant" => "small"), Dict("file_id" => "bad-id"), Dict("channel" => "bad-id"),
+                       Dict("destination" => "relative"), Dict("destination" => "/" * "a"^4096),
+                       Dict("destination" => joinpath(dir, "missing", "file")))
+            ws, calls, req = scenario(Any[]; fields)
+            err = chat_test_error(() -> fetch_file(ws, req))
+            push!(errors, err)
+            @test err.code == :bad_request
+            @test isempty(calls)
+        end
+        ws, calls, req = scenario([ErrorException("$token $original_url")])
+        err = chat_test_error(() -> fetch_file(ws, req))
+        push!(errors, err)
+        @test err.code == :io_error
+        ws, calls, req = scenario(Any[]; file=file_info)
+        ws.transport, _ = chat_test_script([Dict("ok" => false, "error" => "failure $original_url")])
+        push!(errors, chat_test_error(() -> fetch_file(ws, req)))
+    end
+    for err in errors
+        @test err isa SlackClaw.ChatError
+        @test !occursin(token, err.detail)
+        @test !occursin("https://", err.detail)
+    end
+
+    # Exercise the actual callback path and its bounded-discard cleanup on both versions.
+    large_body = fill(0x61, 131073)
+    gzip_body = UInt8[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+        0xeb, 0x0c, 0xf0, 0x73, 0x67, 0xf8, 0xdf, 0xc0, 0xc5, 0xeb, 0x04, 0x00,
+        0x73, 0x3a, 0xa5, 0x31, 0x0a, 0x00, 0x00, 0x00]
+    server = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        SlackClaw.HTTP.serve!(req -> begin
+            headers = ["Content-Type" => "application/octet-stream"]
+            req.target == "/gzip" && push!(headers, "Content-Encoding" => "gzip")
+            body = req.target in ("/discard", "/large") ? large_body :
+                req.target == "/empty" ? UInt8[] : req.target == "/gzip" ? gzip_body : bytes
+            SlackClaw.HTTP.Response(req.target == "/discard" ? 302 : 200, headers, body)
+        end, "127.0.0.1", 0; listenany=true, verbose=(SlackClaw.CHAT_HTTP_V2 ? false : -1))
+    end
+    try
+        @test_logs min_level=Base.CoreLogging.Warn begin
+            url = "http://127.0.0.1:$(SlackClaw.HTTP.port(server))"
+            for _ in 1:2
+                output = IOBuffer()
+                selected = Ref(0)
+                selector = function(status, headers)
+                    selected[] += 1
+                    @test status == 200
+                    @test ("Content-Type" => "application/octet-stream") in headers
+                    @test position(output) == 0
+                    return output
+                end
+                result = SlackClaw.http_transport("GET", "$url/file", Pair{String,String}[]; response_stream=selector)
+                @test selected[] == 1
+                @test isempty(result.body)
+                @test take!(output) == bytes
+                result = SlackClaw.http_transport("GET", "$url/discard", Pair{String,String}[];
+                    response_stream=(status, headers) -> nothing)
+                @test result.status == 302
+                @test isempty(result.body)
+                for (target, expected) in (("large", large_body), ("empty", UInt8[]), ("gzip", gzip_body))
+                    output = IOBuffer()
+                    selected[] = 0
+                    result = SlackClaw.http_transport("GET", "$url/$target", Pair{String,String}[];
+                        response_stream=selector, timeout_s=20.5)
+                    @test selected[] == 1
+                    @test isempty(result.body)
+                    @test take!(output) == expected
+                end
+            end
+            sink = SlackClaw.ChatFileSink(IOBuffer(), length(bytes) - 1, 0, false)
+            chat_test_error(() -> SlackClaw.http_transport("GET", "$url/file", Pair{String,String}[];
+                response_stream=(status, headers) -> sink))
+            @test sink.exceeded
+            @test sink.bytes <= sink.max_bytes
+        end
+    finally
+        close(server)
+    end
+end
+
+@testset "chat_stream_abandons_unread_bodies" begin
+    # Hold the end of each chunked response until after the client finishes.
+    # Draining cleanup or even an EOF probe at the discard limit would hang.
+    @test_logs min_level=Base.CoreLogging.Warn begin
+        for mode in (:discard, :reject, :overflow)
+            release = Channel{Nothing}(1)
+            server = SlackClaw.HTTP.listen!("127.0.0.1", 0;
+                listenany=true, verbose=(SlackClaw.CHAT_HTTP_V2 ? false : -1)) do http
+                SlackClaw.HTTP.setstatus(http, mode == :discard ? 302 : 200)
+                SlackClaw.HTTP.setheader(http, "Transfer-Encoding" => "chunked")
+                SlackClaw.HTTP.startwrite(http)
+                mode == :reject || write(http, fill(0x61, 65536))
+                take!(release)
+            end
+            client = nothing
+            try
+                url = "http://127.0.0.1:$(SlackClaw.HTTP.port(server))/"
+                selected = Ref(0)
+                sink = SlackClaw.ChatFileSink(IOBuffer(), 1, 0, false)
+                rejection = SlackClaw.ChatError(:forbidden, "Rejected response head")
+                selector = function(status, headers)
+                    selected[] += 1
+                    @test status == (mode == :discard ? 302 : 200)
+                    mode == :reject && throw(rejection)
+                    return mode == :discard ? nothing : sink
+                end
+                client = @async try
+                    SlackClaw.http_transport("GET", url, Pair{String,String}[];
+                        response_stream=selector, timeout_s=30)
+                catch e
+                    e
+                end
+                @test timedwait(() -> istaskdone(client), 10) == :ok
+                if istaskdone(client)
+                    result = fetch(client)
+                    @test selected[] == 1
+                    if mode == :discard
+                        @test result isa SlackClaw.ChatHTTPResponse
+                        @test result.status == 302
+                        @test isempty(result.body)
+                    else
+                        @test result isa Exception
+                        @test sink.bytes == 0
+                        @test mode == :overflow ? sink.exceeded : !sink.exceeded
+                    end
+                end
+            finally
+                put!(release, nothing)
+                client === nothing || wait(client)
+                close(server)
+            end
+        end
+    end
+end
+
+@testset "chat_upload_streams_original_bytes" begin
+    upload_file = SlackClaw.chat_upload_file
+    response = SlackClaw.ChatHTTPResponse
+    token = "fake-upload-bot-token-do-not-print"
+    upload_url = "https://uploads.example.org/private/upload"
+    bytes = UInt8[0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x80, 0x0a, 0x0d, 0x42]
+    get_url = Dict("ok" => true, "file_id" => "FNEW", "upload_url" => upload_url)
+    mktempdir() do dir
+        path = joinpath(dir, "source.png")
+        write(path, bytes)
+        request(fields=Dict{String,Any}()) = merge(Dict{String,Any}("channel" => "C1", "thread_ts" => "1.0",
+            "path" => path, "name" => "image\nname/with\\slashes.png", "comment" => "original bytes",
+            "author" => FakeJSONObject("kind" => "row", "name" => "worker")), fields)
+        for kind in ("person", "row"), category in ("public", "private"), has_comment in (false, true)
+            input = Ref{Any}(nothing)
+            completion = Dict("ok" => true, "files" => [FakeJSONObject("shares" => FakeJSONObject(
+                category => FakeJSONObject("C1" => [FakeJSONObject("ts" => "2.000001")])))])
+            fake, calls = chat_test_transport() do call
+                if occursin("/files.getUploadURLExternal?", call["url"])
+                    @test call["query"]["length"] == string(length(bytes))
+                    @test call["query"]["filename"] == "image name_with_slashes.png"
+                    return get_url
+                elseif call["url"] == upload_url
+                    @test call["method"] == "POST"
+                    @test call["body"] isa IOStream
+                    @test read(call["body"]) == bytes
+                    @test ("Content-Length" => string(length(bytes))) in call["headers"]
+                    @test ("Content-Type" => "application/octet-stream") in call["headers"]
+                    @test !any(h -> lowercase(first(h)) == "authorization", call["headers"])
+                    input[] = call["body"]
+                    return response(200, Pair{String,String}[], UInt8[])
+                end
+                @test endswith(call["url"], "/files.completeUploadExternal")
+                return completion
+            end
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, posting_form=:custom, transport=fake)
+            ws.bot_user_id, ws.bot_id = "UBOT", "BOWN"
+            req = request(Dict("author" => FakeJSONObject("kind" => kind, "name" => "worker"),
+                "comment" => has_comment ? "original bytes" : nothing))
+            @test upload_file(ws, FakeJSONObject(pairs(req)...)) == Dict("file_id" => "FNEW", "ts" => "2.000001")
+            @test length(calls) == 3
+            @test !isopen(input[])
+            body = calls[end]["body"]
+            label = "$(kind == "row" ? "@worker" : "worker") ($kind via Ship of Tools)"
+            @test body["files"] == [Dict("id" => "FNEW", "title" => "image name_with_slashes.png")]
+            @test body["channel_id"] == "C1"
+            @test body["thread_ts"] == "1.0"
+            @test body["initial_comment"] == (has_comment ? "$label: original bytes" : label)
+            @test ("Authorization" => "Bearer $token") in calls[end]["headers"]
+            record = SlackClaw.normalize_message(ws, FakeJSONObject("ts" => "2.000001", "bot_id" => "BOWN",
+                "subtype" => "file_share", "text" => body["initial_comment"]), "C1")
+            @test record["origin"] == (kind == "row" ? "row" : "drawer")
+            @test record["author"]["name"] == (kind == "row" ? "@worker" : "worker")
+            @test record["text"] == (has_comment ? "original bytes" : "")
+        end
+
+        # Appending or replacing the path with a same-size sibling must refuse
+        # completion, even while the original open descriptor is unchanged.
+        for change in (:append, :replace)
+            fake, calls = chat_test_transport() do call
+                if call["url"] != upload_url
+                    return get_url
+                end
+                @test read(call["body"]) == bytes
+                if change == :append
+                    open(path, "a") do changed
+                        write(changed, "changed")
+                    end
+                else
+                    sibling = joinpath(dir, "replacement.png")
+                    write(sibling, reverse(bytes))
+                    @test stat(sibling).inode != stat(path).inode
+                    mv(sibling, path; force=true)
+                    @test stat(path).size == length(bytes)
+                    @test read(path) == reverse(bytes)
+                end
+                return response(200, Pair{String,String}[], UInt8[])
+            end
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> upload_file(ws, request()))
+            @test err isa SlackClaw.ChatError
+            @test err.code == :io_error
+            @test err.detail == "source changed during upload"
+            @test err.outcome == :refused
+            @test length(calls) == 2
+            @test all(c -> !occursin("/files.completeUploadExternal", c["url"]), calls)
+            @test !isopen(calls[end]["body"])
+            write(path, bytes)
+        end
+
+        # Neither a refused byte upload nor an uncertain completion is resubmitted.
+        timeout = chat_test_timeout()
+        for (answers, code, outcome, expected_calls) in (
+            (Any[timeout], :timeout, :refused, 1),
+            (Any[get_url, timeout], :timeout, :refused, 2),
+            (Any[get_url, response(503, Pair{String,String}[], UInt8[])], :unavailable, :refused, 2),
+            (Any[get_url, response(200, Pair{String,String}[], UInt8[]), timeout], :timeout, :unknown, 3),
+            (Any[get_url, response(200, Pair{String,String}[], UInt8[]), Dict("ok" => false, "error" => "missing_scope")], :forbidden, :refused, 3))
+            fake, calls = chat_test_script(answers)
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> upload_file(ws, request()))
+            @test err isa SlackClaw.ChatError
+            @test err.code == code
+            @test err.outcome == outcome
+            @test length(calls) == expected_calls
+            @test expected_calls == 3 ? endswith(calls[end]["url"], "/files.completeUploadExternal") :
+                all(c -> !occursin("/files.completeUploadExternal", c["url"]), calls)
+            @test !occursin(token, err.detail)
+            @test !occursin(upload_url, err.detail)
+            if expected_calls >= 2
+                @test !isopen(calls[2]["body"])
+            end
+        end
+        fake, calls = chat_test_script(Any[get_url, response(200, Pair{String,String}[], UInt8[]), Dict("ok" => true)])
+        ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+        @test upload_file(ws, request(Dict("thread_ts" => nothing, "comment" => ""))) == Dict("file_id" => "FNEW")
+        @test !haskey(calls[end]["body"], "thread_ts")
+        @test calls[end]["body"]["initial_comment"] == "@worker (row via Ship of Tools): "
+
+        for (fields, code) in ((Dict("path" => "relative"), :bad_request), (Dict("path" => dir), :bad_request),
+                              (Dict("name" => " \n"), :bad_request), (Dict("name" => "é"^129), :bad_request),
+                              (Dict("comment" => "é"^4097), :too_large), (Dict("comment" => 12), :bad_request),
+                              (Dict("author" => FakeJSONObject("kind" => "bot", "name" => "worker")), :bad_request))
+            fake, calls = chat_test_script(Any[])
+            ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> upload_file(ws, request(fields)))
+            @test err.code == code
+            @test err.outcome == :refused
+            @test isempty(calls)
+        end
+        empty_path = joinpath(dir, "empty")
+        write(empty_path, UInt8[])
+        fake, calls = chat_test_script(Any[])
+        ws = SlackClaw.ChatWorkspace(id="T1", bot_token=token, transport=fake)
+        err = chat_test_error(() -> upload_file(ws, request(Dict("path" => empty_path))))
+        @test err.code == :bad_request
+        @test err.outcome == :refused
+        @test isempty(calls)
+
+        # The real transport must preserve an IO request body with either a
+        # buffered response or a callback response, including its fixed length.
+        upload_bytes = repeat(bytes, 16385)
+        write(path, upload_bytes)
+        received = Ref(UInt8[])
+        @test_logs min_level=Base.CoreLogging.Warn begin
+            server = SlackClaw.HTTP.serve!(req -> begin
+                received[] = req.body
+                @test SlackClaw.HTTP.header(req, "Content-Length", "") == string(length(upload_bytes))
+                @test isempty(SlackClaw.HTTP.header(req, "Transfer-Encoding", ""))
+                SlackClaw.HTTP.Response(200, "uploaded")
+            end, "127.0.0.1", 0; listenany=true, verbose=(SlackClaw.CHAT_HTTP_V2 ? false : -1))
+            try
+                url = "http://127.0.0.1:$(SlackClaw.HTTP.port(server))/"
+                for streamed in (false, true)
+                    output = IOBuffer()
+                    selected = Ref(0)
+                    selector = function(status, headers)
+                        selected[] += 1
+                        @test status == 200
+                        @test position(output) == 0
+                        return output
+                    end
+                    open(path, "r") do input
+                        result = SlackClaw.http_transport("POST", url,
+                            ["Content-Length" => string(length(upload_bytes))]; body=input,
+                            response_stream=streamed ? selector : nothing, timeout_s=20.5)
+                        @test result.status == 200
+                        @test isopen(input)
+                        @test position(input) == length(upload_bytes)
+                        @test selected[] == (streamed ? 1 : 0)
+                        @test streamed ? isempty(result.body) : String(result.body) == "uploaded"
+                    end
+                    @test received[] == upload_bytes
+                    @test String(take!(output)) == (streamed ? "uploaded" : "")
+                end
+            finally
+                close(server)
+            end
+        end
+    end
 end
