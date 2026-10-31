@@ -4,6 +4,17 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [Unreleased]
+
+### Added
+
+- **Chat Web API client.** A separate, unexported client returns bounded typed
+  errors and mutation outcomes without retrying. Channel and thread history
+  pages carry query-bound cursors and report incomplete pagination explicitly.
+  Shared message records retain bot posts, bound text and file summaries, and
+  recover person or row attribution from metadata, customized authors or text
+  prefixes. Existing monitor and fleet behavior is unchanged.
+
 ## [0.7.3] — 2026-10-15
 
 Patch: a message with files and no text is dispatched, and its files are named

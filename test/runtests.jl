@@ -869,6 +869,8 @@ end
     @test SlackClaw.slack_reactions_remove(cfg, "1.0", "eyes") === nothing
 end
 
+include("chat_sidecar_tests.jl")
+
 # KEEP LAST: overwrites SlackClaw methods (run_claude, post_response,
 # slack_post_message, slack_add_reaction, slack_reactions_remove) with stubs
 # for the rest of the process, then runs the real run_agent_loop! / dispatch
