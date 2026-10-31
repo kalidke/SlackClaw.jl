@@ -123,8 +123,21 @@ end
     @test chat_test_time(pages[3]["messages"][end]["ts"]) < chat_test_time(pages[2]["messages"][1]["ts"])
     @test !haskey(pages[end], "next_cursor")
     @test !haskey(pages[end], "omitted")
+    @test all(p -> !haskey(p, "limited"), pages)
     @test count(c -> occursin("users.info", c["url"]), calls) == 1
     @test any(c -> occursin("%2B%2F", uppercase(c["url"])) && get(c["query"], "cursor", "") == "20 +/", calls)
+
+    # Plan limits are additive page information, including on the final page.
+    for limited in (true, false)
+        fake, recorded = chat_test_script([Dict("ok" => true, "is_limited" => limited,
+            "has_more" => false, "messages" => [Dict("ts" => "1.0", "bot_id" => "B1", "text" => "visible")])])
+        limited_ws = workspace(id="T1", bot_token="fake", transport=fake)
+        page = history(limited_ws, Dict("channel" => "C1"))
+        @test [m["text"] for m in page["messages"]] == ["visible"]
+        @test limited ? page["limited"] === true : !haskey(page, "limited")
+        @test !haskey(page, "next_cursor")
+        @test length(recorded) == 1
+    end
 
     request = Dict{String,Any}("channel" => "C1", "thread_ts" => "1100.000001", "limit" => 20)
     first_page = history(ws, request)
@@ -283,6 +296,8 @@ end
         (SlackClaw.ChatHTTPResponse(403, Pair{String,String}[], collect(codeunits(token))), :bad_request, :refused),
         (SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], collect(codeunits(token))), :io_error, :unknown),
         (SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], collect(codeunits("[]"))), :io_error, :unknown),
+        (Dict("ts" => "1.0"), :io_error, :unknown),
+        (Dict("ok" => nothing, "ts" => "1.0"), :io_error, :unknown),
         (Dict("ok" => false, "error" => "channel_not_found"), :not_found, :refused),
         (Dict("ok" => false, "error" => "internal_error"), :unavailable, :unknown),
         (Dict("ok" => false, "error" => token * "\n" * app_token), :bad_request, :refused),
@@ -310,6 +325,18 @@ end
     end
     @test isempty(logger.logs)
 
+    # Every mutation needs an explicit acknowledgement; reads keep Slack's mapping.
+    for ok in (nothing, 0, 1, "true")
+        for mutation in (true, false)
+            fake, recorded = chat_test_script([Dict("ok" => ok, "error" => "channel_not_found", "ts" => "1.0")])
+            unconfirmed = workspace(id="T1", bot_token=token, transport=fake)
+            err = chat_test_error(() -> SlackClaw.chat_api(unconfirmed, "POST", "chat.postMessage"; mutation))
+            @test err.code == (mutation ? :io_error : :not_found)
+            @test err.outcome == (mutation ? :unknown : :none)
+            @test length(recorded) == 1
+        end
+    end
+
     for header in (Pair{String,String}[], ["Retry-After" => "invalid"], ["Retry-After" => "-1"])
         fake, _ = chat_test_script([SlackClaw.ChatHTTPResponse(429, header, UInt8[])])
         limited = workspace(id="T1", bot_token=token, transport=fake)
@@ -323,7 +350,8 @@ end
         "thread_not_found" => :not_found, "message_not_found" => :not_found, "file_not_found" => :not_found,
         "user_not_found" => :not_found, "ratelimited" => :rate_limited,
         "msg_too_long" => :too_large, "too_large" => :too_large, "fatal_error" => :unavailable,
-        "request_timeout" => :unavailable, "service_unavailable" => :unavailable, "other" => :bad_request)
+        "request_timeout" => :unavailable, "service_unavailable" => :unavailable, "other" => :bad_request,
+        "api_error.1" => :bad_request, "a"^64 => :bad_request)
         fake, recorded = chat_test_script([Dict("ok" => false, "error" => slack_error)])
         broken = workspace(id="T1", bot_token=token, transport=fake)
         err = chat_test_error(() -> SlackClaw.chat_post(broken, post))
@@ -331,6 +359,22 @@ end
         @test err.detail == "Slack: $slack_error"
         @test err.outcome == (code == :unavailable ? :unknown : :refused)
         @test length(recorded) == 1
+    end
+    for slack_error in ("https://files.slack.com/files-pri/T1-F1/x.png?key=secret",
+                        "", "a"^65, "bad\n", "UPPER", "bad-error")
+        fake, recorded = chat_test_script([Dict("ok" => false, "error" => slack_error)])
+        broken = workspace(id="T1", bot_token=token, transport=fake)
+        err = chat_test_error(() -> SlackClaw.chat_post(broken, post))
+        @test err.code == :bad_request
+        @test err.outcome == :refused
+        @test err.detail == "unexpected Slack error"
+        @test length(recorded) == 1
+        for rendered in (err.detail, repr(err), sprint(showerror, err),
+                         SlackClaw.JSON.json(SlackClaw.chat_error_payload(err)))
+            @test !occursin("https", rendered)
+            @test !occursin("files-pri", rendered)
+            @test !occursin("secret", rendered)
+        end
     end
     bounded = SlackClaw.ChatError(:bad_request, "xoxb-fake-secret\n" * "é"^200)
     @test ncodeunits(bounded.detail) <= 256

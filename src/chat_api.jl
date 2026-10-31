@@ -159,9 +159,11 @@ function chat_slack_error(error::AbstractString)
     return (:bad_request, false)
 end
 
-"""Redact both workspace secrets before an untrusted Slack error becomes a detail."""
-function chat_safe_detail(ws::ChatWorkspace, detail::AbstractString)
-    safe = String(detail)
+"""Allow only bounded Slack error codes in details, redacting workspace secrets."""
+function chat_safe_detail(ws::ChatWorkspace, error::AbstractString)
+    ncodeunits(error) <= 64 && occursin(r"\A[a-z0-9_.]{1,64}\z", error) ||
+        return "unexpected Slack error"
+    safe = "Slack: $error"
     for token in (ws.bot_token, ws.app_token)
         isempty(token) || (safe = replace(safe, token => "[redacted]"))
     end
@@ -217,12 +219,16 @@ function chat_api(ws::ChatWorkspace, method, endpoint::AbstractString;
     end
     data isa AbstractDict || throw(ChatError(:io_error, "Invalid Slack response object", nothing,
                                              chat_outcome(mutation, true)))
-    if get(data, "ok", false) !== true
+    ok = get(data, "ok", nothing)
+    if ok !== true
+        if mutation && ok !== false
+            throw(ChatError(:io_error, "Slack did not confirm the mutation", nothing, :unknown))
+        end
         error = get(data, "error", "unknown")
         error isa AbstractString || (error = "unknown")
         code, uncertain = chat_slack_error(error)
         retry_after = code == :rate_limited ? chat_retry_after(response.headers) : nothing
-        throw(ChatError(code, chat_safe_detail(ws, "Slack: $error"), retry_after,
+        throw(ChatError(code, chat_safe_detail(ws, error), retry_after,
                         chat_outcome(mutation, uncertain)))
     end
     return data
@@ -475,7 +481,8 @@ Fetch one complete page, sorted ascending by exact timestamp. Channel pages walk
 backward (the next cursor gives older messages); thread pages walk forward from
 the parent, which may be included in addition to the requested reply limit.
 Continuations bind every query field, and any failed or incomplete call fails the
-entire request, even when Slack supplied some messages.
+entire request, even when Slack supplied some messages. A limited flag marks
+history withheld by the workspace plan without preventing pagination.
 """
 function chat_history(ws::ChatWorkspace, req::AbstractDict)
     query = chat_history_query(req)
@@ -503,6 +510,7 @@ function chat_history(ws::ChatWorkspace, req::AbstractDict)
         throw(ChatError(:incomplete_history, "Slack omitted a required history cursor"))
     end
     result = Dict{String,Any}()
+    get(data, "is_limited", false) === true && (result["limited"] = true)
     isempty(next_cursor) || (result["next_cursor"] = chat_encode_cursor(query, next_cursor))
     raw_messages = get(data, "messages", nothing)
     raw_messages isa AbstractVector || throw(ChatError(:io_error, "Invalid Slack messages array"))
