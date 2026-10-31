@@ -127,6 +127,65 @@ to the same `state_file`, so channels sharing a `repo_dir` must each set a
 distinct one (a shared `status_file` is allowed but warns, since status updates
 could cross-post). (`run_monitor` for a single channel is just a fleet of one.)
 
+## Retiring a channel (fleet quiesce)
+
+Give a fleet an optional `FleetControl` to stop admission for one channel while
+other channels keep serving:
+
+```julia
+control = FleetControl()
+fleet_task = @async run_socket_fleet(configs; control)
+# After the fleet has attached its members:
+quiesce!(control, "CEXAMPLE")
+report = wait_quiesced(control, "CEXAMPLE"; timeout_s=30)
+# Inspect report.complete, report.failed and the per-origin lists before cutover.
+```
+
+`FleetControl()` opens no socket or process. `run_socket_fleet` attaches its
+states during startup; an embedding can attach a state explicitly with
+`SlackClaw.attach!(control, state)`. Quiescing an unknown channel throws an
+`ArgumentError`; repeated calls for a quiesced channel are harmless. There is
+no resume operation.
+
+`quiesce!` stops new direct, thread, scheduled and proactive admission for the
+channel's primary monitor and excludes that source from other members' listen
+dispatch. It snapshots unfinished tasks accepted at that boundary, including
+listen work from the channel in other states. Already accepted work can finish
+and continue its agent loop. Pending schedules stay pending and new proactive
+checks are skipped; quiescing does not delete persisted work or stop the fleet.
+
+`quiesce_report(control, channel)` returns a nonconsuming snapshot:
+
+| Field | Meaning |
+|---|---|
+| `channel` | Quiesced channel ID |
+| `accepted` | Origins of unfinished tasks accepted before the boundary |
+| `completed`, `failed`, `running` | Those tasks classified by Julia task state |
+| `refused` | Distinct refused message/thread/listen origins, retaining the newest 1,000 |
+| `pending_scheduled` | Pending schedules and scheduled firings awaiting admission for that primary channel |
+| `complete` | No accepted task still running and no scheduled firing awaiting admission |
+
+Each origin has `kind`, `channel` and `ts`. Kinds are `:message`, `:thread_reply`,
+`:listen`, `:scheduled` and `:proactive`; a schedule uses its thread timestamp,
+and proactive work has an empty timestamp. `wait_quiesced` requires a nonnegative
+`timeout_s` and returns the latest report, including an incomplete report on
+timeout. `quiesce_report` requires the channel to have been quiesced.
+
+`complete` can be true with failed tasks or pending schedules. `completed`
+means a Julia task ended without an uncaught exception; handled agent or Slack
+failures can still appear there. Tasks already finished before `quiesce!` are
+not part of its snapshot. A saved history cursor is not a completion record.
+Before retiring a route, inspect actual Slack outcomes and account for each
+message across the handoff; a timeout or unresolved failure cannot establish a
+successful cutover.
+
+The control and report are in memory. The launcher must persist removal of the
+primary route and every listen reference so a restart cannot restore dispatch,
+and decide how to retire pending schedules. The new consumer reconciles across
+the overlap, including old-thread replies. Dedicated apps prevent event-stream
+splitting, but do not prove recovery. No-control callers retain existing fleet
+behavior.
+
 ## Configuration reference
 
 | Field | Default | Description |

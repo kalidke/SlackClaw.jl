@@ -105,6 +105,84 @@ safe to re-run.
   `SLACK_BOT_TOKEN_KAL` / `SLACK_BOT_TOKEN_ATQI` resolved per process). Run
   `setup()` once per workspace.
 
+## Dedicated chat apps
+
+The [chat child](chat-child.md) uses a dedicated Ship of Tools app in each
+workspace. Never share that app with a running monitor or fleet: Slack divides
+events among an app's sockets. Existing fleets can keep their separate apps.
+The monitor wizard above provisions a different scope set and writes an
+environment file; use this manifest helper for chat instead:
+
+```julia
+using SlackClaw
+println(SlackClaw.generate_chat_manifest())
+# For prefix posting without customized authors:
+println(SlackClaw.generate_chat_manifest(; customize=false))
+```
+
+The default manifest is:
+
+```yaml
+display_information:
+  name: Ship of Tools
+  description: Project chat through Ship of Tools.
+features:
+  bot_user:
+    display_name: Ship of Tools
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - channels:read
+      - channels:history
+      - groups:read
+      - groups:history
+      - chat:write
+      - files:read
+      - files:write
+      - users:read
+      - chat:write.customize
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+```
+
+`customize=false` removes only `chat:write.customize`. Read/history scopes cover
+public and private channels; `chat:write` posts; file scopes fetch and upload;
+`users:read` resolves names. This app subscribes only to `message.channels` and
+`message.groups`, with Socket Mode on. It has no auto-join, reaction or DM scope.
+
+1. At [api.slack.com/apps](https://api.slack.com/apps), create an app **From an
+   app manifest** in the intended workspace and paste the generated YAML.
+2. Install it to the workspace and obtain the **Bot User OAuth Token** (`xoxb-…`).
+3. Under **Basic Information → App-Level Tokens**, generate an app-level token
+   (`xapp-…`) with `connections:write`.
+4. Invite the app to **each** mapped public or private channel. There is no
+   automatic join in the chat child.
+5. Verify Socket Mode delivery, channel and old-thread history, private fetches,
+   uploads, and person/row attribution in both events and history with this app.
+   Record the proven posting form: `custom` requires the optional scope;
+   otherwise use `prefix`. Labels identify a person through the app, not an
+   authenticated personal Slack account. An unknown mutation must never be
+   repeated in another form.
+
+The supervising hub daemon reads bot/app token pairs from its private
+`<platform-config>/chat-secrets.toml`, alongside workspace IDs such as
+`T_EXAMPLE`. Its separate `chat.toml` supplies resolved project/channel mappings
+and the attachment-folder byte bound. Sessions must not read the secrets file;
+the daemon's OS account is not an isolation boundary between sessions and that
+file. Keep credentials out of repositories, argv, row environments, frontend
+payloads, mail and diagnostics. Tokens reach the child **only through the
+`configure` request on private stdin**, once per process. The child does not
+read either daemon file or the monitor's `slackclaw.env`.
+
 ## Verify
 
 The wizard's self-test already confirms the chain end to end. To check a running

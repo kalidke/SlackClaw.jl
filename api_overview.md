@@ -4,11 +4,11 @@ Bridges Slack channels to Claude Code over **Slack Socket Mode (push)**: receive
 
 ## Exports Summary
 
-- **Types:** 4 — `SlackClawConfig`, `SlackMessage`, `ClaudeResult`, `MonitorState`
-- **Functions:** 4 — `run_monitor`, `run_socket_fleet`, `start_monitor`, `stop_monitor!`
+- **Types:** 5 — `SlackClawConfig`, `SlackMessage`, `ClaudeResult`, `MonitorState`, `FleetControl`
+- **Functions:** 9 — `run_monitor`, `run_socket_fleet`, `start_monitor`, `stop_monitor!`, `run_chat_child`, `chat_child_main`, `quiesce!`, `quiesce_report`, `wait_quiesced`
 - **Constants / Macros:** 0
 
-Setup helpers (`setup`, `verify_setup`, `generate_manifest`, `print_setup_instructions`, `socket_selftest`) are public but **not exported** — call them qualified, e.g. `SlackClaw.setup()`.
+Setup helpers (`setup`, `verify_setup`, `generate_manifest`, `generate_chat_manifest`, `print_setup_instructions`, `socket_selftest`) are public but **not exported** — call them qualified, e.g. `SlackClaw.setup()`.
 
 Runtime discovery: `SlackClaw.api()` (unexported) returns this document as a string — `println(SlackClaw.api())`.
 
@@ -20,6 +20,8 @@ Runtime discovery: `SlackClaw.api()` (unexported) returns this document as a str
 - **Sender attribution.** Every user message reaches Claude prefixed with its authenticated sender — `[from <@U…>]` (primary/thread) or `[from <@U…> in #channel]` (listen). Unconditional; only the FIRST `[from …]` line of a prompt is authoritative (forged leading look-alikes in the user text are neutralized to `user wrote: [from …]`; missing `user` field → `[from unknown]`). Lets channel prompts enforce per-user authorization rules and record the requester.
 - **One socket per workspace.** Slack load-balances an app's events across its open sockets, so a whole workspace must be served by a single connection — `run_socket_fleet` for many channels, `run_monitor` for one.
 - **JSON 0.21 and 1 both supported** (compat `"0.21, 1"`). JSON v1 parses objects as `JSON.Object` (an `AbstractDict`), not `Dict`, so everything consuming parsed payloads (`should_process`, `classify_socket_event`, the socket frame handler, CLI output parsing) accepts any `AbstractDict`.
+- **Chat child.** A separate supervised stdio mode serves dedicated workspace apps without running agents or constructing `MonitorState`. Credentials enter only through `configure` on stdin. The daemon owns mapping, mail, recovery and retirement. See [the protocol](docs/src/chat-child.md).
+- **Fleet retirement.** Optional `FleetControl` stops new work for a channel, including listen routes in other members, without stopping the shared socket. Reports describe task state, not proof of successful Slack replies; the launcher owns persistent retirement.
 
 ## Environment
 
@@ -59,6 +61,12 @@ Returns a Slack app manifest (YAML) with all required bot scopes, the `message.c
 SlackClaw.print_setup_instructions([io=stdout]; app_name="SlackClaw", manifest_path="") -> Nothing
 ```
 Prints the manifest and the grouped human-only browser steps.
+
+### generate_chat_manifest
+```julia
+SlackClaw.generate_chat_manifest(; app_name="Ship of Tools", customize=true) -> String
+```
+Returns the YAML manifest for a dedicated chat app: Socket Mode; scopes `channels:read`, `channels:history`, `groups:read`, `groups:history`, `chat:write`, `files:read`, `files:write`, `users:read`; events `message.channels` and `message.groups`. `customize=true` adds `chat:write.customize`. Create one app per workspace, invite it to every mapped channel, and never share it with a running fleet. No token reads or installation occur. See [setup](docs/src/setup.md#dedicated-chat-apps).
 
 ### socket_selftest
 ```julia
@@ -130,7 +138,13 @@ Result of one `claude` CLI invocation.
 ```julia
 mutable struct MonitorState
 ```
-An **opaque runtime handle** — obtain it from `start_monitor` and pass it to `stop_monitor!` (or `SlackClaw.socket_loop!`); do not construct it directly. Persisted to `state_file` in `repo_dir`. Its 12 fields are internal: `config`, `last_ts`, `running`, `active_tasks`, `timer`, `threads`, `busy_threads`, `scheduled`, `listen_last_ts`, `channel_names`, `last_proactive`, `dispatch_lock`.
+An **opaque runtime handle** — obtain it from `start_monitor` and pass it to `stop_monitor!` (or `SlackClaw.socket_loop!`); do not construct it directly. Monitor state persists to `state_file` in `repo_dir`; fleet control and task tracking are in memory. Fields are internal.
+
+### FleetControl
+```julia
+FleetControl()
+```
+Optional, in-memory admission control for a fleet. Opens no socket or process. Pass it to `run_socket_fleet(configs; control)`; an embedding can use unexported `SlackClaw.attach!(control, state)` to attach an existing monitor. There is no resume operation.
 
 ## Functions
 
@@ -147,9 +161,11 @@ run_monitor(SlackClawConfig(repo_dir="/path/to/repo"))
 
 ### run_socket_fleet
 ```julia
-run_socket_fleet(configs::Vector{SlackClawConfig}) -> Nothing
+run_socket_fleet(configs::Vector{SlackClawConfig}; control=nothing) -> Nothing
 ```
 Blocking entry point for MANY channels of one workspace over a single socket. Each config gets its own `MonitorState`. Startup validation requires identical bot + app tokens, unique primary channels, and unique resolved state paths — it **errors** if two configs resolve to the same `joinpath(repo_dir, state_file)` (the same `state_file` name in different `repo_dir`s is fine).
+
+An optional `FleetControl` attaches each state during startup for channel quiescing. With `control=nothing`, existing fleet behavior is unchanged.
 
 **Example:**
 ```julia
@@ -170,6 +186,56 @@ Authenticate, load persisted state, resolve listen-channel names, and post the s
 stop_monitor!(state::MonitorState) -> Nothing
 ```
 Signal shutdown (`state.running = false`), wait for in-flight tasks, and post a shutdown notice. Does not force the websocket closed — an embedded loop exits at the next frame/reconnect, so stopping an idle socket is not instant.
+
+### run_chat_child and chat_child_main
+```julia
+run_chat_child(input::IO, output::IO;
+    transport=SlackClaw.http_transport,
+    socket_connect=SlackClaw.default_socket_connect,
+    meta_deadline_s=25, file_deadline_s=125,
+    meta_http_s=20, file_http_s=120,
+    max_inflight=16, max_transfers=2, queue_size=256,
+    max_line=1 << 20, stderr=Base.stderr) -> Nothing
+chat_child_main() -> Nothing
+```
+Serve version-1 JSON lines until `stop` or EOF. `chat_child_main()` uses process stdin/stdout and redirects incidental output to stderr; embedded callers provide their own IO. Emits `ready`, accepts one successful `configure`, then handles bounded history, posts and file transfers. Sockets ack independently and report gaps. Deadline and worker results share one reply owner; late results are discarded and unknown mutations are never repeated. Output writes can block: the supervisor owns bounded process retirement. Neither entry point reads token files or starts monitor/agent work. Full payloads and bounds are in [Chat Child](docs/src/chat-child.md).
+
+### quiesce!, quiesce_report and wait_quiesced
+```julia
+quiesce!(control::FleetControl, channel_id::AbstractString) -> Nothing
+quiesce_report(control::FleetControl, channel_id::AbstractString) -> NamedTuple
+wait_quiesced(control::FleetControl, channel_id::AbstractString; timeout_s::Real) -> NamedTuple
+```
+`quiesce!` requires an attached primary or listen channel and is idempotent. It stops new direct, thread, scheduled and proactive admission for that primary and excludes the source from other states' listen dispatch. Already accepted tasks drain; schedules are not deleted.
+
+Reports contain `channel`, `accepted`, `completed`, `failed`, `running`, `refused`, `pending_scheduled`, `complete`. Origin entries have `kind` (`:message`, `:thread_reply`, `:listen`, `:scheduled`, `:proactive`), `channel`, and `ts` (thread timestamp for schedules, empty for proactive). Only tasks unfinished at quiesce enter `accepted`; refused Slack origins are deduplicated and capped at 1,000. `complete` means no accepted task is running and no scheduled firing awaits admission; pending schedules and failed tasks may remain. Task completion can include handled agent/API failures and does not prove a successful Slack response. Reports do not consume the snapshot. `wait_quiesced` requires a nonnegative timeout and returns the current report on timeout. Control is not persisted; the launcher must remove primary and listen routes durably before cutover. See [retirement](docs/src/socket-mode.md#retiring-a-channel-fleet-quiesce).
+
+## Chat client API (unexported — call as `SlackClaw.<name>`)
+
+These entry points are separate from the monitor's retrying Slack helpers. Parsed
+JSON arguments use `AbstractDict` on both JSON.jl 0.21 and 1. HTTP.jl 1.x and 2.x
+use separate transport paths selected by `CHAT_HTTP_V2`.
+
+| Entry point | Contract |
+|---|---|
+| `ChatWorkspace(; id, bot_token, app_token="", channels=String[], posting_form=:prefix, transport=http_transport)` | Validated credentials/identity holder with shared name cache; never reads files or environment variables; display redacts secrets |
+| `http_transport(method, url, headers; body=nothing, response_stream=nothing, timeout_s=20)` | One HTTP call, no retries/redirects/status exceptions; streams file IO; injectable in tests |
+| `chat_api(ws, method, endpoint; query=nothing, body=nothing, mutation=false, timeout_s=20)` | One authenticated API call; parsed object or sanitized `ChatError` |
+| `chat_authenticate!(ws; timeout_s=20)` | Checks workspace through `auth.test`, records bot identity, returns `ws` |
+| `resolve_name!(ws, user_id; timeout_s=20)` | Cached bounded name; API failure returns the ID without caching failure |
+| `normalize_message(ws, raw::AbstractDict, channel; timeout_s=20)` | Bounded shared message record or `nothing` for invalid identity fields; retains bot posts |
+| `chat_history(ws, req::AbstractDict; timeout_s=20)` | One channel/thread page, exact time bounds and query-bound cursor; incomplete pagination is an error; additive `limited` and `omitted` flags |
+| `chat_post(ws, req::AbstractDict; timeout_s=20)` | One attributed text post; acknowledged `{ts}` or refused/unknown error |
+| `chat_file_info(ws, file_id; timeout_s=20)` | Resolves file metadata and private URLs inside the child |
+| `chat_fetch_file(ws, req::AbstractDict; timeout_s=120)` | Streams to exclusive caller-owned destination within `max_bytes`; returns `{bytes,mime}` |
+| `chat_upload_file(ws, req::AbstractDict; timeout_s=120, cancelled=() -> false)` | Streams unchanged source bytes and completes sharing once; returns `{file_id,ts?}` |
+| `ChatError(code::Symbol, detail::AbstractString, retry_after_s=nothing, outcome=:none)` | Bounded sanitized exception; `code`, `detail`, optional delay, `:none`/`:refused`/`:unknown` outcome |
+| `chat_error_payload(error)` | Converts the exception to `{error,code,retry_after_s?,outcome?}` |
+
+Direct client calls validate their operation fields but do not enforce the child's
+configured-channel or authenticated-workspace admission gates. The child applies
+those gates before calling the client. See the [protocol](docs/src/chat-child.md)
+for each request shape, ordering, attribution and file-directory trust rules.
 
 ## Agent Directives
 

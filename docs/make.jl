@@ -18,6 +18,7 @@ makedocs(;
         "Use Cases" => "use-cases.md",
         "Features" => "features.md",
         "Socket Mode" => "socket-mode.md",
+        "Chat Child" => "chat-child.md",
         "API Reference" => "api.md",
     ],
 )
