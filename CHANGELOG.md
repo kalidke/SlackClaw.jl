@@ -8,6 +8,12 @@ Notable changes to SlackClaw.jl. Format follows
 
 ### Added
 
+- **Supervised chat child.** A separate stdio mode serves bounded JSON frames,
+  channel history, posts and file transfers without starting agent work. It
+  acknowledges Socket Mode events independently of API work and protocol output,
+  reports queue gaps and reconnects, bounds admission and request deadlines, and
+  reports uncertain mutations without repeating them. Credentials arrive only
+  through configuration on stdin and are excluded from diagnostics and frames.
 - **Chat file transfers.** Private downloads stream into exclusive, bounded
   destinations and forward bot authorization only to Slack hosts. External
   uploads stream original file bytes, refuse changed sources, and share once

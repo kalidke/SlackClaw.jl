@@ -1198,3 +1198,802 @@ end
         end
     end
 end
+
+"""An in-memory socket with independently observable acknowledgements."""
+mutable struct ChatChildTestSocket
+    frames::Channel{String}
+    acks::Vector{String}
+    closed::Bool
+    close_gate::Union{Channel{Nothing},Nothing}
+    close_started::Bool
+end
+
+"""Build a fake socket with room for a complete overflow burst."""
+ChatChildTestSocket(; close_gate=nothing) =
+    ChatChildTestSocket(Channel{String}(512), String[], false, close_gate, false)
+
+"""Close fake socket iteration without waiting for another frame."""
+function Base.close(ws::ChatChildTestSocket)
+    ws.close_started = true
+    ws.close_gate === nothing || chat_child_test_gate(ws.close_gate)
+    ws.closed = true
+    isopen(ws.frames) && close(ws.frames)
+    return nothing
+end
+
+module ChatChildTestLogging
+module HTTP
+"""Emit records that must be dropped, even when JULIA_DEBUG forces HTTP debugging."""
+function emit()
+    @debug "private HTTP debug record"
+    @warn "private HTTP warning"
+    Nested.emit()
+end
+module Nested
+"""Verify that HTTP submodules' diagnostics are dropped too."""
+emit() = @warn "private HTTP submodule warning"
+end
+end
+end
+
+# Keep missing new names inside the testsets on the base commit. Defining these
+# methods unconditionally would fail while loading the test file instead.
+if isdefined(SlackClaw, :socket_frames) && isdefined(SlackClaw, :socket_send)
+    @eval begin
+        """Iterate the fake's raw input queue."""
+        SlackClaw.socket_frames(ws::ChatChildTestSocket) = ws.frames
+
+        """Record exactly the acknowledgement the child sent."""
+        function SlackClaw.socket_send(ws::ChatChildTestSocket, text)
+            push!(ws.acks, SlackClaw.JSON.parse(text)["envelope_id"])
+            return nothing
+        end
+    end
+end
+
+"""Block a scripted API operation until the test closes its gate."""
+function chat_child_test_gate(gate::Channel)
+    for _ in gate
+    end
+    return nothing
+end
+
+"""Require asynchronous progress within a bounded interval, including on failure."""
+function chat_child_test_until(predicate; timeout_s=5)
+    result = timedwait(predicate, timeout_s; pollint=0.002)
+    result == :ok || error("chat child fixture exceeded its progress deadline")
+    return nothing
+end
+
+"""Run the real protocol reader with BufferStreams and one persistent output reader."""
+function chat_child_test_start(transport, socket_connect; kwargs...)
+    input, output = Base.BufferStream(), Base.BufferStream()
+    frames = Channel{Any}(4096)
+    lines, seen, pending = String[], Any[], Any[]
+    child = @async try
+        SlackClaw.run_chat_child(input, output; transport, socket_connect, kwargs...)
+    finally
+        close(output)
+    end
+    reader = @async try
+        for line in eachline(output)
+            push!(lines, line)
+            frame = SlackClaw.JSON.parse(line)
+            push!(seen, frame)
+            put!(frames, frame)
+        end
+    finally
+        close(frames)
+    end
+    return (; input, output, frames, lines, seen, pending, child, reader)
+end
+
+"""Read one matching output frame without losing interleaved events or other replies."""
+function chat_child_test_frame(h, predicate; timeout_s=5)
+    index = findfirst(predicate, h.pending)
+    index === nothing || return splice!(h.pending, index)
+    deadline = time() + timeout_s
+    while true
+        remaining = deadline - time()
+        remaining > 0 || error("chat child fixture did not receive its expected frame")
+        chat_child_test_until(() -> isready(h.frames) || !isopen(h.frames); timeout_s=remaining)
+        isready(h.frames) || error("chat child output ended before its expected frame")
+        frame = take!(h.frames)
+        predicate(frame) && return frame
+        push!(h.pending, frame)
+    end
+end
+
+"""Read one response, leaving unrelated frames available to later assertions."""
+chat_child_test_response(h, id) = chat_child_test_frame(h,
+    frame -> get(frame, "kind", "") == "res" && get(frame, "id", nothing) == id)["payload"]
+
+"""Write a complete daemon request, accepting any Integer request identity."""
+function chat_child_test_send(h, id::Integer, op, payload=Dict{String,Any}())
+    write(h.input, SlackClaw.JSON.json(Dict("v" => 1, "kind" => "req", "id" => id,
+                                          "op" => op, "payload" => payload)), '\n')
+    flush(h.input)
+end
+
+"""Build configure data using only recognizable, fake credentials."""
+function chat_child_test_configuration()
+    return Dict("workspaces" => [Dict("id" => "T1", "bot_token" => "xoxb-child-fake-secret",
+        "app_token" => "xapp-child-fake-secret", "channels" => ["C1"], "posting_form" => "prefix")])
+end
+
+"""Queue a Slack events_api envelope with a deterministic acknowledgement identity."""
+function chat_child_test_event(ws::ChatChildTestSocket, id, event)
+    put!(ws.frames, SlackClaw.JSON.json(Dict("type" => "events_api", "envelope_id" => string(id),
+        "payload" => Dict("event" => event))))
+end
+
+"""Build a numbered member event with an exact decimal timestamp."""
+chat_child_test_numbered_event(i) = Dict("type" => "message", "channel" => "C1",
+    "ts" => "$i.000001", "user" => "U1", "text" => "message $i")
+
+"""Retire a fixture even after an assertion fails, without leaving a hung test wait."""
+function chat_child_test_cleanup(h, sockets, gates=Channel[])
+    for gate in gates
+        isopen(gate) && close(gate)
+    end
+    for ws in sockets
+        close(ws)
+    end
+    isopen(h.input) && close(h.input)
+    chat_child_test_until(() -> istaskdone(h.child))
+    fetch(h.child)
+    chat_child_test_until(() -> istaskdone(h.reader))
+    fetch(h.reader)
+    return nothing
+end
+
+"""Exercise every authenticated operation while auth is pending, rejected or mismatched."""
+function chat_child_test_authentication()
+    for mode in (:pending, :rejected, :mismatch)
+        gate = Channel{Nothing}(1)
+        started = Ref(false)
+        ws = ChatChildTestSocket()
+        transport, calls = chat_test_transport() do call
+            endswith(call["url"], "/auth.test") || error("unauthenticated Slack call")
+            started[] = true
+            chat_child_test_gate(gate)
+            mode == :rejected && return Dict("ok" => false, "error" => "invalid_auth")
+            return Dict("ok" => true, "team_id" => mode == :mismatch ? "TOTHER" : "T1", "user_id" => "UOWN")
+        end
+        h = chat_child_test_start(transport, (url, f) -> f(ws))
+        try
+            chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+            @test chat_child_test_response(h, 1)["accepted"]
+            chat_child_test_until(() -> started[])
+            if mode != :pending
+                close(gate)
+                status = chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "unavailable")
+                @test status["payload"]["code"] == "unauthorized"
+            end
+            for (id, op) in enumerate(("history", "post", "file.fetch", "file.upload"))
+                chat_child_test_send(h, 10 + id, op, Dict("workspace" => "T1", "channel" => "C1"))
+                result = chat_child_test_response(h, 10 + id)
+                @test result["code"] == "unavailable"
+                @test result["error"] == "workspace not authenticated"
+                if op in ("post", "file.upload")
+                    @test result["outcome"] == "refused"
+                end
+            end
+            @test length(calls) == 1
+            chat_child_test_send(h, 99, "stop")
+            @test chat_child_test_response(h, 99)["stopped"]
+        finally
+            chat_child_test_cleanup(h, [ws], [gate])
+        end
+    end
+end
+
+"""Test cancellation during a byte transfer, including drain and retirement bounds."""
+function chat_child_test_cancel_uploads(dir)
+    source = joinpath(dir, "cancel.png")
+    write(source, UInt8[1, 2, 3, 4])
+    request = Dict("workspace" => "T1", "channel" => "C1", "path" => source,
+        "name" => "cancel.png", "author" => Dict("kind" => "row", "name" => "worker"))
+    # Exercise the upload helper's callback independently of the child's transport guard.
+    cancelled = Ref(false)
+    transport, calls = chat_test_transport() do call
+        if occursin("/files.getUploadURLExternal?", call["url"])
+            return Dict("ok" => true, "file_id" => "FCANCEL", "upload_url" => "https://upload.example.test/cancel")
+        elseif call["url"] == "https://upload.example.test/cancel"
+            @test read(call["body"]) == UInt8[1, 2, 3, 4]
+            cancelled[] = true
+            return SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], UInt8[])
+        end
+        error("cancelled upload attempted completion")
+    end
+    workspace = SlackClaw.ChatWorkspace(; id="T1", bot_token="xoxb-child-fake-secret", transport)
+    err = chat_test_error(() -> SlackClaw.chat_upload_file(workspace, request; cancelled=() -> cancelled[]))
+    @test err isa SlackClaw.ChatError
+    @test err.code == :timeout && err.outcome == :refused
+    @test length(calls) == 2
+    for mode in (:deadline, :stop, :wedged, :allocation)
+        gate = Channel{Nothing}(1)
+        started, completed = Ref(false), Ref(0)
+        upload_input = Ref{Any}(nothing)
+        ws = ChatChildTestSocket()
+        transport, calls = chat_test_transport() do call
+            url = call["url"]
+            if endswith(url, "/auth.test")
+                return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN")
+            elseif endswith(url, "/apps.connections.open")
+                return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+            elseif occursin("/files.getUploadURLExternal?", url)
+                if mode == :allocation
+                    started[] = true
+                    chat_child_test_gate(gate)
+                end
+                return Dict("ok" => true, "file_id" => "FCANCEL", "upload_url" => "https://upload.example.test/cancel")
+            elseif url == "https://upload.example.test/cancel"
+                upload_input[] = call["body"]
+                @test read(call["body"]) == UInt8[1, 2, 3, 4]
+                started[] = true
+                chat_child_test_gate(gate)
+                return SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], UInt8[])
+            elseif endswith(url, "/files.completeUploadExternal")
+                completed[] += 1
+                return Dict("ok" => true)
+            end
+            error("unexpected cancellation fixture call")
+        end
+        h = chat_child_test_start(transport, (url, f) -> f(ws);
+            file_deadline_s=0.6, file_http_s=0.1)
+        release = nothing
+        try
+            chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+            @test chat_child_test_response(h, 1)["accepted"]
+            chat_child_test_until(() -> any(c -> endswith(c["url"], "/apps.connections.open"), calls))
+            chat_child_test_send(h, 2, "file.upload", request)
+            chat_child_test_until(() -> started[])
+            if mode != :stop
+                result = chat_child_test_response(h, 2)
+                @test result["code"] == "timeout" && result["outcome"] == "unknown"
+            end
+            if mode != :wedged
+                # The worker must be joined even if its deadline reply already went out.
+                release = Timer(0.08) do timer
+                    close(gate)
+                end
+            end
+            stopped_at = time()
+            chat_child_test_send(h, 3, "stop")
+            @test chat_child_test_response(h, 3)["stopped"]
+            @test time() - stopped_at < 1.5
+            if mode == :allocation
+                @test !isopen(gate)
+                @test upload_input[] === nothing
+            elseif mode == :wedged
+                @test isopen(upload_input[])
+                close(gate)
+                chat_child_test_until(() -> !isopen(upload_input[]))
+            else
+                @test !isopen(gate)
+                @test !isopen(upload_input[])
+            end
+            if mode == :stop
+                result = chat_child_test_response(h, 2)
+                @test result["code"] == "timeout" && result["outcome"] == "refused"
+            end
+            @test completed[] == 0
+            @test !any(c -> endswith(c["url"], "/files.completeUploadExternal"), calls)
+        finally
+            release === nothing || close(release)
+            chat_child_test_cleanup(h, [ws], [gate])
+        end
+    end
+end
+
+"""Check logger installation at run_chat_child with a transport that logs secrets."""
+function chat_child_test_logging()
+    captured = IOBuffer()
+    ws = ChatChildTestSocket()
+    transport, _ = chat_test_transport() do call
+        if endswith(call["url"], "/auth.test")
+            ChatChildTestLogging.HTTP.emit()
+            Base.CoreLogging.handle_message(Base.CoreLogging.current_logger(), Base.CoreLogging.Debug,
+                "private SlackClaw debug record", SlackClaw, :test, :test, @__FILE__, @__LINE__)
+            @warn "xoxb-child-fake-secret" exception=(ErrorException("private response body"), nothing)
+            return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN")
+        elseif endswith(call["url"], "/apps.connections.open")
+            return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+        end
+        error("unexpected logging fixture call")
+    end
+    withenv("JULIA_DEBUG" => "HTTP") do
+        h = chat_child_test_start(transport, (url, f) -> f(ws); stderr=captured)
+        try
+            chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+            @test chat_child_test_response(h, 1)["accepted"]
+            put!(ws.frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+            chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
+            chat_child_test_send(h, 2, "stop")
+            @test chat_child_test_response(h, 2)["stopped"]
+        finally
+            chat_child_test_cleanup(h, [ws])
+        end
+    end
+    @test String(take!(captured)) == "SlackClaw chat: library_diagnostic ErrorException\n"
+    logger = SlackClaw.ChatChildLogger(captured)
+    @test !Base.CoreLogging.shouldlog(logger, Base.CoreLogging.Debug, SlackClaw, :test, :test)
+end
+
+@testset "chat_frames_are_bounded_and_start_no_agent" begin
+    # This lookup is intentionally inside the testset: runtime red on piece 3.
+    run_child = SlackClaw.run_chat_child
+    @test run_child isa Function
+    @test_throws ArgumentError run_child(IOBuffer(), IOBuffer(); max_line=255)
+    minimal_output = IOBuffer()
+    @test run_child(IOBuffer(), minimal_output; max_line=256) === nothing
+    @test all(line -> ncodeunits(line) <= 256, split(String(take!(minimal_output)), '\n'))
+    chat_child_test_authentication()
+    chat_child_test_logging()
+    mktempdir() do dir
+        chat_child_test_cancel_uploads(dir)
+        marker = joinpath(dir, "agent-ran")
+        shim = joinpath(dir, "claude")
+        write(shim, "#!/bin/sh\ntouch \"\$(dirname \"\$0\")/agent-ran\"\n")
+        chmod(shim, 0o755)
+        stderr_path = joinpath(dir, "stderr")
+        history_gate, post_gate, file_gate = Channel{Nothing}(1), Channel{Nothing}(1), Channel{Nothing}(1)
+        shutdown_gate = Channel{Nothing}(1)
+        history_block, history_large, history_error = Ref(false), Ref(false), Ref(false)
+        history_started, history_finished = Ref(0), Ref(0)
+        files_started, files_finished, posts = Ref(0), Ref(0), Ref(0)
+        current_history_gate = Ref(history_gate)
+        ws = ChatChildTestSocket()
+        transport, calls = chat_test_transport() do call
+            url = call["url"]
+            if endswith(url, "/auth.test")
+                return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN", "bot_id" => "BOWN")
+            elseif endswith(url, "/apps.connections.open")
+                @test ("Authorization" => "Bearer xapp-child-fake-secret") in call["headers"]
+                return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+            elseif occursin("/users.info?", url)
+                @test call["timeout_s"] == 0.1
+                return Dict("ok" => true, "user" => Dict("profile" => Dict("display_name" => "Member")))
+            elseif occursin("/conversations.history?", url)
+                @test call["timeout_s"] == 0.1
+                history_error[] && return ErrorException("xoxb-child-fake-secret https://private.example.test")
+                if history_block[]
+                    history_started[] += 1
+                    chat_child_test_gate(current_history_gate[])
+                    history_finished[] += 1
+                end
+                messages = history_large[] ? [Dict("ts" => "$i.0", "user" => "U1", "text" => "\0"^9000) for i in 1:2] :
+                    [Dict("ts" => "1.0", "user" => "U1", "text" => "x"^9000)]
+                return Dict("ok" => true, "messages" => messages, "is_limited" => true)
+            elseif endswith(url, "/chat.postMessage")
+                @test call["timeout_s"] == 0.1
+                posts[] += 1
+                chat_child_test_gate(post_gate)
+                return Dict("ok" => true, "ts" => "2.0")
+            elseif occursin("/files.info?", url)
+                if call["query"]["file"] == "FSTUB"
+                    @test call["timeout_s"] == 0.1
+                    return Dict("ok" => true, "file" => Dict("id" => "FSTUB", "name" => "resolved.png",
+                        "mimetype" => "image/png", "size" => 4))
+                end
+                @test call["timeout_s"] == 0.2
+                files_started[] += 1
+                chat_child_test_gate(file_gate)
+                files_finished[] += 1
+                return Dict("ok" => true, "file" => Dict("id" => "F1", "channels" => ["C1"], "size" => 4,
+                    "mimetype" => "image/png", "url_private" => "https://files.slack.com/private"))
+            elseif url == "https://files.slack.com/private"
+                @test call["timeout_s"] == 0.2
+                return SlackClaw.ChatHTTPResponse(200, ["Content-Type" => "image/png"], UInt8[1, 2, 3, 4])
+            elseif occursin("/files.getUploadURLExternal?", url)
+                @test call["timeout_s"] == 0.2
+                return Dict("ok" => true, "file_id" => "FUP", "upload_url" => "https://upload.example.test/private")
+            elseif url == "https://upload.example.test/private"
+                @test call["timeout_s"] == 0.2
+                @test read(call["body"]) == UInt8[1, 2, 3, 4]
+                return SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], UInt8[])
+            elseif endswith(url, "/files.completeUploadExternal")
+                @test call["timeout_s"] == 0.2
+                shares = Dict("public" => Dict("C1" => [Dict("ts" => "27.0")]))
+                return Dict("ok" => true, "files" => [Dict("shares" => shares)])
+            end
+            error("unexpected fixture API operation")
+        end
+        connect = function(url, f)
+            try
+                f(ws)
+            finally
+                close(ws)
+            end
+        end
+        open(stderr_path, "w") do captured_stderr
+            redirect_stderr(captured_stderr) do
+                withenv("PATH" => dir * ":" * get(ENV, "PATH", "")) do
+                    Base.CoreLogging.with_logger(SlackClaw.ChatChildLogger(captured_stderr)) do
+                        @warn "xoxb-child-fake-secret" exception=(ErrorException("xapp-child-fake-secret"), nothing)
+                    end
+                    h = chat_child_test_start(transport, connect; meta_deadline_s=0.5, file_deadline_s=0.8,
+                        meta_http_s=0.1, file_http_s=0.2, max_line=32768)
+                    try
+                        first_frame = chat_child_test_frame(h, _ -> true)
+                        @test first_frame == Dict("v" => 1, "kind" => "evt", "op" => "ready",
+                                                  "payload" => Dict("protocol" => 1))
+                        history = Dict("workspace" => "T1", "channel" => "C1", "limit" => 1)
+                        post = Dict("workspace" => "T1", "channel" => "C1", "text" => "hello",
+                                    "author" => Dict("kind" => "row", "name" => "worker"))
+                        chat_child_test_send(h, 1, "history", history)
+                        @test chat_child_test_response(h, 1)["code"] == "unavailable"
+                        chat_child_test_send(h, 2, "post", post)
+                        @test chat_child_test_response(h, 2)["outcome"] == "refused"
+
+                        # Malformed input without an identity is dropped. Valid identities get a reply.
+                        write(h.input, "{broken\n[]\n", SlackClaw.JSON.json(Dict("v" => 2, "kind" => "req",
+                            "id" => 3, "op" => "ping", "payload" => Dict())), '\n')
+                        @test chat_child_test_response(h, 3)["code"] == "bad_request"
+                        write(h.input, SlackClaw.JSON.json(Dict("v" => 1, "kind" => "req", "id" => 4)), '\n')
+                        @test chat_child_test_response(h, 4)["code"] == "bad_request"
+                        invalid = chat_child_test_configuration()
+                        invalid["workspaces"][1]["posting_form"] = "invalid"
+                        chat_child_test_send(h, 5, "configure", invalid)
+                        @test chat_child_test_response(h, 5)["code"] == "bad_request"
+                        chat_child_test_send(h, 6, "configure", chat_child_test_configuration())
+                        @test chat_child_test_response(h, 6) == Dict("accepted" => true)
+                        put!(ws.frames, SlackClaw.JSON.json(Dict("type" => "hello",
+                            "connection_info" => Dict("app_id" => "A1"))))
+                        chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
+                        chat_child_test_send(h, 7, "configure", chat_child_test_configuration())
+                        @test chat_child_test_response(h, 7)["code"] == "bad_request"
+                        chat_child_test_send(h, 8, "history", history)
+                        page = chat_child_test_response(h, 8)
+                        @test page["limited"] === true
+                        @test page["messages"][1]["truncated"] === true
+                        @test ncodeunits(page["messages"][1]["text"]) == 8192
+                        history_large[] = true
+                        chat_child_test_send(h, 9, "history", merge(history, Dict("limit" => 2)))
+                        @test chat_child_test_response(h, 9)["code"] == "too_large"
+                        history_large[] = false
+                        write(h.input, "z"^34000, '\n')
+                        chat_child_test_send(h, Int32(10), "ping")
+                        @test isempty(chat_child_test_response(h, 10))
+                        chat_child_test_send(h, 11, "unknown")
+                        @test chat_child_test_response(h, 11)["code"] == "bad_request"
+                        chat_child_test_send(h, 12, "history", merge(history, Dict("channel" => "COTHER")))
+                        @test chat_child_test_response(h, 12)["code"] == "forbidden"
+                        chat_child_test_send(h, 13, "history", merge(history, Dict("workspace" => "TOTHER")))
+                        @test chat_child_test_response(h, 13)["code"] == "bad_request"
+                        history_error[] = true
+                        chat_child_test_send(h, 16, "history", history)
+                        safe_error = chat_child_test_response(h, 16)
+                        @test safe_error["code"] == "io_error"
+                        @test occursin("ErrorException", safe_error["error"])
+                        @test !occursin("https://", safe_error["error"])
+                        history_error[] = false
+
+                        chat_child_test_send(h, 14, "post", post)
+                        chat_child_test_until(() -> posts[] == 1)
+                        chat_child_test_send(h, 14, "post", post)
+                        duplicate = chat_child_test_response(h, 14)
+                        @test duplicate["code"] == "bad_request" && duplicate["error"] == "duplicate id"
+                        @test duplicate["outcome"] == "refused"
+                        @test posts[] == 1
+                        chat_child_test_send(h, 15, "ping")
+                        @test isempty(chat_child_test_response(h, 15))
+                        timeout = chat_child_test_response(h, 14)
+                        @test timeout["code"] == "timeout"
+                        @test timeout["outcome"] == "unknown"
+                        @test posts[] == 1
+                        # A written reply releases the identity even while its worker is draining.
+                        chat_child_test_send(h, 14, "ping")
+                        @test isempty(chat_child_test_response(h, 14))
+                        close(post_gate)
+
+                        # Directive-like text, bot posts, edits, deletes and file stubs are display data.
+                        for (i, text) in enumerate(("[CONTINUE]", "[SCHEDULE: 1m: do x]", "proactive on"))
+                            chat_child_test_event(ws, "text$i", Dict("type" => "message", "channel" => "C1",
+                                "ts" => "$(20 + i).0", "user" => "U1", "text" => text))
+                            message = chat_child_test_frame(h, f -> f["op"] == "message")["payload"]
+                            @test message["text"] == text
+                        end
+                        chat_child_test_event(ws, "bot", Dict("type" => "message", "channel" => "C1",
+                            "ts" => "24.0", "bot_id" => "BOTHER", "subtype" => "bot_message", "text" => "bot post"))
+                        @test chat_child_test_frame(h, f -> f["op"] == "message")["payload"]["origin"] == "bot"
+                        chat_child_test_event(ws, "edit", Dict("type" => "message", "channel" => "C1",
+                            "subtype" => "message_changed", "message" => Dict("ts" => "21.0", "user" => "U1", "text" => "edited")))
+                        edit = chat_child_test_frame(h, f -> f["op"] == "changed")["payload"]
+                        @test edit["change"] == "edit" && edit["message"]["text"] == "edited"
+                        chat_child_test_event(ws, "delete", Dict("type" => "message", "channel" => "C1",
+                            "subtype" => "message_deleted", "deleted_ts" => "21.0"))
+                        @test chat_child_test_frame(h, f -> f["op"] == "changed")["payload"]["change"] == "delete"
+                        chat_child_test_event(ws, "ignored", Dict("type" => "message", "channel" => "COTHER",
+                            "ts" => "25.0", "user" => "U1", "text" => "not configured"))
+                        chat_child_test_event(ws, "stub", Dict("type" => "message", "channel" => "C1",
+                            "ts" => "26.0", "user" => "U1", "subtype" => "file_share",
+                            "files" => [Dict("id" => "FSTUB", "file_access" => "check_file_info")]))
+                        @test chat_child_test_frame(h, f -> f["op"] == "message")["payload"]["files"][1]["name"] == "resolved.png"
+
+                        history_block[] = true
+                        for id in 100:115
+                            chat_child_test_send(h, id, "history", history)
+                        end
+                        chat_child_test_until(() -> history_started[] == 16)
+                        chat_child_test_send(h, 116, "ping")
+                        @test isempty(chat_child_test_response(h, 116))
+                        chat_child_test_send(h, 117, "history", history)
+                        @test chat_child_test_response(h, 117)["code"] == "busy"
+                        chat_child_test_send(h, 118, "post", post)
+                        busy_post = chat_child_test_response(h, 118)
+                        @test busy_post["code"] == "busy" && busy_post["outcome"] == "refused"
+                        @test chat_child_test_response(h, 100)["code"] == "timeout"
+                        chat_child_test_send(h, 119, "history", history)
+                        @test chat_child_test_response(h, 119)["code"] == "busy"
+                        close(history_gate)
+                        chat_child_test_until(() -> history_finished[] == 16)
+
+                        file = Dict("workspace" => "T1", "channel" => "C1", "file_id" => "F1",
+                            "variant" => "original", "max_bytes" => 4)
+                        for id in 200:201
+                            chat_child_test_send(h, id, "file.fetch", merge(file, Dict("destination" => joinpath(dir, "file$id"))))
+                        end
+                        chat_child_test_until(() -> files_started[] == 2)
+                        chat_child_test_send(h, 202, "file.fetch", merge(file, Dict("destination" => joinpath(dir, "file202"))))
+                        @test chat_child_test_response(h, 202)["code"] == "busy"
+                        chat_child_test_send(h, 203, "file.upload", Dict("workspace" => "T1", "channel" => "C1"))
+                        busy_upload = chat_child_test_response(h, 203)
+                        @test busy_upload["code"] == "busy" && busy_upload["outcome"] == "refused"
+                        close(file_gate)
+                        chat_child_test_until(() -> files_finished[] == 2)
+                        @test chat_child_test_response(h, 200) == Dict("bytes" => 4, "mime" => "image/png")
+                        @test chat_child_test_response(h, 201) == Dict("bytes" => 4, "mime" => "image/png")
+                        source = joinpath(dir, "source.png")
+                        write(source, UInt8[1, 2, 3, 4])
+                        chat_child_test_send(h, 204, "file.upload", Dict("workspace" => "T1", "channel" => "C1",
+                            "path" => source, "name" => "source.png", "comment" => "image",
+                            "author" => Dict("kind" => "row", "name" => "worker")))
+                        @test chat_child_test_response(h, 204) == Dict("file_id" => "FUP", "ts" => "27.0")
+
+                        current_history_gate[] = shutdown_gate
+                        chat_child_test_send(h, 900, "history", history)
+                        chat_child_test_until(() -> history_started[] == 17)
+                        chat_child_test_send(h, 901, "stop")
+                        @test chat_child_test_response(h, 900)["code"] == "timeout"
+                        @test chat_child_test_response(h, 901) == Dict("stopped" => true)
+                        chat_child_test_until(() -> istaskdone(h.child))
+                        fetch(h.child)
+                        @test ws.closed
+                        @test !isfile(marker)
+                        @test posts[] == 1
+                        @test count(c -> endswith(c["url"], "/chat.postMessage"), calls) == 1
+                    finally
+                        chat_child_test_cleanup(h, [ws], [history_gate, post_gate, file_gate, shutdown_gate])
+                    end
+                    @test all(line -> ncodeunits(line) <= 32768, h.lines)
+                    @test all(f -> f["kind"] != "evt" || f["op"] in ("ready", "message", "changed", "status", "gap"), h.seen)
+                    @test all(f -> f["kind"] != "evt" || f["op"] != "message" || f["payload"]["channel"] == "C1", h.seen)
+                    responses = [f for f in h.seen if f["kind"] == "res"]
+                    ordinary = [f for f in responses if f["id"] != 14]
+                    @test length(ordinary) == length(unique(f["id"] for f in ordinary))
+                    @test count(f -> f["id"] == 14, responses) == 3
+                    for token in ("xoxb-child-fake-secret", "xapp-child-fake-secret")
+                        @test !occursin(token, join(h.lines))
+                    end
+                    eof_child = chat_child_test_start(transport, connect)
+                    try
+                        @test chat_child_test_frame(eof_child, _ -> true)["op"] == "ready"
+                        close(eof_child.input)
+                        chat_child_test_until(() -> istaskdone(eof_child.child))
+                        @test fetch(eof_child.child) === nothing
+                    finally
+                        chat_child_test_cleanup(eof_child, ChatChildTestSocket[])
+                    end
+                end
+            end
+        end
+        diagnostics = read(stderr_path, String)
+        @test !occursin("xoxb-child-fake-secret", diagnostics)
+        @test !occursin("xapp-child-fake-secret", diagnostics)
+        @test !occursin("wss://", diagnostics)
+        @test all(line -> ncodeunits(line) <= 512, split(diagnostics, '\n'))
+    end
+end
+
+"""Distinguish app identity from credentials, and bound simultaneous silent closes."""
+function chat_child_test_socket_lifecycle()
+    for mode in (:duplicate, :silent)
+        gate = Channel{Nothing}(1)
+        sockets = [ChatChildTestSocket(; close_gate=mode == :silent ? gate : nothing) for _ in 1:2]
+        connections = [0, 0]
+        transport, _ = chat_test_transport() do call
+            if endswith(call["url"], "/auth.test")
+                second = ("Authorization" => "Bearer xoxb-child-other-fake") in call["headers"]
+                return Dict("ok" => true, "team_id" => second ? "T2" : "T1", "user_id" => "UOWN")
+            elseif endswith(call["url"], "/apps.connections.open")
+                second = ("Authorization" => "Bearer xapp-child-other-fake") in call["headers"]
+                return Dict("ok" => true, "url" => "wss://socket.example.test/$(second ? "two" : "one")")
+            end
+            error("unexpected lifecycle fixture call")
+        end
+        connect = function(url, f)
+            index = endswith(url, "/two") ? 2 : 1
+            connections[index] += 1
+            ws = sockets[index]
+            try
+                f(ws)
+            finally
+                close(ws)
+            end
+        end
+        h = chat_child_test_start(transport, connect)
+        try
+            config = chat_child_test_configuration()
+            push!(config["workspaces"], Dict("id" => "T2", "bot_token" => "xoxb-child-other-fake",
+                "app_token" => "xapp-child-other-fake", "channels" => ["C2"], "posting_form" => "prefix"))
+            chat_child_test_send(h, 1, "configure", config)
+            @test chat_child_test_response(h, 1)["accepted"]
+            put!(sockets[1].frames, SlackClaw.JSON.json(Dict("type" => "hello",
+                "connection_info" => Dict("app_id" => "A1"))))
+            chat_child_test_frame(h, f -> f["op"] == "status" &&
+                f["payload"]["workspace"] == "T1" && f["payload"]["state"] == "connected")
+            put!(sockets[2].frames, SlackClaw.JSON.json(Dict("type" => "hello",
+                "connection_info" => Dict("app_id" => mode == :duplicate ? "A1" : "A2"))))
+            state = mode == :duplicate ? "unavailable" : "connected"
+            status = chat_child_test_frame(h, f -> f["op"] == "status" &&
+                f["payload"]["workspace"] == "T2" && f["payload"]["state"] == state)
+            if mode == :duplicate
+                @test status["payload"]["code"] == "duplicate_app"
+                chat_child_test_until(() -> sockets[2].closed)
+                @test !sockets[1].closed
+                timer = Timer(1.1)
+                try
+                    wait(timer)
+                finally
+                    close(timer)
+                end
+                @test connections == [1, 1]
+                @test !any(f -> f["op"] == "status" && f["payload"]["workspace"] == "T2" &&
+                    f["payload"]["state"] in ("connected", "reconnecting"), h.seen)
+            end
+            stopped_at = time()
+            chat_child_test_send(h, 2, "stop")
+            @test chat_child_test_response(h, 2)["stopped"]
+            @test time() - stopped_at < 2.8
+            if mode == :silent
+                @test all(ws -> ws.close_started && !ws.closed, sockets)
+                @test time() - stopped_at >= 1.8
+            end
+            chat_child_test_until(() -> istaskdone(h.child))
+        finally
+            chat_child_test_cleanup(h, sockets, [gate])
+        end
+    end
+end
+
+"""Run the production connect, iterator and send defaults against a loopback server."""
+function chat_child_test_websocket_defaults()
+    acks = Channel{Any}(1)
+    handler = function(ws)
+        SlackClaw.HTTP.WebSockets.send(ws, SlackClaw.JSON.json(Dict("type" => "hello",
+            "connection_info" => Dict("app_id" => "ALOOP"))))
+        event = Dict("type" => "message", "channel" => "C1", "ts" => "1.0",
+            "user" => "UOWN", "text" => "real websocket")
+        SlackClaw.HTTP.WebSockets.send(ws, SlackClaw.JSON.json(Dict("type" => "events_api",
+            "envelope_id" => "loopback", "payload" => Dict("event" => event))))
+        put!(acks, SlackClaw.JSON.parse(String(SlackClaw.HTTP.WebSockets.receive(ws))))
+        for _ in ws
+        end
+    end
+    # 2.x has a dedicated WebSockets.Server; its listen! takes no verbose keyword.
+    options = SlackClaw.CHAT_HTTP_V2 ? (;) : (; verbose=-1, listenany=true)
+    server = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        SlackClaw.HTTP.WebSockets.listen!(handler, "127.0.0.1", 0; options...)
+    end
+    address = SlackClaw.CHAT_HTTP_V2 ? SlackClaw.HTTP.WebSockets.server_addr(server) :
+        "127.0.0.1:$(SlackClaw.HTTP.port(server))"
+    transport, _ = chat_test_transport() do call
+        if endswith(call["url"], "/auth.test")
+            return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN")
+        elseif endswith(call["url"], "/apps.connections.open")
+            return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+        end
+        error("unexpected loopback fixture call")
+    end
+    # Keep the production wss URL validation; redirect only the injected connector.
+    connect = (url, f) -> SlackClaw.default_socket_connect("ws://$address", f)
+    h = chat_child_test_start(transport, connect)
+    try
+        chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+        @test chat_child_test_response(h, 1)["accepted"]
+        chat_child_test_until(() -> isready(acks))
+        @test take!(acks) == Dict("envelope_id" => "loopback")
+        message = chat_child_test_frame(h, f -> f["op"] == "message")["payload"]
+        @test message["text"] == "real websocket"
+        @test message["workspace"] == "T1" && message["channel"] == "C1"
+        chat_child_test_send(h, 2, "stop")
+        @test chat_child_test_response(h, 2)["stopped"]
+    finally
+        try
+            chat_child_test_cleanup(h, ChatChildTestSocket[])
+        finally
+            close(server)
+        end
+    end
+end
+
+@testset "chat_socket_ack_survives_slow_api_and_reports_queue_gap" begin
+    run_child = SlackClaw.run_chat_child
+    @test run_child isa Function
+    started_at = time()
+    user_gate = Channel{Nothing}(1)
+    user_started = Ref(false)
+    sockets = [ChatChildTestSocket(), ChatChildTestSocket()]
+    connections, live, peak = Ref(0), Ref(0), Ref(0)
+    transport, _ = chat_test_transport() do call
+        url = call["url"]
+        if endswith(url, "/auth.test")
+            return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN", "bot_id" => "BOWN")
+        elseif endswith(url, "/apps.connections.open")
+            return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+        elseif occursin("/users.info?", url)
+            user_started[] = true
+            chat_child_test_gate(user_gate)
+            return Dict("ok" => true, "user" => Dict("profile" => Dict("display_name" => "Member")))
+        end
+        error("unexpected fixture API operation")
+    end
+    connect = function(url, f)
+        connections[] += 1
+        ws = sockets[connections[]]
+        live[] += 1
+        peak[] = max(peak[], live[])
+        try
+            f(ws)
+        finally
+            close(ws)
+            live[] -= 1
+        end
+    end
+    h = chat_child_test_start(transport, connect; meta_http_s=0.1, meta_deadline_s=0.5)
+    try
+        @test chat_child_test_frame(h, _ -> true)["op"] == "ready"
+        chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+        @test chat_child_test_response(h, 1)["accepted"]
+        put!(sockets[1].frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+        chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
+        chat_child_test_event(sockets[1], 1, chat_child_test_numbered_event(1))
+        chat_child_test_until(() -> user_started[])
+        for i in 2:300
+            chat_child_test_event(sockets[1], i, chat_child_test_numbered_event(i))
+        end
+        chat_child_test_until(() -> length(sockets[1].acks) == 300)
+        @test sockets[1].acks == string.(1:300)
+        @test !any(f -> f["op"] == "message", h.seen)
+        gap = chat_child_test_frame(h, f -> f["op"] == "gap")["payload"]
+        @test gap == Dict("workspace" => "T1", "reason" => "event_queue_overflow")
+        close(user_gate)
+        messages = [chat_child_test_frame(h, f -> f["op"] == "message")["payload"] for _ in 1:257]
+        @test [m["ts"] for m in messages] == ["$i.000001" for i in 1:257]
+        @test count(f -> f["op"] == "gap" && f["payload"]["reason"] == "event_queue_overflow", h.seen) == 1
+        chat_child_test_event(sockets[1], 301, chat_child_test_numbered_event(301))
+        @test chat_child_test_frame(h, f -> f["op"] == "message")["payload"]["ts"] == "301.000001"
+
+        # A warning keeps the connection; an actual disconnect reconnects once.
+        put!(sockets[1].frames, SlackClaw.JSON.json(Dict("type" => "disconnect", "reason" => "warning")))
+        chat_child_test_event(sockets[1], 302, chat_child_test_numbered_event(302))
+        @test chat_child_test_frame(h, f -> f["op"] == "message")["payload"]["ts"] == "302.000001"
+        @test connections[] == 1
+        put!(sockets[2].frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+        put!(sockets[1].frames, SlackClaw.JSON.json(Dict("type" => "disconnect", "reason" => "refresh_requested")))
+        chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "reconnecting")
+        chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
+        @test chat_child_test_frame(h, f -> f["op"] == "gap")["payload"]["reason"] == "reconnected"
+        @test connections[] == 2
+        @test peak[] == 1
+        chat_child_test_send(h, 2, "stop")
+        @test chat_child_test_response(h, 2)["stopped"]
+    finally
+        chat_child_test_cleanup(h, sockets, [user_gate])
+    end
+    @test time() - started_at < 8
+    chat_child_test_socket_lifecycle()
+    chat_child_test_websocket_defaults()
+end

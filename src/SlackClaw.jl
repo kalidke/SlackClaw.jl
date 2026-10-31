@@ -10,6 +10,7 @@ include("message_types.jl")
 include("slack_api.jl")
 include("chat_api.jl")
 include("chat_files.jl")
+include("chat_sidecar.jl")
 include("claude_runner.jl")
 include("monitor.jl")
 include("socket_mode.jl")
@@ -19,6 +20,8 @@ export SlackClawConfig,
        start_monitor,
        run_monitor,
        run_socket_fleet,
+       run_chat_child,
+       chat_child_main,
        stop_monitor!,
        SlackMessage,
        ClaudeResult,
