@@ -69,6 +69,9 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
     config = state.config
     route, msg = classify_socket_event(event, config, keys(state.threads))
     route == :ignore && return nothing
+    ch = get(event, "channel", "")
+    kind = route in (:thread_reply, :thread_revive) ? :thread_reply : route == :listen ? :listen : :message
+    refuse_quiesced!(state, TaskOrigin(kind, ch, msg.ts)) && return nothing
 
     if route == :primary
         claim_primary!(state, msg.ts) || return nothing
@@ -108,7 +111,7 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
                 ch
             end
         end
-        dispatch_listen_command!(state, listen_attributed_message(msg, ch_name), ch_name)
+        dispatch_listen_command!(state, listen_attributed_message(msg, ch_name), ch_name; channel_id=ch)
     end
     return nothing
 end
@@ -302,7 +305,7 @@ function validate_fleet(configs::Vector{SlackClawConfig})
 end
 
 """
-    run_socket_fleet(configs::Vector{SlackClawConfig})
+    run_socket_fleet(configs::Vector{SlackClawConfig}; control=nothing)
 
 Blocking entry point serving MANY channels over ONE Socket Mode connection —
 the correct shape for full-workspace push delivery. Each config gets its own
@@ -310,16 +313,20 @@ the correct shape for full-workspace push delivery. Each config gets its own
 budgets); every inbound event is offered to every state, and states ignore
 channels they don't serve. All configs must share the workspace's bot and app
 tokens and resolve to distinct state files
-(override `state_file` for channels sharing a `repo_dir`).
+(override `state_file` for channels sharing a `repo_dir`). Pass a `FleetControl`
+to quiesce individual channels and report completion of accepted tasks.
 """
-function run_socket_fleet(configs::Vector{SlackClawConfig})
+function run_socket_fleet(configs::Vector{SlackClawConfig};
+                          control::Union{FleetControl,Nothing}=nothing)
     validate_fleet(configs)
     crash_log = joinpath(configs[1].repo_dir, ".slackclaw_crash.log")
     try
         states = MonitorState[]
         try
             for c in configs
-                push!(states, start_monitor(c))
+                state = start_monitor(c)
+                push!(states, state)
+                control === nothing || attach!(control, state)
             end
             @info "SlackClaw: fleet up — $(length(states)) channel(s) on one socket"
             socket_fleet_loop!(states)

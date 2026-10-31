@@ -20,6 +20,31 @@ mutable struct ScheduledTask
     due_at::Float64  # time() when this should fire
 end
 
+"""The Slack message or timer invocation that caused an agent task."""
+struct TaskOrigin
+    kind::Symbol      # :message, :thread_reply, :listen, :scheduled, :proactive
+    channel::String   # source channel (primary for scheduled/proactive runs)
+    ts::String        # source message ts, scheduled thread ts, or "" for proactive
+end
+
+"""Tasks accepted before quiescing, and the newest refused invocations."""
+mutable struct QuiesceRecord
+    accepted::Dict{Task,TaskOrigin}
+    refused::Vector{TaskOrigin}
+end
+
+"""
+    FleetControl()
+
+Optional admission control for a socket fleet. Attach members with `attach!`,
+then retire a channel with [`quiesce!`](@ref). Opens no socket or process.
+"""
+mutable struct FleetControl{S}
+    lock::ReentrantLock
+    states::Vector{S}  # parameterized to allow MonitorState's control field below
+    quiesced::Dict{String,QuiesceRecord}
+end
+
 """
 Runtime state of a monitor: cursors, tracked threads, scheduled tasks, and
 the active task list. Created by [`start_monitor`](@ref); persisted to
@@ -38,6 +63,168 @@ mutable struct MonitorState
     channel_names::Dict{String,String}   # channel_id -> display name (cached)
     last_proactive::Float64              # time() of last proactive check
     dispatch_lock::ReentrantLock         # guards cursor claims (socket events vs reconcile poll)
+    control::Union{FleetControl,Nothing}
+    task_origins::Dict{Task,TaskOrigin}
+    inflight_scheduled::Vector{ScheduledTask}  # due tasks awaiting firing admission
+end
+
+# Keep the original positional constructor for callers and persisted-state startup.
+MonitorState(config, last_ts, running, active_tasks, timer, threads, busy_threads,
+             scheduled, listen_last_ts, channel_names, last_proactive, dispatch_lock) =
+    MonitorState(config, last_ts, running, active_tasks, timer, threads, busy_threads,
+                 scheduled, listen_last_ts, channel_names, last_proactive, dispatch_lock,
+                 nothing, Dict{Task,TaskOrigin}(), ScheduledTask[])
+
+FleetControl() = FleetControl(ReentrantLock(), MonitorState[], Dict{String,QuiesceRecord}())
+
+"""Attach a monitor to one fleet control; repeated attachment is harmless."""
+function attach!(control::FleetControl, state::MonitorState)
+    lock(control.lock) do
+        state.control === nothing || state.control === control ||
+            throw(ArgumentError("monitor is already attached to another fleet control"))
+        state.control = control
+        state in control.states || push!(control.states, state)
+    end
+    return nothing
+end
+
+"""Whether a channel's admission has been quiesced."""
+function is_quiesced(control::FleetControl, channel_id::AbstractString)
+    lock(control.lock) do
+        return haskey(control.quiesced, channel_id)
+    end
+end
+
+"""Stop new work for a channel and snapshot its unfinished accepted tasks."""
+function quiesce!(control::FleetControl, channel_id::AbstractString)
+    lock(control.lock) do
+        haskey(control.quiesced, channel_id) && return nothing
+        any(st -> st.config.slack_channel_id == channel_id ||
+                  channel_id in st.config.listen_channel_ids, control.states) ||
+            throw(ArgumentError("no fleet member serves channel $channel_id"))
+        accepted = Dict{Task,TaskOrigin}()
+        for state in control.states, task in state.active_tasks
+            istaskdone(task) && continue
+            origin = get(state.task_origins, task,
+                         TaskOrigin(:message, state.config.slack_channel_id, ""))
+            if state.config.slack_channel_id == channel_id || origin.channel == channel_id
+                accepted[task] = origin
+            end
+        end
+        # The same lock guards task admission; neither path yields while updating it.
+        control.quiesced[String(channel_id)] = QuiesceRecord(accepted, TaskOrigin[])
+    end
+    return nothing
+end
+
+"""
+    quiesce_report(control, channel_id)
+
+Return `channel`, `accepted`, `completed`, `failed`, `running`, `refused`,
+`pending_scheduled`, and `complete`. Entries are `TaskOrigin`s; pending
+schedules use their thread ts, including firings awaiting admission. `complete`
+means no accepted task is running and no scheduled firing is in flight;
+inspect `failed` before cutover. Reporting does not consume the snapshot.
+"""
+function quiesce_report(control::FleetControl, channel_id::AbstractString)
+    lock(control.lock) do
+        record = get(control.quiesced, channel_id, nothing)
+        record === nothing && throw(ArgumentError("channel $channel_id is not quiesced"))
+        completed, failed, running = TaskOrigin[], TaskOrigin[], TaskOrigin[]
+        for (task, origin) in record.accepted
+            push!(istaskfailed(task) ? failed : istaskdone(task) ? completed : running, origin)
+        end
+        pending_scheduled = TaskOrigin[]
+        firing = false
+        for state in control.states
+            state.config.slack_channel_id == channel_id || continue
+            firing |= !isempty(state.inflight_scheduled)
+            for sched in Iterators.flatten((state.scheduled, state.inflight_scheduled))
+                push!(pending_scheduled, TaskOrigin(:scheduled, state.config.slack_channel_id, sched.thread_ts))
+            end
+        end
+        return (channel=String(channel_id), accepted=collect(values(record.accepted)),
+                completed=completed, failed=failed, running=running,
+                refused=copy(record.refused), pending_scheduled=pending_scheduled,
+                complete=isempty(running) && !firing)
+    end
+end
+
+"""Wait for accepted tasks and scheduled firings to settle; return incomplete on timeout."""
+function wait_quiesced(control::FleetControl, channel_id::AbstractString; timeout_s::Real)
+    timeout_s >= 0 || throw(ArgumentError("timeout_s must be nonnegative"))
+    deadline = time() + timeout_s
+    while true
+        report = quiesce_report(control, channel_id)
+        (report.complete || time() >= deadline) && return report
+        sleep(min(0.01, max(0.0, deadline - time())))
+    end
+end
+
+# A retired primary refuses all routes; a retired source refuses that source alone.
+function admission_quiesced(state::MonitorState, channel_id::AbstractString=state.config.slack_channel_id)
+    control = state.control
+    control === nothing && return false
+    lock(control.lock) do
+        return haskey(control.quiesced, state.config.slack_channel_id) ||
+               haskey(control.quiesced, channel_id)
+    end
+end
+
+# Caller holds control.lock. A refusal can belong to both retired channels.
+function record_refusal!(control::FleetControl, state::MonitorState, origin::TaskOrigin)
+    refused = false
+    for ch in unique((state.config.slack_channel_id, origin.channel))
+        record = get(control.quiesced, ch, nothing)
+        record === nothing && continue
+        refused = true
+        # Timers stay pending or are skipped; only Slack messages need a refusal record.
+        origin.kind in (:message, :thread_reply, :listen) || continue
+        any(o -> o.kind == origin.kind && o.channel == origin.channel && o.ts == origin.ts,
+            record.refused) && continue
+        push!(record.refused, origin)
+        length(record.refused) > 1000 && popfirst!(record.refused)
+    end
+    return refused
+end
+
+function refuse_quiesced!(state::MonitorState, origin::TaskOrigin)
+    control = state.control
+    control === nothing && return false
+    lock(control.lock) do
+        return record_refusal!(control, state, origin)
+    end
+end
+
+"""Decide admission and register the spawned task without yielding under the fleet lock."""
+function spawn_task!(spawn::Function, state::MonitorState, origin::TaskOrigin;
+                     react_ts::String="", channel_id::String=origin.channel)
+    function register()
+        task = spawn()
+        push!(state.active_tasks, task)
+        state.task_origins[task] = origin
+        return true
+    end
+    control = state.control
+    admitted = if control === nothing
+        register()
+    else
+        lock(control.lock) do
+            record_refusal!(control, state, origin) && return false
+            return register()
+        end
+    end
+    if !admitted && !isempty(react_ts)
+        slack_reactions_remove(state.config, react_ts, "eyes"; channel_id)
+    end
+    return admitted
+end
+
+"""Prune finished tasks without losing a quiesce record's separate snapshot."""
+function prune_tasks!(state::MonitorState)
+    filter!(!istaskdone, state.active_tasks)
+    filter!(pair -> !istaskdone(first(pair)), state.task_origins)
+    return nothing
 end
 
 const SLACK_MAX_TEXT = 3900
@@ -213,21 +400,36 @@ end
 # is dispatched only by whichever path claims it first; redeliveries and
 # reconcile/socket overlap are dropped here.
 
-"""Claim a top-level message against the primary-channel cursor. Returns false if already seen."""
+# Caller holds dispatch_lock; always take control.lock second. The refusal
+# check and cursor update run together without yielding while both are held.
+function claim_if_admitted!(claim::Function, state::MonitorState, origin::TaskOrigin; refused=false)
+    control = state.control
+    control === nothing && return claim()
+    lock(control.lock) do
+        record_refusal!(control, state, origin) && return refused
+        return claim()
+    end
+end
+
+"""Claim a top-level message. Returns false if already seen or quiesced."""
 function claim_primary!(state::MonitorState, ts::AbstractString)
     lock(state.dispatch_lock) do
-        ts > state.last_ts || return false
-        state.last_ts = ts
-        return true
+        claim_if_admitted!(state, TaskOrigin(:message, state.config.slack_channel_id, ts)) do
+            ts > state.last_ts || return false
+            state.last_ts = ts
+            return true
+        end
     end
 end
 
 """Claim a thread reply against the session's reply cursor."""
 function claim_thread_reply!(state::MonitorState, session::ThreadSession, ts::AbstractString)
     lock(state.dispatch_lock) do
-        ts > session.last_reply_ts || return false
-        session.last_reply_ts = ts
-        return true
+        claim_if_admitted!(state, TaskOrigin(:thread_reply, session.channel_id, ts)) do
+            ts > session.last_reply_ts || return false
+            session.last_reply_ts = ts
+            return true
+        end
     end
 end
 
@@ -237,25 +439,58 @@ re-tracking it. Creates a fresh `ThreadSession` — empty Claude `session_id`,
 since the expired session's context is gone; the reply starts a new session in
 the same Slack thread — with `last_reply_ts = msg.ts`, so a redelivery of this
 message routes as `:thread_reply` and fails `claim_thread_reply!`. Returns the
-new session, or `nothing` when the thread is already tracked (another delivery
-won the race).
+new session, or `nothing` when quiesced or the thread is already tracked
+(another delivery won the race).
 """
 function claim_thread_revive!(state::MonitorState, msg::SlackMessage, channel_id::AbstractString)
     lock(state.dispatch_lock) do
-        haskey(state.threads, msg.thread_ts) && return nothing
-        session = ThreadSession(msg.thread_ts, "", msg.ts, time(), String(channel_id))
-        state.threads[msg.thread_ts] = session
-        return session
+        claim_if_admitted!(state, TaskOrigin(:thread_reply, channel_id, msg.ts); refused=nothing) do
+            haskey(state.threads, msg.thread_ts) && return nothing
+            session = ThreadSession(msg.thread_ts, "", msg.ts, time(), String(channel_id))
+            state.threads[msg.thread_ts] = session
+            return session
+        end
     end
 end
 
 """Claim a listen-channel message against that channel's cursor."""
 function claim_listen!(state::MonitorState, ch_id::AbstractString, ts::AbstractString)
     lock(state.dispatch_lock) do
-        ts > get(state.listen_last_ts, ch_id, "") || return false
-        state.listen_last_ts[ch_id] = ts
-        return true
+        claim_if_admitted!(state, TaskOrigin(:listen, ch_id, ts)) do
+            ts > get(state.listen_last_ts, ch_id, "") || return false
+            state.listen_last_ts[ch_id] = ts
+            return true
+        end
     end
+end
+
+"""Update Claude context while preserving a quiesced channel's reply cursor."""
+function update_thread_session!(state::MonitorState, thread_ts::String, session_id::String,
+                                channel_id::String)
+    function update(quiesced::Bool)
+        previous = get(state.threads, thread_ts, nothing)
+        last_reply_ts = if quiesced
+            # New threads start at their root so no later reply is skipped.
+            previous === nothing ? thread_ts : previous.last_reply_ts
+        else
+            slack_ts_now()
+        end
+        state.threads[thread_ts] = ThreadSession(
+            thread_ts, session_id, last_reply_ts, time(), channel_id)
+    end
+    control = state.control
+    if control === nothing
+        update(false)
+    else
+        # Match cursor claims: dispatch_lock first, then control.lock.
+        lock(state.dispatch_lock) do
+            lock(control.lock) do
+                update(haskey(control.quiesced, state.config.slack_channel_id) ||
+                       haskey(control.quiesced, channel_id))
+            end
+        end
+    end
+    return nothing
 end
 
 # --- Status file watching ---
@@ -381,7 +616,8 @@ drop anything the live socket already dispatched.
 """
 function reconcile_messages!(state::MonitorState)
     state.running || return
-    filter!(!istaskdone, state.active_tasks)
+    admission_quiesced(state) && return
+    prune_tasks!(state)
 
     n_threads = length(state.threads)
     n_sched = length(state.scheduled)
@@ -394,6 +630,7 @@ function reconcile_messages!(state::MonitorState)
     if !isempty(raw_msgs)
         parsed = parse_slack_messages(raw_msgs)
         for (msg, raw) in zip(parsed, raw_msgs)
+            refuse_quiesced!(state, TaskOrigin(:message, state.config.slack_channel_id, msg.ts)) && continue
             claim_primary!(state, msg.ts) || continue
             should_process(msg, state.config, raw) || continue
             dispatch_command!(state, msg)
@@ -412,11 +649,13 @@ end
 
 """Poll listen-only channels for new messages, dispatching responses to the primary channel."""
 function poll_listen_channels!(state::MonitorState)
+    admission_quiesced(state) && return
     config = state.config
     isempty(config.listen_channel_ids) && return
 
     for ch_id in config.listen_channel_ids
         state.running || break
+        admission_quiesced(state, ch_id) && continue
         ch_last_ts = get(state.listen_last_ts, ch_id, state.last_ts)
         try
             raw_msgs = slack_get_history(config, ch_last_ts; channel_id=ch_id)
@@ -425,12 +664,13 @@ function poll_listen_channels!(state::MonitorState)
             ch_name = get(state.channel_names, ch_id, ch_id)
             parsed = parse_slack_messages(raw_msgs)
             for (msg, raw) in zip(parsed, raw_msgs)
+                refuse_quiesced!(state, TaskOrigin(:listen, ch_id, msg.ts)) && continue
                 claim_listen!(state, ch_id, msg.ts) || continue
                 should_process(msg, config, raw) || continue
                 # Prefix message with sender + channel origin for Claude context
                 prefixed_msg = listen_attributed_message(msg, ch_name)
                 # Dispatch to primary channel (no reaction on listen channel -- we're read-only)
-                dispatch_listen_command!(state, prefixed_msg, ch_name)
+                dispatch_listen_command!(state, prefixed_msg, ch_name; channel_id=ch_id)
             end
             save_state!(state)
         catch e
@@ -445,9 +685,12 @@ If the following message is NOT relevant to your project, respond with exactly "
 If it IS relevant, respond normally.\n\n"""
 
 """Dispatch a message from a listen channel -- only post to primary channel if Claude deems it relevant."""
-function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_name::String)
+function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_name::String;
+                                  channel_id::String=ch_name)
+    origin = TaskOrigin(:listen, channel_id, msg.ts)
+    refuse_quiesced!(state, origin) && return nothing
     config = state.config
-    filter!(!istaskdone, state.active_tasks)
+    prune_tasks!(state)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
         @info "SlackClaw: skipping listen channel message (busy)" channel=ch_name
@@ -457,49 +700,51 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
     primary = config.slack_channel_id
 
     # Run Claude first to check relevance before posting anything
-    task = @async begin
-        try
-            relevance_prompt = LISTEN_RELEVANCE_PREFIX * msg.text
-            result = run_claude(relevance_prompt, config)
+    spawn_task!(state, origin) do
+        @async begin
+            try
+                relevance_prompt = LISTEN_RELEVANCE_PREFIX * msg.text
+                result = run_claude(relevance_prompt, config)
 
-            # Skip if Claude says not relevant, errored, or empty
-            response_text = strip(result.result_text)
-            if !result.success || isempty(response_text) || is_decline(response_text)
-                @info "SlackClaw: listen message skipped (not relevant)" channel=ch_name
-                return
+                # Skip if Claude says not relevant, errored, or empty
+                response_text = strip(result.result_text)
+                if !result.success || isempty(response_text) || is_decline(response_text)
+                    @info "SlackClaw: listen message skipped (not relevant)" channel=ch_name
+                    return
+                end
+
+                # Relevant — post header + response as a new thread in primary channel
+                header = "_Message from #$(ch_name):_\n> $(msg.text)"
+                thread_ts = slack_post_message(config, header; channel_id=primary)
+                post_response(config, response_text, thread_ts; channel_id=primary)
+
+                # Track the thread for follow-up replies
+                if !isempty(result.session_id)
+                    update_thread_session!(state, thread_ts, result.session_id, primary)
+                    save_state!(state)
+                end
+            catch e
+                @error "SlackClaw listen dispatch error" channel=ch_name exception=(e, catch_backtrace())
             end
-
-            # Relevant — post header + response as a new thread in primary channel
-            header = "_Message from #$(ch_name):_\n> $(msg.text)"
-            thread_ts = slack_post_message(config, header; channel_id=primary)
-            post_response(config, response_text, thread_ts; channel_id=primary)
-
-            # Track the thread for follow-up replies
-            if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
-            end
-        catch e
-            @error "SlackClaw listen dispatch error" channel=ch_name exception=(e, catch_backtrace())
         end
     end
-
-    push!(state.active_tasks, task)
     return nothing
 end
 
 # --- Thread polling ---
 
 function poll_threads!(state::MonitorState)
+    admission_quiesced(state) && return
     for (thread_ts, session) in state.threads
         state.running || break
+        admission_quiesced(state, session.channel_id) && continue
         try
             raw_replies = slack_get_replies(state.config, thread_ts, session.last_reply_ts;
                                            channel_id=session.channel_id)
             isempty(raw_replies) && continue
             parsed = parse_slack_messages(raw_replies)
             for (msg, raw) in zip(parsed, raw_replies)
+                refuse_quiesced!(state, TaskOrigin(:thread_reply, session.channel_id, msg.ts)) && continue
                 claim_thread_reply!(state, session, msg.ts) || continue
                 should_process(msg, state.config, raw) || continue
                 dispatch_thread_reply!(state, msg, session)
@@ -559,22 +804,80 @@ end
 # --- Scheduled tasks ---
 
 function check_scheduled!(state::MonitorState)
+    control = state.control
+    control === nothing || return check_controlled_scheduled!(state, control)
+    admission_quiesced(state) && return nothing
     now = time()
     due = filter(s -> s.due_at <= now, state.scheduled)
     filter!(s -> s.due_at > now, state.scheduled)
 
     for sched in due
-        @info "SlackClaw: firing scheduled task for thread $(sched.thread_ts)"
         ch = if haskey(state.threads, sched.thread_ts)
             state.threads[sched.thread_ts].channel_id
         else
             state.config.slack_channel_id
         end
+        origin = TaskOrigin(:scheduled, state.config.slack_channel_id, sched.thread_ts)
+        if refuse_quiesced!(state, origin)
+            push!(state.scheduled, sched)
+            continue
+        end
+        @info "SlackClaw: firing scheduled task for thread $(sched.thread_ts)"
         slack_post_message(state.config, "_Scheduled follow-up firing..._";
             thread_ts=sched.thread_ts, channel_id=ch)
-        run_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id;
-                        channel_id=ch)
+        admission = spawn_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id;
+                                      channel_id=ch, origin)
+        admission == :refused && push!(state.scheduled, sched)
     end
+end
+
+# Settle only this firing; another housekeeping call may have its own batch.
+function finish_scheduled_firing!(state::MonitorState, control::FleetControl,
+                                  sched::ScheduledTask; retry::Bool=false)
+    lock(control.lock) do
+        index = findfirst(s -> s === sched, state.inflight_scheduled)
+        index === nothing && return nothing
+        retry && push!(state.scheduled, sched)
+        deleteat!(state.inflight_scheduled, index)
+    end
+    return nothing
+end
+
+function check_controlled_scheduled!(state::MonitorState, control::FleetControl)
+    due = lock(control.lock) do
+        haskey(control.quiesced, state.config.slack_channel_id) && return ScheduledTask[]
+        now = time()
+        batch = filter(s -> s.due_at <= now, state.scheduled)
+        filter!(s -> s.due_at > now, state.scheduled)
+        append!(state.inflight_scheduled, batch)
+        return batch
+    end
+    try
+        for sched in due
+            ch = if haskey(state.threads, sched.thread_ts)
+                state.threads[sched.thread_ts].channel_id
+            else
+                state.config.slack_channel_id
+            end
+            origin = TaskOrigin(:scheduled, state.config.slack_channel_id, sched.thread_ts)
+            if refuse_quiesced!(state, origin)
+                finish_scheduled_firing!(state, control, sched; retry=true)
+                continue
+            end
+            @info "SlackClaw: firing scheduled task for thread $(sched.thread_ts)"
+            slack_post_message(state.config, "_Scheduled follow-up firing..._";
+                thread_ts=sched.thread_ts, channel_id=ch)
+            admission = spawn_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id;
+                                          channel_id=ch, origin)
+            finish_scheduled_firing!(state, control, sched; retry=admission == :refused)
+        end
+    finally
+        # A failed post must restore this firing and the rest of its due batch.
+        for sched in due
+            finish_scheduled_firing!(state, control, sched; retry=true)
+        end
+    end
+    return nothing
 end
 
 # --- Proactive mode ---
@@ -620,71 +923,76 @@ function check_proactive!(state::MonitorState)
     tasks_path = joinpath(config.repo_dir, PROACTIVE_TASKS_FILE)
     isempty(config.proactive_prompt) && !isfile(tasks_path) && return
 
+    origin = TaskOrigin(:proactive, config.slack_channel_id, "")
+    refuse_quiesced!(state, origin) && return nothing
     now = time()
     elapsed = now - state.last_proactive
     elapsed >= config.proactive_interval_s || return
 
-    filter!(!istaskdone, state.active_tasks)
+    prune_tasks!(state)
     if length(state.active_tasks) >= config.max_concurrent_tasks
         @info "SlackClaw: skipping proactive check (busy)"
         return
     end
 
-    state.last_proactive = now
-    save_state!(state)
-
     primary = config.slack_channel_id
     log_path = joinpath(config.repo_dir, PROACTIVE_LOG_FILE)
 
-    task = @async begin
-        try
-            prefix = replace(replace(PROACTIVE_PREFIX,
-                "%LOG_PATH%" => log_path),
-                "%TASKS_PATH%" => tasks_path)
-            prompt = prefix
-            !isempty(config.proactive_prompt) && (prompt *= config.proactive_prompt)
-            result = run_claude(prompt, config)
+    if state.control === nothing
+        state.last_proactive = now
+        save_state!(state)
+    end
+    spawn_task!(state, origin) do
+        state.last_proactive = now
+        @async begin
+            try
+                state.control === nothing || save_state!(state)
+                prefix = replace(replace(PROACTIVE_PREFIX,
+                    "%LOG_PATH%" => log_path),
+                    "%TASKS_PATH%" => tasks_path)
+                prompt = prefix
+                !isempty(config.proactive_prompt) && (prompt *= config.proactive_prompt)
+                result = run_claude(prompt, config)
 
-            response_text = strip(result.result_text)
-            if !result.success || isempty(response_text)
-                @info "SlackClaw: proactive check — nothing to report"
-                return
+                response_text = strip(result.result_text)
+                if !result.success || isempty(response_text)
+                    @info "SlackClaw: proactive check — nothing to report"
+                    return
+                end
+                if is_decline(response_text)
+                    # Narrated decline: suppress the post, but preserve any
+                    # reasoning around the token for the next cycle's dedup
+                    response_text != SKIP_TOKEN &&
+                        append_proactive_log(log_path, response_text; suppressed=true)
+                    @info "SlackClaw: proactive check — declined ($(SKIP_TOKEN))"
+                    return
+                end
+
+                # Post as new top-level message in primary channel
+                thread_ts = slack_post_message(config, response_text; channel_id=primary)
+
+                append_proactive_log(log_path, response_text)
+
+                # Track thread for follow-up replies
+                if !isempty(result.session_id)
+                    update_thread_session!(state, thread_ts, result.session_id, primary)
+                    save_state!(state)
+                end
+
+                @info "SlackClaw: proactive check posted to channel"
+            catch e
+                @error "SlackClaw proactive check error" exception=(e, catch_backtrace())
             end
-            if is_decline(response_text)
-                # Narrated decline: suppress the post, but preserve any
-                # reasoning around the token for the next cycle's dedup
-                response_text != SKIP_TOKEN &&
-                    append_proactive_log(log_path, response_text; suppressed=true)
-                @info "SlackClaw: proactive check — declined ($(SKIP_TOKEN))"
-                return
-            end
-
-            # Post as new top-level message in primary channel
-            thread_ts = slack_post_message(config, response_text; channel_id=primary)
-
-            append_proactive_log(log_path, response_text)
-
-            # Track thread for follow-up replies
-            if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
-            end
-
-            @info "SlackClaw: proactive check posted to channel"
-        catch e
-            @error "SlackClaw proactive check error" exception=(e, catch_backtrace())
         end
     end
-
-    push!(state.active_tasks, task)
     return nothing
 end
 
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
-    run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="", channel_id=state.config.slack_channel_id)
+    run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="", channel_id=state.config.slack_channel_id,
+                    origin=TaskOrigin(:message, channel_id, thread_ts))
 
 Run Claude in a loop, handling [CONTINUE] and [SCHEDULE] directives.
 Posts each response to the thread. Watches status file during execution.
@@ -694,124 +1002,135 @@ messages and arrive bare.
 """
 function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                          session_id::String; react_ts::String="",
-                         channel_id::String=state.config.slack_channel_id)
+                         channel_id::String=state.config.slack_channel_id,
+                         origin::TaskOrigin=TaskOrigin(:message, channel_id, thread_ts))
+    spawn_agent_loop!(state, thread_ts, prompt, session_id; react_ts, channel_id, origin)
+    return nothing
+end
+
+# Returns :admitted, :refused (quiesced), or :busy so only refused schedules retry.
+function spawn_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
+                           session_id::String; react_ts::String="",
+                           channel_id::String=state.config.slack_channel_id,
+                           origin::TaskOrigin=TaskOrigin(:message, channel_id, thread_ts))
     config = state.config
-    filter!(!istaskdone, state.active_tasks)
+    if refuse_quiesced!(state, origin)
+        !isempty(react_ts) && slack_reactions_remove(config, react_ts, "eyes"; channel_id)
+        return :refused
+    end
+    prune_tasks!(state)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config, "Busy — please wait."; thread_ts, channel_id)
-        return
+        return :busy
     end
 
-    state.busy_threads[thread_ts] = time()
+    admitted = spawn_task!(state, origin; react_ts, channel_id) do
+        state.busy_threads[thread_ts] = time()
+        @async begin
+            current_prompt = prompt
+            current_session = session_id
+            continue_count = 0
 
-    task = @async begin
-        current_prompt = prompt
-        current_session = session_id
-        continue_count = 0
+            try
+                while true
+                    # Start status file watcher
+                    stop_watcher = Ref(false)
+                    watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
-        try
-            while true
-                # Start status file watcher
-                stop_watcher = Ref(false)
-                watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
+                    # Run Claude (pass thread context for file upload support)
+                    result = run_claude(current_prompt, config;
+                        session_id=current_session,
+                        thread_ts=thread_ts,
+                        channel_id=channel_id)
 
-                # Run Claude (pass thread context for file upload support)
-                result = run_claude(current_prompt, config;
-                    session_id=current_session,
-                    thread_ts=thread_ts,
-                    channel_id=channel_id)
+                    # Stop watcher
+                    stop_watcher[] = true
 
-                # Stop watcher
-                stop_watcher[] = true
+                    # Update session tracking
+                    if !isempty(result.session_id)
+                        current_session = result.session_id
+                        update_thread_session!(state, thread_ts, current_session, channel_id)
+                        save_state!(state)
+                    end
 
-                # Update session tracking
-                if !isempty(result.session_id)
-                    current_session = result.session_id
-                    state.threads[thread_ts] = ThreadSession(
-                        thread_ts, current_session, slack_ts_now(), time(),
-                        channel_id)
-                    save_state!(state)
-                end
-
-                if !result.success
-                    post_response(config, result.result_text, thread_ts; channel_id)
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
-                    break
-                end
-
-                # Parse directives
-                directive, clean_text = if config.agent_directives
-                    parse_directives(result.result_text)
-                else
-                    (DIRECTIVE_DONE, result.result_text)
-                end
-
-                # Post the clean response (directive-only messages leave clean_text empty).
-                # The skip gate sits here, AFTER the session bookkeeping above — a skipped
-                # message must still update thread state so later replies keep continuity.
-                skipped = should_skip_response(clean_text, config.allow_skip)
-                if skipped
-                    @info "SlackClaw: primary message skipped by $(SKIP_TOKEN)" thread_ts channel_id
-                    # Eyes-as-intent: take back the dispatch-time "seen" mark —
-                    # lingering eyes would promise a reply that never comes;
-                    # their removal signals "saw it, deliberately staying out"
-                    !isempty(react_ts) && slack_reactions_remove(config, react_ts, "eyes"; channel_id)
-                elseif !isempty(strip(clean_text))
-                    post_response(config, clean_text, thread_ts; channel_id)
-                elseif directive.type == :done
-                    # Claude did work (tool use) but produced no text response
-                    post_response(config, "_Done — changes applied._", thread_ts; channel_id)
-                end
-
-                if directive.type == :continue
-                    continue_count += 1
-                    if continue_count >= config.max_continue
-                        slack_post_message(config,
-                            "_Reached max continue limit ($(config.max_continue)). Stopping._";
-                            thread_ts, channel_id)
+                    if !result.success
+                        post_response(config, result.result_text, thread_ts; channel_id)
+                        !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                         break
                     end
-                    @info "SlackClaw: [CONTINUE] #$continue_count in thread $thread_ts"
-                    current_prompt = directive.prompt
-                    # Loop continues immediately
 
-                elseif directive.type == :schedule
-                    due = time() + directive.delay_s
-                    push!(state.scheduled, ScheduledTask(
-                        thread_ts, current_session, directive.prompt, due))
-                    save_state!(state)
-                    mins = round(Int, directive.delay_s / 60)
-                    slack_post_message(config,
-                        "_Scheduled follow-up in $(mins)m._";
-                        thread_ts, channel_id)
-                    @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
-                    break
+                    # Parse directives
+                    directive, clean_text = if config.agent_directives
+                        parse_directives(result.result_text)
+                    else
+                        (DIRECTIVE_DONE, result.result_text)
+                    end
 
-                else  # :done
-                    # No checkmark on a deliberately skipped message — it would itself be noise
-                    !isempty(react_ts) && !skipped &&
-                        slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
-                    break
+                    # Post the clean response (directive-only messages leave clean_text empty).
+                    # The skip gate sits here, AFTER the session bookkeeping above — a skipped
+                    # message must still update thread state so later replies keep continuity.
+                    skipped = should_skip_response(clean_text, config.allow_skip)
+                    if skipped
+                        @info "SlackClaw: primary message skipped by $(SKIP_TOKEN)" thread_ts channel_id
+                        # Eyes-as-intent: take back the dispatch-time "seen" mark —
+                        # lingering eyes would promise a reply that never comes;
+                        # their removal signals "saw it, deliberately staying out"
+                        !isempty(react_ts) && slack_reactions_remove(config, react_ts, "eyes"; channel_id)
+                    elseif !isempty(strip(clean_text))
+                        post_response(config, clean_text, thread_ts; channel_id)
+                    elseif directive.type == :done
+                        # Claude did work (tool use) but produced no text response
+                        post_response(config, "_Done — changes applied._", thread_ts; channel_id)
+                    end
+
+                    if directive.type == :continue
+                        continue_count += 1
+                        if continue_count >= config.max_continue
+                            slack_post_message(config,
+                                "_Reached max continue limit ($(config.max_continue)). Stopping._";
+                                thread_ts, channel_id)
+                            break
+                        end
+                        @info "SlackClaw: [CONTINUE] #$continue_count in thread $thread_ts"
+                        current_prompt = directive.prompt
+                        # Loop continues immediately
+
+                    elseif directive.type == :schedule
+                        due = time() + directive.delay_s
+                        push!(state.scheduled, ScheduledTask(
+                            thread_ts, current_session, directive.prompt, due))
+                        save_state!(state)
+                        mins = round(Int, directive.delay_s / 60)
+                        slack_post_message(config,
+                            "_Scheduled follow-up in $(mins)m._";
+                            thread_ts, channel_id)
+                        @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
+                        break
+
+                    else  # :done
+                        # No checkmark on a deliberately skipped message — it would itself be noise
+                        !isempty(react_ts) && !skipped &&
+                            slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
+                        break
+                    end
                 end
+            catch e
+                @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
+                try
+                    err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
+                    slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts, channel_id)
+                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
+                catch; end
+            finally
+                delete!(state.busy_threads, thread_ts)
+                # Clean up status file
+                status_path = joinpath(config.repo_dir, config.status_file)
+                isfile(status_path) && rm(status_path; force=true)
             end
-        catch e
-            @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
-            try
-                err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
-                slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts, channel_id)
-                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
-            catch; end
-        finally
-            delete!(state.busy_threads, thread_ts)
-            # Clean up status file
-            status_path = joinpath(config.repo_dir, config.status_file)
-            isfile(status_path) && rm(status_path; force=true)
         end
     end
-
-    push!(state.active_tasks, task)
-    return nothing
+    return admitted ? :admitted : :refused
 end
 
 # --- Dispatch: top-level messages ---
@@ -819,6 +1138,8 @@ end
 function dispatch_command!(state::MonitorState, msg::SlackMessage;
                           channel_id::String=state.config.slack_channel_id)
     config = state.config
+
+    refuse_quiesced!(state, TaskOrigin(:message, channel_id, msg.ts)) && return nothing
 
     # Dynamic proactive frequency adjustment. Matched against the caption only:
     # a file named "proactive off.txt" must not toggle anything.
@@ -841,7 +1162,7 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
         return
     end
 
-    filter!(!istaskdone, state.active_tasks)
+    prune_tasks!(state)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config,
@@ -886,6 +1207,8 @@ thread_prompt(session::ThreadSession, msg::SlackMessage) =
 function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session::ThreadSession)
     config = state.config
     ch = session.channel_id
+    origin = TaskOrigin(:thread_reply, ch, msg.ts)
+    refuse_quiesced!(state, origin) && return nothing
 
     # If thread is busy, report elapsed time
     if haskey(state.busy_threads, session.thread_ts)
@@ -902,7 +1225,7 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
     # reply gets its eyes removed in the agent loop's skip branch
     slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
     run_agent_loop!(state, session.thread_ts, thread_prompt(session, msg),
-                    session.session_id; react_ts=msg.ts, channel_id=ch)
+                    session.session_id; react_ts=msg.ts, channel_id=ch, origin)
 end
 
 # --- Shutdown ---
@@ -921,6 +1244,7 @@ function stop_monitor!(state::MonitorState)
         try wait(t) catch; end
     end
     empty!(state.active_tasks)
+    empty!(state.task_origins)
     # Same gate as the startup banner: `run_monitor`'s `finally` reaches here on
     # crashes too, so an ungated notice spams the channel on every supervised
     # (systemd Restart=) crash-loop cycle exactly like the startup banner would.

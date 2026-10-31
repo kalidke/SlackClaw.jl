@@ -4,6 +4,20 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [Unreleased]
+
+### Added
+
+- **Fleet quiesce control.** `run_socket_fleet(configs; control=FleetControl())`
+  takes an optional handle. `quiesce!(control, channel)` stops new work for one
+  channel (direct messages, thread replies, its listen dispatch on other
+  members, scheduled and proactive runs) without closing the socket or touching
+  other channels. A quiesced channel's cursors never advance.
+  `quiesce_report` / `wait_quiesced` report the tasks accepted before quiescing
+  as completed, failed or running, plus refused messages and pending scheduled
+  tasks, so a cutover works from a completion record instead of a cursor.
+  Fleets without a control behave exactly as before.
+
 ## [0.7.3] — 2026-10-15
 
 Patch: a message with files and no text is dispatched, and its files are named
