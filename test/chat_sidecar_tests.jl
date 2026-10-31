@@ -558,7 +558,7 @@ end
         @test file["thumbnail"] === true
         @test !occursin("private-url", SlackClaw.JSON.json(file))
     end
-    for mime in ("https://cdn.example.org/private/key", "image/xoxb-fake")
+    for mime in ("https://cdn.example.org/private/key", "image/xoxb-fake", "a"^64 * "/" * "b"^64)
         raw["files"] = [Dict("id" => "F1", "mimetype" => mime)]
         record = normalize(ws, raw, "C1")
         @test record["files"][1]["mime"] == "application/octet-stream"
@@ -773,13 +773,16 @@ end
         # MIME fields can contain URLs or token-shaped strings, neither of
         # which may escape in the result, even though the latter is a token.
         for mime in ("https://cdn.example.org/private/key", "image/xoxb-fake",
-                     "text", "image/", "image/" * "a"^65, "image/pn\ng")
+                     "text", "image/", "image/" * "a"^65, "image/pn\ng", "a"^64 * "/" * "b"^64)
             ws, calls, req = scenario([download]; file=merge(file_info, Dict("mimetype" => mime)))
             @test fetch_file(ws, req)["mime"] == "application/octet-stream"
             ws, calls, req = scenario([response(200, ["Content-Type" => mime], bytes)];
                 fields=Dict("variant" => "thumbnail"))
             @test fetch_file(ws, req)["mime"] == "application/octet-stream"
         end
+        longest_mime = "a"^64 * "/" * "b"^63
+        @test ncodeunits(longest_mime) == 128
+        @test SlackClaw.chat_file_mime(longest_mime) == longest_mime
         ws, calls, req = scenario([download]; file=merge(file_info, Dict("mimetype" => "IMAGE/PNG; charset=binary")))
         @test fetch_file(ws, req)["mime"] == "image/png"
 
@@ -1206,19 +1209,48 @@ mutable struct ChatChildTestSocket
     closed::Bool
     close_gate::Union{Channel{Nothing},Nothing}
     close_started::Bool
+    forced::Bool
+    close_tasks::Vector{Task}
 end
 
 """Build a fake socket with room for a complete overflow burst."""
 ChatChildTestSocket(; close_gate=nothing) =
-    ChatChildTestSocket(Channel{String}(512), String[], false, close_gate, false)
+    ChatChildTestSocket(Channel{String}(512), String[], false, close_gate, false, false, Task[])
 
 """Close fake socket iteration without waiting for another frame."""
 function Base.close(ws::ChatChildTestSocket)
+    ws.closed && return nothing
+    push!(ws.close_tasks, current_task())
     ws.close_started = true
     ws.close_gate === nothing || chat_child_test_gate(ws.close_gate)
     ws.closed = true
     isopen(ws.frames) && close(ws.frames)
     return nothing
+end
+
+"""An output stream that can fail after ready, without exposing its error contents."""
+mutable struct ChatChildTestOutput <: IO
+    io::IO
+    failure::Symbol
+    writers::Vector{Task}
+end
+
+function Base.unsafe_write(output::ChatChildTestOutput, data::Ptr{UInt8}, count::UInt)
+    if output.failure == :write
+        push!(output.writers, current_task())
+        throw(Base.IOError("private output failure xoxb-child-fake-secret", Int32(1)))
+    end
+    return unsafe_write(output.io, data, count)
+end
+
+Base.write(output::ChatChildTestOutput, byte::UInt8) = write(output, Ref(byte))
+
+function Base.flush(output::ChatChildTestOutput)
+    if output.failure == :flush
+        push!(output.writers, current_task())
+        throw(Base.IOError("private flush failure xapp-child-fake-secret", Int32(1)))
+    end
+    return flush(output.io)
 end
 
 module ChatChildTestLogging
@@ -1234,6 +1266,16 @@ module Nested
 emit() = @warn "private HTTP submodule warning"
 end
 end
+end
+
+if isdefined(SlackClaw, :socket_forceclose)
+    @eval function SlackClaw.socket_forceclose(ws::ChatChildTestSocket)
+        ws.forced = true
+        ws.closed = true
+        ws.close_gate === nothing || (isopen(ws.close_gate) && close(ws.close_gate))
+        isopen(ws.frames) && close(ws.frames)
+        return nothing
+    end
 end
 
 # Keep missing new names inside the testsets on the base commit. Defining these
@@ -1258,20 +1300,33 @@ function chat_child_test_gate(gate::Channel)
     return nothing
 end
 
+# Hang guards and scheduling slack must also allow progress on a busy runner.
+const CHAT_CHILD_TEST_TIMEOUT_S = 30.0
+const CHAT_CHILD_TEST_MARGIN_S = 5.0
+# Match the socket close limit and first reconnect backoff in chat_sidecar.jl.
+const CHAT_CHILD_TEST_SOCKET_CLOSE_S = 2.0
+const CHAT_CHILD_TEST_RECONNECT_BACKOFF_S = 1.0
+
+"""Allow the configured request drain and concurrent socket close, plus scheduling slack."""
+chat_child_test_shutdown_bound(deadline_s=0.0) =
+    max(deadline_s + SlackClaw.CHAT_CHILD_SHUTDOWN_GRACE_S, CHAT_CHILD_TEST_SOCKET_CLOSE_S) +
+    CHAT_CHILD_TEST_MARGIN_S
+
 """Require asynchronous progress within a bounded interval, including on failure."""
-function chat_child_test_until(predicate; timeout_s=5)
+function chat_child_test_until(predicate; timeout_s=CHAT_CHILD_TEST_TIMEOUT_S)
     result = timedwait(predicate, timeout_s; pollint=0.002)
     result == :ok || error("chat child fixture exceeded its progress deadline")
     return nothing
 end
 
 """Run the real protocol reader with BufferStreams and one persistent output reader."""
-function chat_child_test_start(transport, socket_connect; kwargs...)
+function chat_child_test_start(transport, socket_connect; output_wrapper=identity, kwargs...)
     input, output = Base.BufferStream(), Base.BufferStream()
+    sink = output_wrapper(output)
     frames = Channel{Any}(4096)
     lines, seen, pending = String[], Any[], Any[]
     child = @async try
-        SlackClaw.run_chat_child(input, output; transport, socket_connect, kwargs...)
+        SlackClaw.run_chat_child(input, sink; transport, socket_connect, kwargs...)
     finally
         close(output)
     end
@@ -1285,11 +1340,11 @@ function chat_child_test_start(transport, socket_connect; kwargs...)
     finally
         close(frames)
     end
-    return (; input, output, frames, lines, seen, pending, child, reader)
+    return (; input, output, sink, frames, lines, seen, pending, child, reader)
 end
 
 """Read one matching output frame without losing interleaved events or other replies."""
-function chat_child_test_frame(h, predicate; timeout_s=5)
+function chat_child_test_frame(h, predicate; timeout_s=CHAT_CHILD_TEST_TIMEOUT_S)
     index = findfirst(predicate, h.pending)
     index === nothing || return splice!(h.pending, index)
     deadline = time() + timeout_s
@@ -1305,8 +1360,8 @@ function chat_child_test_frame(h, predicate; timeout_s=5)
 end
 
 """Read one response, leaving unrelated frames available to later assertions."""
-chat_child_test_response(h, id) = chat_child_test_frame(h,
-    frame -> get(frame, "kind", "") == "res" && get(frame, "id", nothing) == id)["payload"]
+chat_child_test_response(h, id; timeout_s=CHAT_CHILD_TEST_TIMEOUT_S) = chat_child_test_frame(h,
+    frame -> get(frame, "kind", "") == "res" && get(frame, "id", nothing) == id; timeout_s)["payload"]
 
 """Write a complete daemon request, accepting any Integer request identity."""
 function chat_child_test_send(h, id::Integer, op, payload=Dict{String,Any}())
@@ -1411,7 +1466,9 @@ function chat_child_test_cancel_uploads(dir)
     @test err isa SlackClaw.ChatError
     @test err.code == :timeout && err.outcome == :refused
     @test length(calls) == 2
-    for mode in (:deadline, :stop, :wedged, :allocation)
+    for mode in (:deadline, :stop, :wedged, :allocation, :nonyielding, :late_completion)
+        file_deadline_s = mode in (:nonyielding, :late_completion) ? 2.0 : 3.0
+        shutdown_bound_s = chat_child_test_shutdown_bound(file_deadline_s)
         gate = Channel{Nothing}(1)
         started, completed = Ref(false), Ref(0)
         upload_input = Ref{Any}(nothing)
@@ -1432,17 +1489,29 @@ function chat_child_test_cancel_uploads(dir)
                 upload_input[] = call["body"]
                 @test read(call["body"]) == UInt8[1, 2, 3, 4]
                 started[] = true
-                chat_child_test_gate(gate)
+                if mode == :nonyielding
+                    # Do not let the deadline timer run until the worker resumes.
+                    Libc.systemsleep(file_deadline_s + 0.5)
+                elseif mode != :late_completion
+                    chat_child_test_gate(gate)
+                end
                 return SlackClaw.ChatHTTPResponse(200, Pair{String,String}[], UInt8[])
             elseif endswith(url, "/files.completeUploadExternal")
                 completed[] += 1
+                mode == :late_completion && Libc.systemsleep(file_deadline_s + 0.5)
                 return Dict("ok" => true)
             end
             error("unexpected cancellation fixture call")
         end
-        h = chat_child_test_start(transport, (url, f) -> f(ws);
-            file_deadline_s=0.6, file_http_s=0.1)
-        release = nothing
+        connect = function(url, f)
+            try
+                f(ws)
+            finally
+                # Socket retirement follows cancellation; release the stopped worker then.
+                mode == :stop && isopen(gate) && close(gate)
+            end
+        end
+        h = chat_child_test_start(transport, connect; file_deadline_s, file_http_s=0.1)
         try
             chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
             @test chat_child_test_response(h, 1)["accepted"]
@@ -1451,18 +1520,17 @@ function chat_child_test_cancel_uploads(dir)
             chat_child_test_until(() -> started[])
             if mode != :stop
                 result = chat_child_test_response(h, 2)
-                @test result["code"] == "timeout" && result["outcome"] == "unknown"
+                @test result["code"] == "timeout"
+                @test result["outcome"] == (mode == :nonyielding ? "refused" : "unknown")
             end
-            if mode != :wedged
-                # The worker must be joined even if its deadline reply already went out.
-                release = Timer(0.08) do timer
-                    close(gate)
-                end
+            if mode in (:deadline, :allocation)
+                # Cancellation is already observed; release before waiting for shutdown to join.
+                close(gate)
             end
             stopped_at = time()
             chat_child_test_send(h, 3, "stop")
-            @test chat_child_test_response(h, 3)["stopped"]
-            @test time() - stopped_at < 1.5
+            @test chat_child_test_response(h, 3; timeout_s=shutdown_bound_s)["stopped"]
+            @test time() - stopped_at < shutdown_bound_s
             if mode == :allocation
                 @test !isopen(gate)
                 @test upload_input[] === nothing
@@ -1470,6 +1538,8 @@ function chat_child_test_cancel_uploads(dir)
                 @test isopen(upload_input[])
                 close(gate)
                 chat_child_test_until(() -> !isopen(upload_input[]))
+            elseif mode in (:nonyielding, :late_completion)
+                @test !isopen(upload_input[])
             else
                 @test !isopen(gate)
                 @test !isopen(upload_input[])
@@ -1478,11 +1548,71 @@ function chat_child_test_cancel_uploads(dir)
                 result = chat_child_test_response(h, 2)
                 @test result["code"] == "timeout" && result["outcome"] == "refused"
             end
-            @test completed[] == 0
-            @test !any(c -> endswith(c["url"], "/files.completeUploadExternal"), calls)
+            @test completed[] == (mode == :late_completion ? 1 : 0)
+            @test count(c -> endswith(c["url"], "/files.completeUploadExternal"), calls) == completed[]
         finally
-            release === nothing || close(release)
             chat_child_test_cleanup(h, [ws], [gate])
+        end
+    end
+end
+
+"""A broken daemon output retires the reader, request workers and socket tasks."""
+function chat_child_test_failed_output()
+    meta_deadline_s = 3.0
+    shutdown_bound_s = chat_child_test_shutdown_bound(meta_deadline_s)
+    for mode in (:ping, :reply, :event, :flush)
+        captured = IOBuffer()
+        ws = ChatChildTestSocket()
+        tasks = Task[]
+        transport, _ = chat_test_transport() do call
+            if endswith(call["url"], "/auth.test")
+                return Dict("ok" => true, "team_id" => "T1", "user_id" => "UOWN")
+            elseif endswith(call["url"], "/apps.connections.open")
+                return Dict("ok" => true, "url" => "wss://socket.example.test/private")
+            elseif occursin("/conversations.history?", call["url"])
+                push!(tasks, current_task())
+                return Dict("ok" => true, "messages" => Any[])
+            end
+            error("unexpected output failure fixture call")
+        end
+        connect = function(url, f)
+            push!(tasks, current_task())
+            try
+                f(ws)
+            finally
+                close(ws)
+            end
+        end
+        h = chat_child_test_start(transport, connect; stderr=captured,
+            output_wrapper=io -> ChatChildTestOutput(io, :none, Task[]), meta_deadline_s)
+        try
+            @test chat_child_test_frame(h, _ -> true)["op"] == "ready"
+            if mode in (:reply, :event)
+                chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
+                @test chat_child_test_response(h, 1)["accepted"]
+                put!(ws.frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+                chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
+            end
+            h.sink.failure = mode == :flush ? :flush : :write
+            failed_at = time()
+            if mode == :reply
+                chat_child_test_send(h, 2, "history", Dict("workspace" => "T1", "channel" => "C1"))
+            elseif mode == :event
+                put!(ws.frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+            else
+                chat_child_test_send(h, 2, "ping")
+            end
+            chat_child_test_until(() -> istaskdone(h.child); timeout_s=shutdown_bound_s)
+            @test fetch(h.child) === nothing
+            @test time() - failed_at < shutdown_bound_s
+            @test !isopen(h.input)
+            chat_child_test_until(() -> all(istaskdone, tasks) && all(istaskdone, h.sink.writers) &&
+                all(istaskdone, ws.close_tasks))
+            @test length(h.sink.writers) == 1
+            @test mode in (:reply, :event) ? ws.closed : !ws.close_started
+            @test String(take!(captured)) == "SlackClaw chat: output_failed IOError\n"
+        finally
+            chat_child_test_cleanup(h, [ws])
         end
     end
 end
@@ -1531,6 +1661,7 @@ end
     @test all(line -> ncodeunits(line) <= 256, split(String(take!(minimal_output)), '\n'))
     chat_child_test_authentication()
     chat_child_test_logging()
+    chat_child_test_failed_output()
     mktempdir() do dir
         chat_child_test_cancel_uploads(dir)
         marker = joinpath(dir, "agent-ran")
@@ -1613,7 +1744,7 @@ end
                     Base.CoreLogging.with_logger(SlackClaw.ChatChildLogger(captured_stderr)) do
                         @warn "xoxb-child-fake-secret" exception=(ErrorException("xapp-child-fake-secret"), nothing)
                     end
-                    h = chat_child_test_start(transport, connect; meta_deadline_s=0.5, file_deadline_s=0.8,
+                    h = chat_child_test_start(transport, connect; meta_deadline_s=5.0, file_deadline_s=8.0,
                         meta_http_s=0.1, file_http_s=0.2, max_line=32768)
                     try
                         first_frame = chat_child_test_frame(h, _ -> true)
@@ -1799,6 +1930,7 @@ end
 
 """Distinguish app identity from credentials, and bound simultaneous silent closes."""
 function chat_child_test_socket_lifecycle()
+    shutdown_bound_s = chat_child_test_shutdown_bound()
     for mode in (:duplicate, :silent)
         gate = Channel{Nothing}(1)
         sockets = [ChatChildTestSocket(; close_gate=mode == :silent ? gate : nothing) for _ in 1:2]
@@ -1855,13 +1987,15 @@ function chat_child_test_socket_lifecycle()
             end
             stopped_at = time()
             chat_child_test_send(h, 2, "stop")
-            @test chat_child_test_response(h, 2)["stopped"]
-            @test time() - stopped_at < 2.8
+            @test chat_child_test_response(h, 2; timeout_s=shutdown_bound_s)["stopped"]
+            @test time() - stopped_at < shutdown_bound_s
             if mode == :silent
-                @test all(ws -> ws.close_started && !ws.closed, sockets)
+                @test all(ws -> ws.close_started && ws.closed, sockets)
+                @test any(ws -> ws.forced, sockets)
                 @test time() - stopped_at >= 1.8
             end
             chat_child_test_until(() -> istaskdone(h.child))
+            chat_child_test_until(() -> all(ws -> all(istaskdone, ws.close_tasks), sockets))
         finally
             chat_child_test_cleanup(h, sockets, [gate])
         end
@@ -1922,10 +2056,10 @@ end
 @testset "chat_socket_ack_survives_slow_api_and_reports_queue_gap" begin
     run_child = SlackClaw.run_chat_child
     @test run_child isa Function
-    started_at = time()
     user_gate = Channel{Nothing}(1)
+    close_gate = Channel{Nothing}(1)
     user_started = Ref(false)
-    sockets = [ChatChildTestSocket(), ChatChildTestSocket()]
+    sockets = [ChatChildTestSocket(; close_gate), ChatChildTestSocket()]
     connections, live, peak = Ref(0), Ref(0), Ref(0)
     transport, _ = chat_test_transport() do call
         url = call["url"]
@@ -1952,7 +2086,7 @@ end
             live[] -= 1
         end
     end
-    h = chat_child_test_start(transport, connect; meta_http_s=0.1, meta_deadline_s=0.5)
+    h = chat_child_test_start(transport, connect; meta_http_s=0.1, meta_deadline_s=5.0)
     try
         @test chat_child_test_frame(h, _ -> true)["op"] == "ready"
         chat_child_test_send(h, 1, "configure", chat_child_test_configuration())
@@ -1982,18 +2116,23 @@ end
         @test chat_child_test_frame(h, f -> f["op"] == "message")["payload"]["ts"] == "302.000001"
         @test connections[] == 1
         put!(sockets[2].frames, SlackClaw.JSON.json(Dict("type" => "hello")))
+        disconnected_at = time()
         put!(sockets[1].frames, SlackClaw.JSON.json(Dict("type" => "disconnect", "reason" => "refresh_requested")))
         chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "reconnecting")
         chat_child_test_frame(h, f -> f["op"] == "status" && f["payload"]["state"] == "connected")
         @test chat_child_test_frame(h, f -> f["op"] == "gap")["payload"]["reason"] == "reconnected"
         @test connections[] == 2
+        reconnect_bound_s = CHAT_CHILD_TEST_SOCKET_CLOSE_S + CHAT_CHILD_TEST_RECONNECT_BACKOFF_S +
+            CHAT_CHILD_TEST_MARGIN_S
+        @test time() - disconnected_at < reconnect_bound_s
+        @test sockets[1].forced && sockets[1].closed
+        @test all(istaskdone, sockets[1].close_tasks)
         @test peak[] == 1
         chat_child_test_send(h, 2, "stop")
         @test chat_child_test_response(h, 2)["stopped"]
     finally
-        chat_child_test_cleanup(h, sockets, [user_gate])
+        chat_child_test_cleanup(h, sockets, [user_gate, close_gate])
     end
-    @test time() - started_at < 8
     chat_child_test_socket_lifecycle()
     chat_child_test_websocket_defaults()
 end

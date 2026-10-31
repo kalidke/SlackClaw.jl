@@ -9,6 +9,24 @@ socket_frames(ws) = ws
 """Send an acknowledgement; fake sockets may specialize this."""
 socket_send(ws, text) = HTTP.WebSockets.send(ws, text)
 
+"""Abort the transport without another WebSocket close handshake."""
+function socket_forceclose(ws::HTTP.WebSockets.WebSocket)
+    # Both versions' callback-form open must see a fully retired socket when
+    # our callback returns, or its finally block starts another unbounded close.
+    ws.readclosed = true
+    ws.writeclosed = true
+    if CHAT_HTTP_V2
+        try
+            ws.close_transport!()
+        finally
+            isopen(ws.readchannel) && close(ws.readchannel)
+        end
+    else
+        close(ws.io)
+    end
+    return nothing
+end
+
 """Write one bounded diagnostic using only a fixed event name and exception type."""
 function chat_child_log(event::Symbol, exception=nothing; io::IO=chat_child_log_io())
     detail = exception === nothing ? "" : " $(nameof(typeof(exception)))"
@@ -64,6 +82,7 @@ mutable struct ChatChildWorkspace
     capacity::Int
     overflowing::Bool
     socket::Any
+    close_task::Union{Task,Nothing}
     retry_timer::Union{Timer,Nothing}
     connections::Int
     authenticated::Bool
@@ -87,6 +106,7 @@ end
 
 """Child-owned admission and response state, shared only by cooperative tasks."""
 mutable struct ChatChild
+    input::IO
     output::IO
     write_lock::ReentrantLock
     options::NamedTuple
@@ -94,6 +114,7 @@ mutable struct ChatChild
     secrets::Vector{String}
     configured::Bool
     stopping::Bool
+    output_failed::Bool
     active::Int
     transfers::Int
     awaiting::Int
@@ -101,6 +122,9 @@ mutable struct ChatChild
     inflight::Set{Integer}
     requests::Vector{ChatChildRequest}
 end
+
+"""Unwind a failed frame write without retaining or displaying its contents."""
+struct ChatChildOutputError <: Exception end
 
 """Never display credentials, transports, output buffers or pending request data."""
 Base.show(io::IO, ::ChatChild) = print(io, "ChatChild([private])")
@@ -153,8 +177,18 @@ function chat_child_write(child::ChatChild, frame::AbstractDict)
         end
     end
     lock(child.write_lock) do
-        write(child.output, line, '\n')
-        flush(child.output)
+        child.output_failed && throw(ChatChildOutputError())
+        try
+            write(child.output, line, '\n')
+            flush(child.output)
+        catch e
+            child.output_failed = true
+            chat_child_begin_shutdown(child)
+            chat_child_log(:output_failed, e)
+            # Wake a protocol reader waiting for the daemon's next request.
+            close(child.input)
+            throw(ChatChildOutputError())
+        end
     end
     return nothing
 end
@@ -176,7 +210,7 @@ function chat_child_emit(child::ChatChild, op::String, payload)
     @async try
         chat_child_event(child, op, payload)
     catch e
-        chat_child_log(:event_output_failed, e)
+        child.output_failed || chat_child_log(:event_output_failed, e)
     end
     return nothing
 end
@@ -238,7 +272,7 @@ function chat_child_configure(child::ChatChild, payload::AbstractDict, transport
         length(unique(ws.channels)) == length(ws.channels) ||
             throw(ChatError(:bad_request, "duplicate channel"))
         workspaces[id] = ChatChildWorkspace(ws, Channel{AbstractDict}(child.options.queue_size),
-            child.options.queue_size, false, nothing, nothing, 0, false, nothing, false)
+            child.options.queue_size, false, nothing, nothing, nothing, 0, false, nothing, false)
         push!(apps, String(app))
         append!(secrets, (String(bot), String(app)))
     end
@@ -398,7 +432,7 @@ function chat_child_consumer(child::ChatChild, runtime::ChatChildWorkspace)
         try
             chat_child_message(child, runtime, event)
         catch e
-            chat_child_log(:message_failed, e)
+            child.output_failed || chat_child_log(:message_failed, e)
         end
     end
     return nothing
@@ -420,6 +454,29 @@ function chat_child_backoff(child::ChatChild, runtime::ChatChildWorkspace, delay
     return nothing
 end
 
+"""Share one bounded close between reconnect and shutdown, forcing silent peers off."""
+function chat_child_close_socket(runtime::ChatChildWorkspace)
+    runtime.socket === nothing && return nothing
+    if runtime.close_task === nothing
+        socket = runtime.socket
+        runtime.close_task = @async begin
+            closer = @async try
+                close(socket)
+            catch e
+                chat_child_log(:socket_close_failed, e)
+            end
+            if timedwait(() -> istaskdone(closer), 2.0; pollint=0.01) == :timed_out
+                try
+                    socket_forceclose(socket)
+                catch e
+                    chat_child_log(:socket_forceclose_failed, e)
+                end
+            end
+        end
+    end
+    return runtime.close_task
+end
+
 """Maintain exactly one connection at a time for a configured workspace app."""
 function chat_child_socket_loop(child::ChatChild, runtime::ChatChildWorkspace, socket_connect)
     backoff = 1.0
@@ -438,12 +495,18 @@ function chat_child_socket_loop(child::ChatChild, runtime::ChatChildWorkspace, s
             child.stopping && break
             socket_connect(url, ws -> begin
                 runtime.socket = ws
+                runtime.close_task = nothing
                 runtime.connections += 1
                 opened_at = time_ns()
-                child.stopping && return nothing
-                for raw in socket_frames(ws)
-                    child.stopping && break
-                    chat_child_socket_frame(child, runtime, ws, raw) == :ok || break
+                try
+                    child.stopping && return nothing
+                    for raw in socket_frames(ws)
+                        child.stopping && break
+                        chat_child_socket_frame(child, runtime, ws, raw) == :ok || break
+                    end
+                finally
+                    # Close before the connector's own synchronous finally runs.
+                    wait(chat_child_close_socket(runtime))
                 end
             end)
         catch e
@@ -481,15 +544,20 @@ function chat_child_socket_loop(child::ChatChild, runtime::ChatChildWorkspace, s
     return nothing
 end
 
-"""Claim a request's sole reply before yielding; stop waits for completed writes."""
+"""Claim one reply and always release its id, including after an output failure."""
 function chat_child_finish(child::ChatChild, request::ChatChildRequest, payload)
     request.replied && return nothing
     request.replied = true
     request.timer === nothing || close(request.timer)
+    if time() >= request.deadline_at
+        outcome = chat_child_mutation(request.op) ?
+            (get(payload, "outcome", "") == "refused" ? :refused : :unknown) : :none
+        payload = chat_error_payload(ChatError(:timeout, "request deadline exceeded", nothing, outcome))
+    end
     try
         chat_child_reply(child, request.id, request.op, payload)
-        delete!(child.inflight, request.id)
     finally
+        delete!(child.inflight, request.id)
         child.awaiting -= 1
         notify(child.settled)
     end
@@ -513,7 +581,7 @@ function chat_child_admit(child::ChatChild, id::Integer, op::String, payload::Ab
     !transfer || child.transfers < child.options.max_transfers ||
         throw(ChatError(:busy, "transfer capacity reached"))
     deadline = transfer ? child.options.file_deadline_s : child.options.meta_deadline_s
-    request = ChatChildRequest(id, op, false, false, nothing, nothing, time_ns() / 1e9 + deadline)
+    request = ChatChildRequest(id, op, false, false, nothing, nothing, time() + deadline)
     push!(child.inflight, id)
     push!(child.requests, request)
     child.active += 1
@@ -526,12 +594,12 @@ function chat_child_admit(child::ChatChild, id::Integer, op::String, payload::Ab
             chat_child_finish(child, request, chat_error_payload(ChatError(:timeout, "request deadline exceeded",
                 nothing, chat_outcome(chat_child_mutation(op), true))))
         catch e
-            chat_child_log(:deadline_output_failed, e)
+            child.output_failed || chat_child_log(:deadline_output_failed, e)
         end
     end
     request.worker = @async begin
         try
-            cancelled = () -> request.cancelled || child.stopping
+            cancelled = () -> request.cancelled || child.stopping || time() >= request.deadline_at
             cancelled() && throw(ChatError(:timeout, "request cancelled"))
             request_ws = chat_child_cancellable_workspace(ws, cancelled)
             result = op == "history" ? chat_history(request_ws, payload; timeout_s) :
@@ -548,7 +616,7 @@ function chat_child_admit(child::ChatChild, id::Integer, op::String, payload::Ab
             try
                 chat_child_finish(child, request, chat_error_payload(err))
             catch output_error
-                chat_child_log(:response_output_failed, output_error)
+                child.output_failed || chat_child_log(:response_output_failed, output_error)
             end
         finally
             # Timed-out workers still occupy admission until they actually finish.
@@ -561,38 +629,38 @@ function chat_child_admit(child::ChatChild, id::Integer, op::String, payload::Ab
     return nothing
 end
 
-"""Cancel workers, bound their drain by deadlines plus grace, and close sockets concurrently."""
-function chat_child_shutdown(child::ChatChild)
+"""Stop admission and start cancellation and socket retirement without waiting."""
+function chat_child_begin_shutdown(child::ChatChild)
     child.stopping = true
-    requests = copy(child.requests)
-    for request in requests
+    for request in child.requests
         request.cancelled = true
     end
-    close_tasks = Task[]
-    close_deadline = time_ns() / 1e9 + 2.0
     for runtime in values(child.workspaces)
         runtime.retry_timer === nothing || close(runtime.retry_timer)
         isopen(runtime.queue) && close(runtime.queue)
-        if runtime.socket !== nothing
-            socket = runtime.socket
-            push!(close_tasks, @async try
-                close(socket)
-            catch e
-                chat_child_log(:socket_close_failed, e)
-            end)
-        end
+        chat_child_close_socket(runtime)
     end
+    return nothing
+end
+
+# A cancelled worker needs time to observe cancellation and return.
+const CHAT_CHILD_SHUTDOWN_GRACE_S = 1.0
+
+"""Cancel workers, bound their drain by deadlines plus grace, and close sockets concurrently."""
+function chat_child_shutdown(child::ChatChild)
+    requests = copy(child.requests)
+    chat_child_begin_shutdown(child)
+    close_tasks = Task[runtime.close_task for runtime in values(child.workspaces)
+                       if runtime.close_task !== nothing]
     if !isempty(requests)
-        remaining = maximum(request.deadline_at for request in requests) + 0.25 - time_ns() / 1e9
+        remaining = maximum(request.deadline_at for request in requests) + CHAT_CHILD_SHUTDOWN_GRACE_S - time()
         drained = () -> all(request -> request.worker === nothing || istaskdone(request.worker), requests)
         if !drained() && timedwait(drained, max(0.0, remaining); pollint=0.01) == :timed_out
             chat_child_log(:workers_pending_retirement)
         end
     end
-    if !all(istaskdone, close_tasks)
-        remaining = max(0.0, close_deadline - time_ns() / 1e9)
-        timedwait(() -> all(istaskdone, close_tasks), remaining; pollint=0.01) == :timed_out &&
-            chat_child_log(:sockets_pending_retirement)
+    for task in close_tasks
+        wait(task)
     end
     while child.awaiting > 0
         wait(child.settled)
@@ -611,6 +679,7 @@ all Slack and socket work is separate from the protocol reader. API mutations ar
 submitted once, and a late result cannot replace a deadline's unknown outcome.
 A write blocks while the reader of `output` stops draining it. The daemon owns
 bounded retirement of a wedged child, including a stop reply blocked on output.
+If a write or flush throws, close `input` to wake the reader and shut down.
 """
 function run_chat_child(input::IO, output::IO; transport=http_transport,
                         socket_connect=default_socket_connect, meta_deadline_s=25, file_deadline_s=125,
@@ -628,13 +697,14 @@ function run_chat_child(input::IO, output::IO; transport=http_transport,
     return Base.CoreLogging.with_logger(ChatChildLogger(stderr)) do
         options = (; meta_deadline_s, file_deadline_s, meta_http_s, file_http_s,
                    max_inflight, max_transfers, queue_size, max_line)
-        child = ChatChild(output, ReentrantLock(), options, Dict{String,ChatChildWorkspace}(),
-                          String[], false, false, 0, 0, 0, Base.Condition(), Set{Integer}(), ChatChildRequest[])
+        child = ChatChild(input, output, ReentrantLock(), options, Dict{String,ChatChildWorkspace}(),
+                          String[], false, false, false, 0, 0, 0, Base.Condition(), Set{Integer}(), ChatChildRequest[])
         stop_id = nothing
         try
             chat_child_event(child, "ready", Dict("protocol" => 1))
-            while true
+            while !child.stopping
                 kind, bytes = chat_child_readline(input, max_line)
+                child.stopping && break
                 kind == :eof && break
                 if kind == :oversized
                     chat_child_log(:input_too_large)
@@ -687,6 +757,7 @@ function run_chat_child(input::IO, output::IO; transport=http_transport,
                         throw(ChatError(:bad_request, "unknown op"))
                     end
                 catch e
+                    child.output_failed && rethrow()
                     err = e isa ChatError ? e : ChatError(:io_error, "request failed: $(nameof(typeof(e)))")
                     if chat_child_mutation(op) && err.outcome == :none
                         err = ChatError(err.code, err.detail, err.retry_after_s, :refused)
@@ -694,10 +765,18 @@ function run_chat_child(input::IO, output::IO; transport=http_transport,
                     chat_child_reply(child, id, op, chat_error_payload(err))
                 end
             end
+        catch
+            child.output_failed || rethrow()
         finally
             chat_child_shutdown(child)
         end
-        stop_id === nothing || chat_child_reply(child, stop_id, "stop", Dict("stopped" => true))
+        if stop_id !== nothing && !child.output_failed
+            try
+                chat_child_reply(child, stop_id, "stop", Dict("stopped" => true))
+            catch
+                child.output_failed || rethrow()
+            end
+        end
         return nothing
     end
 end

@@ -441,7 +441,8 @@ end
 """Return a MIME token without parameters, refusing URLs and recognizable secrets."""
 function chat_file_mime(value::AbstractString)
     mime = lowercase(strip(first(split(value, ';'; limit=2))))
-    valid = occursin(r"\A[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\z", mime)
+    valid = ncodeunits(mime) <= 128 &&
+        occursin(r"\A[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\z", mime)
     secret = occursin(r"(?:xox[baprs]-|xapp-)", mime)
     return valid && !secret ? String(mime) : "application/octet-stream"
 end
