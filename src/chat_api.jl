@@ -1,5 +1,7 @@
 using Base64: base64encode, base64decode
 
+const CHAT_HTTP_V2 = pkgversion(HTTP).major >= 2
+
 """One chat transport response; streamed responses carry an empty body."""
 struct ChatHTTPResponse
     status::Int
@@ -11,15 +13,30 @@ end
     http_transport(method, url, headers; body=nothing, response_stream=nothing, timeout_s=20)
 
 Make one HTTP request, without redirects, status exceptions or retries. A supplied
-response stream owns the response bytes instead of the returned body. Fractional
-timeouts round up to whole seconds for HTTP.jl.
+response stream owns the response bytes instead of the returned body. HTTP.jl 1.x
+requires fractional timeouts to round up to whole seconds; 2.x accepts them directly.
 """
 function http_transport(method::String, url::String, headers::Vector{Pair{String,String}};
                         body=nothing, response_stream=nothing, timeout_s::Real=20)
-    # With retries off, reusing a connection the server closed fails and makes a post's outcome uncertain.
-    response = HTTP.request(method, url, headers, body === nothing ? UInt8[] : body;
-        response_stream, redirect=false, status_exception=false, retry=false, closeimmediately=true,
-        readtimeout=ceil(Int, timeout_s), connect_timeout=min(10, ceil(Int, timeout_s)), logerrors=false)
+    # With retries off, reusing a connection the server closed makes a post's outcome uncertain.
+    request_headers = headers
+    options = (redirect=false, status_exception=false, retry=false)
+    if CHAT_HTTP_V2
+        if !any(header -> lowercase(first(header)) == "connection", headers)
+            request_headers = [headers; "Connection" => "close"]
+        end
+        options = (; options..., connect_timeout=min(10, timeout_s),
+                   read_idle_timeout=timeout_s, protocol=:h1)
+    else
+        seconds = ceil(Int, timeout_s)
+        options = (; options..., readtimeout=seconds, connect_timeout=min(10, seconds),
+                   closeimmediately=true, logerrors=false)
+    end
+    if response_stream !== nothing
+        options = (; options..., response_stream)
+    end
+    response = HTTP.request(method, url, request_headers, body === nothing ? UInt8[] : body;
+                            options...)
     bytes = response_stream === nothing ? Vector{UInt8}(response.body) : UInt8[]
     return ChatHTTPResponse(Int(response.status),
         Pair{String,String}[String(k) => String(v) for (k, v) in response.headers], bytes)
@@ -76,13 +93,17 @@ chat_outcome(mutation::Bool, uncertain::Bool=false) = mutation ? (uncertain ? :u
 
 """Map exceptions by type only: HTTP exception text can contain credentials."""
 function chat_exception(e; mutation::Bool=false)
+    while isdefined(HTTP, :RequestError) && e isa HTTP.RequestError
+        e = e.error
+    end
     if e isa ChatError
         return mutation && e.outcome == :none ?
             ChatError(e.code, e.detail, e.retry_after_s, :refused) : e
     end
-    code = e isa HTTP.Exceptions.ConnectError ? :unavailable :
-           e isa HTTP.Exceptions.TimeoutError ? :timeout : :io_error
-    uncertain = !(e isa HTTP.Exceptions.ConnectError)
+    unavailable = e isa HTTP.ConnectError ||
+                  (isdefined(HTTP, :DNSError) && e isa HTTP.DNSError)
+    code = unavailable ? :unavailable : e isa HTTP.TimeoutError ? :timeout : :io_error
+    uncertain = !unavailable
     return ChatError(code, "Transport: $(nameof(typeof(e)))", nothing,
                      chat_outcome(mutation, uncertain))
 end

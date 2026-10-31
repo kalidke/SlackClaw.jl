@@ -245,19 +245,37 @@ end
 
 @testset "chat_rate_limits_return_and_unknown_mutations_are_not_retried" begin
     workspace = SlackClaw.ChatWorkspace
+    http_v2 = pkgversion(SlackClaw.HTTP).major >= 2
     # Exercise the real HTTP wrapper with fractional seconds and a local server.
-    server = SlackClaw.HTTP.serve!(_ -> SlackClaw.HTTP.Response(200, "local response"),
-        "127.0.0.1", 0; listenany=true, verbose=-1)
-    try
-        url = "http://127.0.0.1:$(SlackClaw.HTTP.Servers.port(server))/"
-        # The first request also warms the server before testing a subsecond value.
-        for timeout_s in (20.5, 0.25, 0.25)
-            response = SlackClaw.http_transport("GET", url, ["Connection" => "close"]; timeout_s)
+    @test_logs min_level=Base.CoreLogging.Warn begin
+        connections = String[]
+        server = SlackClaw.HTTP.serve!(request -> begin
+            push!(connections, SlackClaw.HTTP.header(request, "Connection", ""))
+            SlackClaw.HTTP.Response(200, "local response")
+        end, "127.0.0.1", 0; listenany=true, verbose=(http_v2 ? false : -1))
+        try
+            url = "http://127.0.0.1:$(SlackClaw.HTTP.port(server))/"
+            # The first request also warms the server before testing a subsecond value.
+            for (timeout_s, headers) in ((20.5, Pair{String,String}[]),
+                                         (0.25, ["Connection" => "close"]),
+                                         (0.25, ["cOnNeCtIoN" => "keep-alive"]))
+                original_headers = copy(headers)
+                response = SlackClaw.http_transport("GET", url, headers; timeout_s)
+                @test response.status == 200
+                @test String(response.body) == "local response"
+                @test headers == original_headers
+            end
+            @test connections == [http_v2 ? "close" : "", "close", "keep-alive"]
+
+            stream = IOBuffer()
+            response = SlackClaw.http_transport("GET", url, Pair{String,String}[];
+                                               response_stream=stream, timeout_s=20.5)
             @test response.status == 200
-            @test String(response.body) == "local response"
+            @test isempty(response.body)
+            @test String(take!(stream)) == "local response"
+        finally
+            close(server)
         end
-    finally
-        close(server)
     end
 
     token = "fake-chat-token-do-not-print"
@@ -284,11 +302,8 @@ end
 
     post = Dict{String,Any}("channel" => "C1", "thread_ts" => "1.0", "text" => "hello",
                             "author" => Dict("kind" => "person", "name" => "Keith"))
-    http_request = SlackClaw.HTTP.Request("POST", "/api/chat.postMessage", ["Authorization" => "Bearer $token"])
     errors = Any[
-        (SlackClaw.HTTP.Exceptions.TimeoutError(20), :timeout, :unknown),
-        (SlackClaw.HTTP.Exceptions.ConnectError("https://slack.com/$token", ErrorException(token)), :unavailable, :refused),
-        (SlackClaw.HTTP.Exceptions.RequestError(http_request, ErrorException(token)), :io_error, :unknown),
+        (SlackClaw.HTTP.ConnectError("https://slack.com/$token", ErrorException(token)), :unavailable, :refused),
         (Base.IOError(token, Int32(1)), :io_error, :unknown),
         (EOFError(), :io_error, :unknown),
         (ErrorException(token), :io_error, :unknown),
@@ -303,6 +318,27 @@ end
         (Dict("ok" => false, "error" => token * "\n" * app_token), :bad_request, :refused),
         (Dict("ok" => true), :io_error, :unknown),
         (rate_limit, :rate_limited, :refused)]
+    if http_v2
+        append!(errors, [
+            (SlackClaw.HTTP.TimeoutError("request", 20_000_000_000), :timeout, :unknown),
+            (SlackClaw.HTTP.TimeoutError("connect", 10_000_000_000), :timeout, :unknown),
+            (SlackClaw.HTTP.TimeoutError("tls_handshake", 10_000_000_000), :timeout, :unknown),
+            (SlackClaw.HTTP.DNSError(token, ErrorException(token)), :unavailable, :refused),
+            (SlackClaw.HTTP.ParseError(token), :io_error, :unknown),
+            (SlackClaw.HTTP.ProtocolError(token), :io_error, :unknown),
+            (SlackClaw.HTTP.TLSHandshakeError(ErrorException(token)), :io_error, :unknown),
+            (SlackClaw.HTTP.TLSTransportError(ErrorException(token)), :io_error, :unknown)])
+    else
+        push!(errors, (SlackClaw.HTTP.TimeoutError(20), :timeout, :unknown))
+    end
+    if isdefined(SlackClaw.HTTP, :RequestError)
+        http_request = SlackClaw.HTTP.Request("POST", "/api/chat.postMessage", ["Authorization" => "Bearer $token"])
+        append!(errors, [
+            (SlackClaw.HTTP.RequestError(http_request, ErrorException(token)), :io_error, :unknown),
+            (SlackClaw.HTTP.RequestError(http_request, SlackClaw.HTTP.TimeoutError(20)), :timeout, :unknown),
+            (SlackClaw.HTTP.RequestError(http_request,
+                SlackClaw.HTTP.ConnectError("https://slack.com/$token", ErrorException(token))), :unavailable, :refused)])
+    end
     logger = Test.TestLogger()
     for (answer, code, outcome) in errors
         fake, recorded = chat_test_script([answer])
