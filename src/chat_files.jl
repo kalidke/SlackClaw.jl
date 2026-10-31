@@ -85,6 +85,15 @@ function chat_file_status(status::Int, headers::AbstractVector)
     return ChatError(code, "File server HTTP $status", code == :rate_limited ? chat_retry_after(headers) : nothing)
 end
 
+"""Resolve file metadata once, including Slack Connect stubs, without exposing URLs."""
+function chat_file_info(ws::ChatWorkspace, file_id; timeout_s::Real=20)
+    id = chat_validate(file_id, "file_id")
+    data = chat_api(ws, "GET", "files.info"; query=Dict{String,Any}("file" => id), timeout_s)
+    file = get(data, "file", nothing)
+    file isa AbstractDict || throw(ChatError(:io_error, "Slack omitted file metadata"))
+    return file
+end
+
 """
     chat_fetch_file(ws, req::AbstractDict) -> Dict{String,Any}
 
@@ -95,7 +104,7 @@ path must not already be a file or symlink. This call does not defend against a
 party able to write in that directory, including ancestor symlinks or a file
 swapped in before cleanup.
 """
-function chat_fetch_file(ws::ChatWorkspace, req::AbstractDict)
+function chat_fetch_file(ws::ChatWorkspace, req::AbstractDict; timeout_s::Real=120)
     try
         channel = chat_validate(get(req, "channel", nothing), "channel")
         file_id = chat_validate(get(req, "file_id", nothing), "file_id")
@@ -109,9 +118,7 @@ function chat_fetch_file(ws::ChatWorkspace, req::AbstractDict)
             throw(ChatError(:bad_request, "Invalid max_bytes"))
         max_bytes = Int(max_bytes)
 
-        data = chat_api(ws, "GET", "files.info"; query=Dict{String,Any}("file" => file_id))
-        file = get(data, "file", nothing)
-        file isa AbstractDict || throw(ChatError(:io_error, "Slack omitted file metadata"))
+        file = chat_file_info(ws, file_id; timeout_s)
         chat_file_shared(file, channel) || throw(ChatError(:forbidden, "File is not shared in the channel"))
         if variant == "original"
             size = get(file, "size", nothing)
@@ -166,7 +173,7 @@ function chat_fetch_file(ws::ChatWorkspace, req::AbstractDict)
                     end
                 end
                 response = try
-                    ws.transport("GET", string(uri), headers; response_stream=select_sink, timeout_s=120)
+                    ws.transport("GET", string(uri), headers; response_stream=select_sink, timeout_s)
                 catch
                     sink !== nothing && sink.exceeded && throw(ChatError(:too_large, "File exceeds max_bytes"))
                     callback_error === nothing || throw(callback_error)
@@ -236,12 +243,14 @@ function chat_file_share_ts(data::AbstractDict, channel::String)
 end
 
 """
-    chat_upload_file(ws, req::AbstractDict) -> Dict{String,Any}
+    chat_upload_file(ws, req::AbstractDict; timeout_s=120, cancelled=() -> false) -> Dict{String,Any}
 
 Stream the source's original bytes without sharing until its identity, size and
 mtime/ctime have been checked again. Complete exactly once, preserving uncertainty.
+Check cooperative cancellation immediately before sharing the uploaded file.
 """
-function chat_upload_file(ws::ChatWorkspace, req::AbstractDict)
+function chat_upload_file(ws::ChatWorkspace, req::AbstractDict;
+                          timeout_s::Real=120, cancelled::Function=() -> false)
     completion_started = false
     try
         channel = chat_validate(get(req, "channel", nothing), "channel")
@@ -261,7 +270,7 @@ function chat_upload_file(ws::ChatWorkspace, req::AbstractDict)
         _, _, label = chat_author_label(get(req, "author", nothing))
 
         data = chat_api(ws, "GET", "files.getUploadURLExternal";
-            query=Dict{String,Any}("filename" => name, "length" => before.size))
+            query=Dict{String,Any}("filename" => name, "length" => before.size), timeout_s)
         file_id = get(data, "file_id", nothing)
         chat_valid_id(file_id) || throw(ChatError(:io_error, "Slack omitted a valid upload file ID"))
         upload_url = chat_file_url(get(data, "upload_url", nothing))
@@ -270,7 +279,7 @@ function chat_upload_file(ws::ChatWorkspace, req::AbstractDict)
             chat_file_unchanged(before, stat(input)) || throw(ChatError(:io_error, "source changed during upload"))
             response = ws.transport("POST", string(upload_url), Pair{String,String}[
                 "Content-Type" => "application/octet-stream", "Content-Length" => string(before.size)];
-                body=input, timeout_s=120)
+                body=input, timeout_s)
             200 <= response.status < 300 || throw(chat_file_status(response.status, response.headers))
             chat_file_unchanged(before, stat(input)) && chat_file_unchanged(before, stat(path)) ||
                 throw(ChatError(:io_error, "source changed during upload"))
@@ -280,8 +289,9 @@ function chat_upload_file(ws::ChatWorkspace, req::AbstractDict)
         body = Dict{String,Any}("files" => [Dict{String,Any}("id" => file_id, "title" => name)],
             "channel_id" => channel, "initial_comment" => comment === nothing ? label : "$label: $comment")
         thread_ts === nothing || (body["thread_ts"] = thread_ts)
+        cancelled() && throw(ChatError(:timeout, "upload cancelled before sharing", nothing, :refused))
         completion_started = true
-        data = chat_api(ws, "POST", "files.completeUploadExternal"; body, mutation=true)
+        data = chat_api(ws, "POST", "files.completeUploadExternal"; body, mutation=true, timeout_s)
         result = Dict{String,Any}("file_id" => String(file_id))
         ts = chat_file_share_ts(data, channel)
         ts === nothing || (result["ts"] = ts)

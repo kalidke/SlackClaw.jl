@@ -352,8 +352,8 @@ function chat_api(ws::ChatWorkspace, method, endpoint::AbstractString;
 end
 
 """Authenticate the bot and reject tokens belonging to another Slack workspace."""
-function chat_authenticate!(ws::ChatWorkspace)
-    data = chat_api(ws, "POST", "auth.test")
+function chat_authenticate!(ws::ChatWorkspace; timeout_s::Real=20)
+    data = chat_api(ws, "POST", "auth.test"; timeout_s)
     get(data, "team_id", nothing) == ws.id ||
         throw(ChatError(:unauthorized, "Slack workspace does not match"))
     user_id = chat_validate(get(data, "user_id", nothing), "bot user")
@@ -367,7 +367,7 @@ function chat_authenticate!(ws::ChatWorkspace)
 end
 
 """Resolve a member without locking during API work; typed failures stay uncached."""
-function resolve_name!(ws::ChatWorkspace, user_id::AbstractString)
+function resolve_name!(ws::ChatWorkspace, user_id::AbstractString; timeout_s::Real=20)
     isempty(user_id) && return "unknown"
     id = chat_validate(user_id, "user")
     cached = lock(ws.lock) do
@@ -375,7 +375,7 @@ function resolve_name!(ws::ChatWorkspace, user_id::AbstractString)
     end
     cached === nothing || return cached
     data = try
-        chat_api(ws, "GET", "users.info"; query=Dict{String,Any}("user" => id))
+        chat_api(ws, "GET", "users.info"; query=Dict{String,Any}("user" => id), timeout_s)
     catch e
         e isa ChatError || rethrow()
         return id
@@ -441,7 +441,8 @@ end
 """Return a MIME token without parameters, refusing URLs and recognizable secrets."""
 function chat_file_mime(value::AbstractString)
     mime = lowercase(strip(first(split(value, ';'; limit=2))))
-    valid = occursin(r"\A[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\z", mime)
+    valid = ncodeunits(mime) <= 128 &&
+        occursin(r"\A[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}\z", mime)
     secret = occursin(r"(?:xox[baprs]-|xapp-)", mime)
     return valid && !secret ? String(mime) : "application/octet-stream"
 end
@@ -482,7 +483,7 @@ Build the shared bounded record, retaining members and bots. Own-app identity is
 checked before attribution markers. Invalid channel, timestamp or author identity
 fields omit the record instead of failing a history page or shortening identities.
 """
-function normalize_message(ws::ChatWorkspace, raw::AbstractDict, channel::AbstractString)
+function normalize_message(ws::ChatWorkspace, raw::AbstractDict, channel::AbstractString; timeout_s::Real=20)
     ts = get(raw, "ts", nothing)
     chat_valid_ts(ts) && chat_valid_id(channel) || return nothing
     thread_ts = get(raw, "thread_ts", ts)
@@ -514,7 +515,7 @@ function normalize_message(ws::ChatWorkspace, raw::AbstractDict, channel::Abstra
         isempty(name) && profile isa AbstractDict && (name = chat_clean_field(get(profile, "name", ""), 160))
         isempty(name) && (name = "bot")
     elseif origin == "member"
-        name = resolve_name!(ws, author_id)
+        name = resolve_name!(ws, author_id; timeout_s)
     end
     files, files_omitted = chat_message_files(raw)
     count = get(raw, "reply_count", 0)
@@ -609,7 +610,7 @@ Continuations bind every query field, and any failed or incomplete call fails th
 entire request, even when Slack supplied some messages. A limited flag marks
 history withheld by the workspace plan without preventing pagination.
 """
-function chat_history(ws::ChatWorkspace, req::AbstractDict)
+function chat_history(ws::ChatWorkspace, req::AbstractDict; timeout_s::Real=20)
     query = chat_history_query(req)
     cursor = chat_decode_cursor(get(req, "cursor", ""), query)
     params = Dict{String,Any}("channel" => query["channel"], "limit" => query["limit"],
@@ -627,7 +628,7 @@ function chat_history(ws::ChatWorkspace, req::AbstractDict)
     else
         params["inclusive"] = false
     end
-    data = chat_api(ws, "GET", thread ? "conversations.replies" : "conversations.history"; query=params)
+    data = chat_api(ws, "GET", thread ? "conversations.replies" : "conversations.history"; query=params, timeout_s)
     metadata = get(data, "response_metadata", nothing)
     next_cursor = metadata isa AbstractDict ? get(metadata, "next_cursor", "") : ""
     next_cursor isa AbstractString || throw(ChatError(:incomplete_history, "Invalid Slack continuation"))
@@ -652,7 +653,7 @@ function chat_history(ws::ChatWorkspace, req::AbstractDict)
             continue
         end
         chat_inside_bounds(raw["ts"], query) || continue
-        message = normalize_message(ws, raw, query["channel"])
+        message = normalize_message(ws, raw, query["channel"]; timeout_s)
         if message === nothing
             omitted += 1
         else
@@ -687,7 +688,7 @@ Post once with recoverable person/row attribution in metadata and the workspace'
 chosen author form. Return a timestamp only after Slack acknowledges; every
 failure carries a definite refusal or an unknown outcome.
 """
-function chat_post(ws::ChatWorkspace, req::AbstractDict)
+function chat_post(ws::ChatWorkspace, req::AbstractDict; timeout_s::Real=20)
     try
         channel = chat_validate(get(req, "channel", nothing), "channel")
         thread_ts = get(req, "thread_ts", nothing)
@@ -702,7 +703,7 @@ function chat_post(ws::ChatWorkspace, req::AbstractDict)
                 "event_payload" => Dict{String,Any}("kind" => kind, "name" => name)))
         thread_ts === nothing || (body["thread_ts"] = thread_ts)
         ws.posting_form == :custom && (body["username"] = label)
-        data = chat_api(ws, "POST", "chat.postMessage"; body, mutation=true)
+        data = chat_api(ws, "POST", "chat.postMessage"; body, mutation=true, timeout_s)
         ts = get(data, "ts", nothing)
         chat_valid_ts(ts) || throw(ChatError(:io_error, "Slack omitted a valid post timestamp", nothing, :unknown))
         return Dict{String,Any}("ts" => String(ts))
