@@ -1109,4 +1109,601 @@ end
     claude_reply[] = "[SKIP]"
 end
 
+@testset "fleet_quiesce_stops_admission_and_reports_completed_tasks" begin
+    # Missing fleet-control names are resolved here, at runtime, on the base commit.
+    control = FleetControl()
+    blockers = Dict{String,Channel{Nothing}}()
+    reaction_blockers = Dict{String,Channel{Nothing}}()
+    post_blockers = Dict{String,Channel{Nothing}}()
+    post_failures = Set{String}()
+    paused_reactions = Set{String}()
+    paused_posts = Set{String}()
+    info_blockers = Dict{String,Channel{Nothing}}()
+    paused_infos = Set{String}()
+    history_blockers = Dict{String,Channel{Nothing}}()
+    paused_histories = Set{String}()
+    history_batches = Dict{String,Vector{Any}}()
+    calls = NamedTuple[]
+    replies = Dict{String,Vector{String}}()
+    history_calls = String[]
+    reply_calls = String[]
+    Core.eval(SlackClaw, quote
+        function run_claude(prompt::String, config::SlackClawConfig;
+                            session_id::String="", thread_ts::String="", channel_id::String="")
+            key = startswith(prompt, LISTEN_RELEVANCE_PREFIX) ? "listen:" * config.slack_channel_id :
+                  isempty(thread_ts) ? "proactive:" * config.slack_channel_id : thread_ts
+            push!($calls, (key=key, prompt=prompt))
+            gate = pop!($blockers, key, nothing)
+            gate === nothing || take!(gate)
+            responses = get($replies, key, String[])
+            text = isempty(responses) ? "done" : popfirst!(responses)
+            return ClaudeResult(true, text, 1, 0.0, "sess-fleet")
+        end
+        function slack_add_reaction(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
+                                    channel_id::AbstractString=config.slack_channel_id)
+            push!($reacted, String(emoji))
+            gate = emoji == "eyes" ? pop!($reaction_blockers, String(ts), nothing) : nothing
+            if gate !== nothing
+                push!($paused_reactions, String(ts))
+                take!(gate)
+            end
+            return nothing
+        end
+        function slack_post_message(config::SlackClawConfig, text::AbstractString;
+                                    thread_ts::AbstractString="",
+                                    channel_id::AbstractString=config.slack_channel_id)
+            push!($top_posted, String(text))
+            gate = text == "_Scheduled follow-up firing..._" ? pop!($post_blockers, String(thread_ts), nothing) : nothing
+            if gate !== nothing
+                push!($paused_posts, String(thread_ts))
+                take!(gate)
+            end
+            if text == "_Scheduled follow-up firing..._" && String(thread_ts) in $post_failures
+                error("fixture firing notice failure")
+            end
+            return "500.0"
+        end
+        function slack_get_history(config::SlackClawConfig, oldest::AbstractString;
+                                   channel_id::AbstractString=config.slack_channel_id)
+            push!($history_calls, channel_id)
+            gate = pop!($history_blockers, String(channel_id), nothing)
+            if gate !== nothing
+                push!($paused_histories, String(channel_id))
+                take!(gate)
+            end
+            return get($history_batches, String(channel_id), Any[])
+        end
+        function slack_get_replies(config::SlackClawConfig, thread_ts::AbstractString, oldest::AbstractString;
+                                   channel_id::AbstractString=config.slack_channel_id)
+            push!($reply_calls, channel_id)
+            return Any[]
+        end
+        function slack_conversations_info(config::SlackClawConfig, channel_id::AbstractString)
+            gate = pop!($info_blockers, String(channel_id), nothing)
+            if gate !== nothing
+                push!($paused_infos, String(channel_id))
+                take!(gate)
+            end
+            return Dict("name" => "friendly-name")
+        end
+    end)
+
+    cfg(ch; listen=String[], proactive=false) = SlackClawConfig(
+        slack_bot_token="fake", app_token="fake", slack_channel_id=ch,
+        bot_user_id="UBOT", repo_dir=mktempdir(), listen_channel_ids=listen,
+        proactive_enabled=proactive, proactive_prompt=proactive ? "check things" : "")
+    event(ch, ts; text="hi", thread="") = FakeJSONObject(
+        "type" => "message", "channel" => ch, "ts" => ts,
+        "user" => "U1", "text" => text, "thread_ts" => thread)
+    origin_tuple(o) = (o.kind, o.channel, o.ts)
+    origins(entries) = Set(origin_tuple(o) for o in entries)
+    started(n) = @test timedwait(() -> length(calls) >= n, 5.0) == :ok
+    function finish(state)
+        @test timedwait(() -> all(istaskdone, state.active_tasks), 5.0) == :ok
+        all(istaskdone, state.active_tasks) && foreach(wait, state.active_tasks)
+    end
+
+    a = mkstate(cfg("C_A"; listen=["C_X"], proactive=true))
+    b = mkstate(cfg("C_B"; listen=["C_A"]))
+    @test a.control === nothing
+    @test isempty(a.task_origins)
+    @test isempty(a.inflight_scheduled)
+    @test SlackClaw.attach!(control, a) === nothing
+    SlackClaw.attach!(control, b)
+    SlackClaw.attach!(control, a)
+    @test length(control.states) == 2
+    @test a.control === control
+    @test_throws ArgumentError SlackClaw.attach!(FleetControl(), a)
+    @test_throws ArgumentError quiesce!(control, "C_UNKNOWN")
+    @test_throws ArgumentError quiesce_report(control, "C_A")
+    @test !SlackClaw.is_quiesced(control, "C_A")
+
+    gate = Channel{Nothing}(1)
+    blockers["200.0"] = gate
+    SlackClaw.route_socket_event!(a, event("C_A", "200.0"))
+    started(1)
+    first_task = only(a.active_tasks)
+    @test !istaskdone(first_task)
+    @test quiesce!(control, "C_A") === nothing
+    @test quiesce!(control, "C_A") === nothing
+    @test SlackClaw.is_quiesced(control, "C_A")
+
+    session = SlackClaw.ThreadSession("250.0", "sid", "250.0", time(), "C_A")
+    a.threads[session.thread_ts] = session
+    due = SlackClaw.ScheduledTask("250.0", "sid", "later", time() - 1)
+    push!(a.scheduled, due)
+    before = (length(reacted), length(unreacted), length(posted), length(top_posted))
+    proactive_before = a.last_proactive
+    SlackClaw.route_socket_event!(a, event("C_A", "300.0"))
+    SlackClaw.route_socket_event!(a, event("C_A", "300.0"))
+    @test length(quiesce_report(control, "C_A").refused) == 1
+    SlackClaw.route_socket_event!(a, event("C_A", "301.0"; thread="250.0"))
+    SlackClaw.route_socket_event!(a, event("C_A", "302.0"; thread="150.0"))
+    for _ in 1:5
+        SlackClaw.check_scheduled!(a)
+        SlackClaw.check_proactive!(a)
+    end
+    SlackClaw.route_socket_event!(b, event("C_A", "303.0"))
+    SlackClaw.route_socket_event!(a, event("C_X", "304.0"))
+    SlackClaw.route_socket_event!(a, event("C_A", "305.0"; text="proactive off"))
+    SlackClaw.reconcile_messages!(a)
+    SlackClaw.poll_threads!(a)
+    SlackClaw.poll_listen_channels!(a)
+    SlackClaw.poll_listen_channels!(b)
+    @test isempty(history_calls)
+    @test isempty(reply_calls)
+    @test a.active_tasks == [first_task]
+    @test isempty(b.active_tasks)
+    @test length(calls) == 1
+    @test a.last_ts == "200.0"
+    @test session.last_reply_ts == "250.0"
+    @test !haskey(a.threads, "150.0")
+    @test isempty(a.listen_last_ts)
+    @test isempty(b.listen_last_ts)
+    @test a.scheduled == [due]
+    @test a.last_proactive == proactive_before
+    @test a.config.proactive_enabled
+    @test before == (length(reacted), length(unreacted), length(posted), length(top_posted))
+
+    # The other primary remains live, including its normal reconciliation fetch.
+    SlackClaw.route_socket_event!(b, event("C_B", "400.0"))
+    finish(b)
+    SlackClaw.reconcile_messages!(b)
+    @test history_calls == ["C_B"]
+    @test b.last_ts == "400.0"
+    report = quiesce_report(control, "C_A")
+    @test report.channel == "C_A"
+    @test origins(report.accepted) == Set([(:message, "C_A", "200.0")])
+    @test origins(report.running) == origins(report.accepted)
+    @test isempty(report.completed) && isempty(report.failed)
+    @test !report.complete
+    @test origins(report.pending_scheduled) == Set([(:scheduled, "C_A", "250.0")])
+    @test !any(o -> o.kind in (:scheduled, :proactive), report.refused)
+    @test (:thread_reply, "C_A", "301.0") in origins(report.refused)
+    @test (:listen, "C_A", "303.0") in origins(report.refused)
+    @test (:listen, "C_X", "304.0") in origins(report.refused)
+    @test !wait_quiesced(control, "C_A"; timeout_s=0.02).complete
+    @test_throws ArgumentError wait_quiesced(control, "C_A"; timeout_s=-1)
+    put!(gate, nothing)
+    report = wait_quiesced(control, "C_A"; timeout_s=10)
+    @test report.complete
+    @test isempty(report.running) && isempty(report.failed)
+    @test origins(report.completed) == Set([(:message, "C_A", "200.0")])
+    SlackClaw.prune_tasks!(a)
+    @test isempty(a.active_tasks) && isempty(a.task_origins)
+    @test origins(quiesce_report(control, "C_A").completed) == origins(report.completed)
+
+    # Reports are copies; refusals retain only the newest 1000 entries.
+    empty!(report.accepted)
+    for i in 1:1005
+        SlackClaw.route_socket_event!(a, event("C_A", "$(1000 + i).0"))
+    end
+    report = quiesce_report(control, "C_A")
+    @test length(report.accepted) == 1
+    @test length(report.refused) == 1000
+    @test first(report.refused).ts == "1006.0"
+    @test last(report.refused).ts == "2005.0"
+
+    # The old twelve-argument constructor still dispatches without a control.
+    plain = mkstate(cfg("C_PLAIN"))
+    SlackClaw.route_socket_event!(plain, event("C_PLAIN", "600.0"))
+    finish(plain)
+    @test plain.control === nothing
+    @test plain.last_ts == "600.0"
+    @test origins(values(plain.task_origins)) == Set([(:message, "C_PLAIN", "600.0")])
+
+    @testset "accepted replies preserve quiesced session cursors" begin
+        for mode in (:plain, :live, :primary, :session, :same)
+            ctl = FleetControl()
+            primary = "C_CURSOR_PRIMARY"
+            ch = mode == :same ? primary : "C_CURSOR_THREAD"
+            state = mkstate(cfg(primary; listen=ch == primary ? String[] : [ch]))
+            mode == :plain || SlackClaw.attach!(ctl, state)
+            session = SlackClaw.ThreadSession("780.0", "sid", "780.0", time(), ch)
+            state.threads[session.thread_ts] = session
+            release = Channel{Nothing}(1)
+            blockers[session.thread_ts] = release
+            n_calls = length(calls)
+            SlackClaw.route_socket_event!(state, event(ch, "781.0"; thread=session.thread_ts))
+            started(n_calls + 1)
+            running = only(state.active_tasks)
+            cursor_before = state.threads[session.thread_ts].last_reply_ts
+            @test cursor_before == "781.0"
+            retired = mode in (:primary, :session, :same)
+            retired_channel = mode == :primary ? primary : ch
+            retired && quiesce!(ctl, retired_channel)
+
+            # The later reply and its redelivery must leave one refusal after quiesce.
+            for _ in 1:2
+                SlackClaw.route_socket_event!(state, event(ch, "782.0"; thread=session.thread_ts))
+            end
+            @test state.active_tasks == [running]
+            @test length(calls) == n_calls + 1
+            @test state.threads[session.thread_ts].last_reply_ts ==
+                  (retired ? cursor_before : "782.0")
+            put!(release, nothing)
+            finish(state)
+            updated = state.threads[session.thread_ts]
+            @test updated.session_id == "sess-fleet"
+            if retired
+                @test updated.last_reply_ts == cursor_before
+                r = quiesce_report(ctl, retired_channel)
+                @test r.complete
+                @test origins(r.completed) == Set([(:thread_reply, ch, "781.0")])
+                @test length(r.refused) == 1
+                @test origins(r.refused) == Set([(:thread_reply, ch, "782.0")])
+            else
+                @test parse(Float64, updated.last_reply_ts) > 782.0
+            end
+        end
+    end
+
+    @testset "accepted tasks track threads conservatively after quiesce" begin
+        for kind in (:message, :listen, :proactive), existing in (false, true), retired in (false, true)
+            ctl = FleetControl()
+            primary, source = "C_NEW_SESSION", "C_NEW_SOURCE"
+            state = mkstate(cfg(primary; listen=[source], proactive=kind == :proactive))
+            SlackClaw.attach!(ctl, state)
+            thread_ts = kind == :message ? "790.0" : "500.0"
+            previous_cursor = kind == :message ? "791.0" : "501.0"
+            if existing
+                state.threads[thread_ts] = SlackClaw.ThreadSession(
+                    thread_ts, "sid", previous_cursor, time(), primary)
+            end
+            key = kind == :message ? thread_ts :
+                  (kind == :listen ? "listen:" : "proactive:") * primary
+            release = Channel{Nothing}(1)
+            blockers[key] = release
+            n_calls = length(calls)
+            if kind == :message
+                SlackClaw.route_socket_event!(state, event(primary, thread_ts))
+            elseif kind == :listen
+                SlackClaw.route_socket_event!(state, event(source, "790.0"))
+            else
+                SlackClaw.check_proactive!(state)
+            end
+            started(n_calls + 1)
+            primary_cursor = state.last_ts
+            listen_cursors = copy(state.listen_last_ts)
+            retired && quiesce!(ctl, primary)
+            put!(release, nothing)
+            finish(state)
+            updated = state.threads[thread_ts]
+            @test updated.session_id == "sess-fleet"
+            @test state.last_ts == primary_cursor
+            @test state.listen_last_ts == listen_cursors
+            if retired
+                @test updated.last_reply_ts == (existing ? previous_cursor : thread_ts)
+                @test quiesce_report(ctl, primary).complete
+            else
+                @test parse(Float64, updated.last_reply_ts) > parse(Float64, previous_cursor)
+            end
+        end
+    end
+
+    @testset "busy scheduled tasks fire once with or without control" begin
+        for controlled in (false, true)
+            state = mkstate(cfg(controlled ? "C_BUSY_CONTROLLED" : "C_BUSY_PLAIN"))
+            state.config.max_concurrent_tasks = 1
+            controlled && SlackClaw.attach!(FleetControl(), state)
+            release = Channel{Nothing}(1)
+            blockers["680.0"] = release
+            n_calls = length(calls)
+            @test SlackClaw.spawn_agent_loop!(state, "680.0", "working", "") == :admitted
+            started(n_calls + 1)
+            running = only(state.active_tasks)
+            push!(state.scheduled, SlackClaw.ScheduledTask("690.0", "sid", "later", time() - 1))
+            empty!(top_posted)
+            for _ in 1:2
+                SlackClaw.check_scheduled!(state)
+            end
+            @test top_posted == ["_Scheduled follow-up firing..._", "Busy — please wait."]
+            @test isempty(state.scheduled)
+            @test isempty(state.inflight_scheduled)
+            @test state.active_tasks == [running]
+            @test length(calls) == n_calls + 1
+            put!(release, nothing)
+            finish(state)
+        end
+    end
+
+    @testset "quiesce while cursor claims wait preserves cursors" begin
+        for route in (:primary, :thread_reply, :thread_revive, :listen)
+            ctl = FleetControl()
+            state = mkstate(cfg("C_CLAIM"; listen=["C_CLAIM_SOURCE"]))
+            SlackClaw.attach!(ctl, state)
+            session = SlackClaw.ThreadSession("740.0", "sid", "740.0", time(), "C_CLAIM")
+            state.threads[session.thread_ts] = session
+            ch = route == :listen ? "C_CLAIM_SOURCE" : "C_CLAIM"
+            thread = route == :thread_reply ? "740.0" : route == :thread_revive ? "730.0" : ""
+            kind = route in (:thread_reply, :thread_revive) ? :thread_reply :
+                   route == :listen ? :listen : :message
+            n_calls = length(calls)
+            entered = Ref(false)
+            lock(state.dispatch_lock)
+            dispatch = @async begin
+                entered[] = true
+                SlackClaw.route_socket_event!(state, event(ch, "750.0"; thread))
+            end
+            try
+                # The route passes its early gate, then yields waiting for our lock.
+                @test timedwait(() -> entered[], 5.0) == :ok
+                @test !istaskdone(dispatch)
+                quiesce!(ctl, ch)
+            finally
+                unlock(state.dispatch_lock)
+            end
+            @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+            istaskdone(dispatch) && wait(dispatch)
+            @test state.last_ts == "100.0"
+            @test session.last_reply_ts == "740.0"
+            @test !haskey(state.threads, "730.0")
+            @test isempty(state.listen_last_ts)
+            @test isempty(state.active_tasks) && isempty(state.task_origins)
+            @test length(calls) == n_calls
+            # A redelivery still leaves exactly one refusal for this message.
+            SlackClaw.route_socket_event!(state, event(ch, "750.0"; thread))
+            r = quiesce_report(ctl, ch)
+            @test r.complete && isempty(r.accepted)
+            @test length(r.refused) == 1
+            @test origins(r.refused) == Set([(kind, ch, "750.0")])
+        end
+    end
+
+    @testset "scheduled firings stay visible until settled" begin
+        ctl = FleetControl()
+        state = mkstate(cfg("C_SCHED_FLIGHT"))
+        SlackClaw.attach!(ctl, state)
+        due = [SlackClaw.ScheduledTask(ts, "sid", "later", time() - 1)
+               for ts in ("760.0", "761.0")]
+        append!(state.scheduled, due)
+        release = Channel{Nothing}(1)
+        post_blockers[first(due).thread_ts] = release
+        n_calls = length(calls)
+        dispatch = @async SlackClaw.check_scheduled!(state)
+        @test timedwait(() -> first(due).thread_ts in paused_posts, 5.0) == :ok
+        @test isempty(state.scheduled)
+        @test state.inflight_scheduled == due
+        quiesce!(ctl, "C_SCHED_FLIGHT")
+        r = quiesce_report(ctl, "C_SCHED_FLIGHT")
+        expected = Set([(:scheduled, "C_SCHED_FLIGHT", sched.thread_ts) for sched in due])
+        @test origins(r.pending_scheduled) == expected
+        @test length(r.pending_scheduled) == 2
+        @test !r.complete && isempty(r.accepted) && isempty(r.running)
+        @test !wait_quiesced(ctl, "C_SCHED_FLIGHT"; timeout_s=0.02).complete
+        put!(release, nothing)
+        r = wait_quiesced(ctl, "C_SCHED_FLIGHT"; timeout_s=10)
+        @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+        istaskdone(dispatch) && wait(dispatch)
+        @test r.complete
+        @test origins(r.pending_scheduled) == expected
+        @test isempty(r.refused)
+        @test state.scheduled == due
+        @test isempty(state.inflight_scheduled)
+        @test isempty(state.active_tasks) && isempty(state.task_origins)
+        @test length(calls) == n_calls
+
+        # A failed firing notice restores both the current and unprocessed tasks.
+        ctl = FleetControl()
+        state = mkstate(cfg("C_SCHED_THROW"))
+        SlackClaw.attach!(ctl, state)
+        due = [SlackClaw.ScheduledTask(ts, "sid", "later", time() - 1)
+               for ts in ("770.0", "771.0")]
+        append!(state.scheduled, due)
+        push!(post_failures, first(due).thread_ts)
+        n_calls = length(calls)
+        @test_throws ErrorException SlackClaw.check_scheduled!(state)
+        delete!(post_failures, first(due).thread_ts)
+        @test state.scheduled == due
+        @test isempty(state.inflight_scheduled)
+        @test isempty(state.active_tasks) && isempty(state.task_origins)
+        @test length(calls) == n_calls
+        quiesce!(ctl, "C_SCHED_THROW")
+        r = quiesce_report(ctl, "C_SCHED_THROW")
+        @test r.complete
+        @test origins(r.pending_scheduled) ==
+              Set([(:scheduled, "C_SCHED_THROW", sched.thread_ts) for sched in due])
+    end
+
+    @testset "quiesce during dispatch-time HTTP" begin
+        # Both primary and reply paths can yield while adding their eyes reaction.
+        for reply in (false, true)
+            ctl = FleetControl()
+            state = mkstate(cfg("C_RACE"))
+            SlackClaw.attach!(ctl, state)
+            state.threads["650.0"] = SlackClaw.ThreadSession("650.0", "sid", "650.0", time(), "C_RACE")
+            ts = reply ? "701.0" : "700.0"
+            release = Channel{Nothing}(1)
+            reaction_blockers[ts] = release
+            n_calls = length(calls)
+            empty!(unreacted)
+            dispatch = @async SlackClaw.route_socket_event!(state,
+                event("C_RACE", ts; thread=reply ? "650.0" : ""))
+            @test timedwait(() -> ts in paused_reactions, 5.0) == :ok
+            quiesce!(ctl, "C_RACE")
+            put!(release, nothing)
+            @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+            istaskdone(dispatch) && wait(dispatch)
+            @test isempty(state.active_tasks) && isempty(state.task_origins)
+            @test isempty(state.busy_threads)
+            @test length(calls) == n_calls
+            @test unreacted == ["eyes"]
+            r = quiesce_report(ctl, "C_RACE")
+            @test r.complete && isempty(r.accepted)
+            kind = reply ? :thread_reply : :message
+            @test origins(r.refused) == Set([(kind, "C_RACE", ts)])
+        end
+
+        # A due scheduled task also stays pending if its announcement yields.
+        ctl = FleetControl()
+        state = mkstate(cfg("C_SCHED_RACE"))
+        SlackClaw.attach!(ctl, state)
+        sched = SlackClaw.ScheduledTask("710.0", "sid", "later", time() - 1)
+        push!(state.scheduled, sched)
+        release = Channel{Nothing}(1)
+        post_blockers[sched.thread_ts] = release
+        dispatch = @async SlackClaw.check_scheduled!(state)
+        @test timedwait(() -> sched.thread_ts in paused_posts, 5.0) == :ok
+        quiesce!(ctl, "C_SCHED_RACE")
+        put!(release, nothing)
+        @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+        istaskdone(dispatch) && wait(dispatch)
+        @test state.scheduled == [sched]
+        @test isempty(state.active_tasks)
+        r = quiesce_report(ctl, "C_SCHED_RACE")
+        @test r.complete && isempty(r.accepted)
+        @test origins(r.pending_scheduled) == Set([(:scheduled, "C_SCHED_RACE", "710.0")])
+        @test isempty(r.refused)
+
+        # A listener can yield resolving a display name after its cursor claim.
+        ctl = FleetControl()
+        source = mkstate(cfg("C_LSOURCE"))
+        listener = mkstate(cfg("C_LISTENER"; listen=["C_LSOURCE"]))
+        SlackClaw.attach!(ctl, source)
+        SlackClaw.attach!(ctl, listener)
+        release = Channel{Nothing}(1)
+        info_blockers["C_LSOURCE"] = release
+        n_calls = length(calls)
+        dispatch = @async SlackClaw.route_socket_event!(listener, event("C_LSOURCE", "720.0"))
+        @test timedwait(() -> "C_LSOURCE" in paused_infos, 5.0) == :ok
+        quiesce!(ctl, "C_LSOURCE")
+        put!(release, nothing)
+        @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+        istaskdone(dispatch) && wait(dispatch)
+        @test isempty(listener.active_tasks)
+        @test length(calls) == n_calls
+        r = quiesce_report(ctl, "C_LSOURCE")
+        @test r.complete && isempty(r.accepted)
+        @test origins(r.refused) == Set([(:listen, "C_LSOURCE", "720.0")])
+    end
+
+    @testset "quiesce during history fetch preserves cursors" begin
+        for listen in (false, true)
+            ctl = FleetControl()
+            ch = listen ? "C_HISTORY_LISTEN" : "C_HISTORY_PRIMARY"
+            state = mkstate(cfg(listen ? "C_HISTORY_OBSERVER" : ch;
+                                listen=listen ? [ch] : String[]))
+            SlackClaw.attach!(ctl, state)
+            release = Channel{Nothing}(1)
+            history_blockers[ch] = release
+            history_batches[ch] = Any[event(ch, "730.0")]
+            n_calls = length(calls)
+            dispatch = @async begin
+                if listen
+                    SlackClaw.poll_listen_channels!(state)
+                else
+                    SlackClaw.reconcile_messages!(state)
+                end
+            end
+            @test timedwait(() -> ch in paused_histories, 5.0) == :ok
+            quiesce!(ctl, ch)
+            SlackClaw.route_socket_event!(state, event(ch, "730.0"))
+            put!(release, nothing)
+            @test timedwait(() -> istaskdone(dispatch), 5.0) == :ok
+            istaskdone(dispatch) && wait(dispatch)
+            @test state.last_ts == "100.0"
+            @test isempty(state.listen_last_ts)
+            @test isempty(state.active_tasks)
+            @test length(calls) == n_calls
+            r = quiesce_report(ctl, ch)
+            @test length(r.refused) == 1
+            kind = listen ? :listen : :message
+            @test origins(r.refused) == Set([(kind, ch, "730.0")])
+        end
+    end
+
+    @testset "snapshot every task origin and retain directive schedules" begin
+        ctl = FleetControl()
+        x = mkstate(cfg("C_ORIG_A"; listen=["C_OTHER"], proactive=true))
+        y = mkstate(cfg("C_ORIG_B"; listen=["C_ORIG_A"]))
+        SlackClaw.attach!(ctl, x)
+        SlackClaw.attach!(ctl, y)
+        keys = ["800.0", "810.0", "820.0", "proactive:C_ORIG_A",
+                "listen:C_ORIG_A", "listen:C_ORIG_B", "830.0"]
+        releases = [Channel{Nothing}(1) for _ in keys]
+        for (key, release) in zip(keys, releases)
+            blockers[key] = release
+        end
+        replies["800.0"] = ["working [CONTINUE: final step]", "done [SCHEDULE: 1m: later]"]
+        n_calls = length(calls)
+        SlackClaw.route_socket_event!(x, event("C_ORIG_A", "800.0"))
+        session = SlackClaw.ThreadSession("810.0", "sid", "810.0", time(), "C_ORIG_A")
+        x.threads[session.thread_ts] = session
+        SlackClaw.dispatch_thread_reply!(x, SlackMessage("811.0", "U1", "reply", "810.0"), session)
+        push!(x.scheduled, SlackClaw.ScheduledTask("820.0", "sid", "scheduled", time() - 1))
+        SlackClaw.check_scheduled!(x)
+        SlackClaw.check_proactive!(x)
+        SlackClaw.dispatch_listen_command!(x, SlackMessage("840.0", "U1", "foreign", ""),
+                                          "other"; channel_id="C_OTHER")
+        SlackClaw.dispatch_listen_command!(y, SlackMessage("850.0", "U1", "source", ""),
+                                          "source"; channel_id="C_ORIG_A")
+        SlackClaw.run_agent_loop!(y, "830.0", "unrelated", "")
+        started(n_calls + 7)
+        quiesce!(ctl, "C_ORIG_A")
+        r = quiesce_report(ctl, "C_ORIG_A")
+        expected = Set([(:message, "C_ORIG_A", "800.0"),
+                        (:thread_reply, "C_ORIG_A", "811.0"),
+                        (:scheduled, "C_ORIG_A", "820.0"),
+                        (:proactive, "C_ORIG_A", ""),
+                        (:listen, "C_OTHER", "840.0"),
+                        (:listen, "C_ORIG_A", "850.0")])
+        @test origins(r.accepted) == expected
+        @test origins(r.running) == expected
+        @test !r.complete
+        for release in releases
+            put!(release, nothing)
+        end
+        r = wait_quiesced(ctl, "C_ORIG_A"; timeout_s=10)
+        finish(y)
+        @test r.complete && isempty(r.failed)
+        @test origins(r.completed) == expected
+        @test any(call -> call.key == "800.0" && call.prompt == "final step", calls)
+        @test origins(r.pending_scheduled) == Set([(:scheduled, "C_ORIG_A", "800.0")])
+        only(x.scheduled).due_at = time() - 1
+        n_calls = length(calls)
+        SlackClaw.check_scheduled!(x)
+        @test length(x.scheduled) == 1
+        @test length(calls) == n_calls
+    end
+
+    @testset "failed accepted tasks remain visible" begin
+        ctl = FleetControl()
+        state = mkstate(cfg("C_FAIL"))
+        SlackClaw.attach!(ctl, state)
+        release = Channel{Nothing}(1)
+        task = @async begin
+            take!(release)
+            error("fixture task failure")
+        end
+        push!(state.active_tasks, task)
+        state.task_origins[task] = SlackClaw.TaskOrigin(:message, "C_FAIL", "900.0")
+        quiesce!(ctl, "C_FAIL")
+        put!(release, nothing)
+        r = wait_quiesced(ctl, "C_FAIL"; timeout_s=10)
+        @test r.complete && isempty(r.running) && isempty(r.completed)
+        @test origins(r.failed) == Set([(:message, "C_FAIL", "900.0")])
+        @test_throws TaskFailedException wait(task)
+    end
+end
+
 end
