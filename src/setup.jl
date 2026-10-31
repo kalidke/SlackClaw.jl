@@ -77,6 +77,48 @@ function generate_manifest(; app_name::AbstractString="SlackClaw",
 end
 
 """
+    generate_chat_manifest(; app_name="Ship of Tools", customize=true) -> String
+
+Build the YAML manifest for a dedicated chat app, with channel message events
+and Socket Mode enabled. Set `customize=false` for prefix attribution without
+`chat:write.customize`. Create one app per workspace; never share it with a
+running monitor or fleet. This helper does not install the app or read tokens.
+"""
+function generate_chat_manifest(; app_name::AbstractString="Ship of Tools", customize::Bool=true)
+    scopes = ["channels:read", "channels:history", "groups:read", "groups:history",
+              "chat:write", "files:read", "files:write", "users:read"]
+    customize && push!(scopes, "chat:write.customize")
+    lines = String[
+        "display_information:",
+        "  name: $app_name",
+        "  description: Project chat through Ship of Tools.",
+        "features:",
+        "  bot_user:",
+        "    display_name: $app_name",
+        "    always_online: true",
+        "oauth_config:",
+        "  scopes:",
+        "    bot:",
+    ]
+    for scope in scopes
+        push!(lines, "      - $scope")
+    end
+    append!(lines, [
+        "settings:",
+        "  event_subscriptions:",
+        "    bot_events:",
+        "      - message.channels",
+        "      - message.groups",
+        "  interactivity:",
+        "    is_enabled: false",
+        "  org_deploy_enabled: false",
+        "  socket_mode_enabled: true",
+        "  token_rotation_enabled: false",
+    ])
+    return join(lines, "\n") * "\n"
+end
+
+"""
     print_setup_instructions([io]; app_name="SlackClaw", manifest_path="")
 
 Print the manifest and the grouped human-only browser steps. Every step here is

@@ -23,7 +23,7 @@ Tests cover pure logic (directive parsing, message filtering, Claude output pars
 
 ## Required Environment
 
-All three are required — run `SlackClaw.setup()` to provision the app and tokens:
+Monitor and fleet mode require all three — run `SlackClaw.setup()` to provision the app and tokens. Chat-child credentials arrive through `configure` on stdin:
 
 - `SLACK_BOT_TOKEN` — Bot token. Manifest scopes: `channels:history`, `channels:read`, `channels:join`, `groups:history`, `groups:read`, `im:history`, `chat:write`, `reactions:write`, `files:write`
 - `SLACK_CHANNEL_ID` — Target channel to monitor
@@ -31,16 +31,19 @@ All three are required — run `SlackClaw.setup()` to provision the app and toke
 
 ## Architecture
 
-Eight source files, all included from `SlackClaw.jl`:
+Eleven source files, all included from `SlackClaw.jl`:
 
 - **config.jl** — `SlackClawConfig` kwdef struct with all settings (poll interval, model, budget, timeouts, directive toggles)
 - **message_types.jl** — `SlackMessage` struct; `parse_slack_messages()` and `should_process()` filtering (skips bots, self, messages with neither text nor files); `message_text()` builds the text both socket and reconcile paths use, so one payload gives one text: the caption, then one `[attached file: …]` line per file. A Slack Connect socket event can carry only a file id, so its note can read `unnamed file`
 - **directives.jl** — Agent control flow: `parse_directives()` extracts `[CONTINUE]`/`[SCHEDULE: duration: prompt]`/done from response text via regex
 - **slack_api.jl** — HTTP wrappers for Slack Web API with rate-limit retry (exponential backoff). All channel-scoped functions accept an explicit `channel_id` kwarg (defaults to `config.slack_channel_id`). `slack_reactions_remove` swallows ALL errors (un-reacts are always benign and run inside the agent loop)
+- **chat_api.jl** — Separate, unexported chat client: sanitized typed errors, query-bound history cursors, bounded message records, names and recoverable person/row attribution; API mutations are submitted once
+- **chat_files.jl** — Bounded private downloads into exclusive destinations and streamed external uploads; authorization follows only Slack download hosts, changed sources refuse sharing
+- **chat_sidecar.jl** — Supervised JSON-lines child (`run_chat_child`, `chat_child_main`): configure on stdin, independent socket acknowledgements, bounded admission, deadlines and explicit gaps; no monitor or agent work
 - **claude_runner.jl** — `run_claude()` spawns `claude --print --output-format json --permission-mode <config.permission_mode>` subprocess (default `auto`, the permission classifier; `bypassPermissions` remains reachable per channel via config); returns `ClaudeResult` (success, text, cost, session_id). Strips all `CLAUDE_*` env vars from subprocess environment to prevent session leakage. Appends `DIRECTIVE_INSTRUCTIONS` to system prompt when `agent_directives` is enabled. A non-zero exit's reason comes from `exit_failure_message`: the stdout result text first, then a labelled stderr tail.
-- **monitor.jl** — Core agent loop, dispatch, and reconciliation. Contains `MonitorState`, `ThreadSession`, `ScheduledTask`, persistence via `.slackclaw_state.json`. `ThreadSession` carries `channel_id` for multi-channel thread tracking. `reconcile_messages!` is the full message-fetch pass (primary history + threads + listen channels); `claim_*!` cursor gates make dispatch idempotent. `post_response` chunks long text across multiple thread messages (`chunk_text`)
+- **monitor.jl** — Core agent loop, dispatch, and reconciliation. Contains `MonitorState`, `ThreadSession`, `ScheduledTask`, persistence via `.slackclaw_state.json`. `ThreadSession` carries `channel_id` for multi-channel thread tracking. `reconcile_messages!` is the full message-fetch pass (primary history + threads + listen channels); `claim_*!` cursor gates make dispatch idempotent. `post_response` chunks long text across multiple thread messages (`chunk_text`). The optional `FleetControl` gates admission per channel and reports the state of tasks accepted before `quiesce!`
 - **socket_mode.jl** — Socket Mode (push) event loop: `socket_loop!` connects via `apps.connections.open` (app-level token), acks envelopes immediately, and routes events through `classify_socket_event` into the dispatch paths. `socket_housekeeping!` fires scheduled/proactive checks and the periodic reconciliation poll
-- **setup.jl** — Setup assistant. `generate_manifest()` builds the Slack app manifest (scopes + events + Socket Mode); `verify_setup()` validates tokens, resolves/joins the channel, runs a live socket self-test, writes `slackclaw.env`; `setup()` is the interactive wizard. Groups the human-only browser steps so there's no back-and-forth
+- **setup.jl** — Setup assistant. `generate_manifest()` builds the monitor app manifest (scopes + events + Socket Mode); `generate_chat_manifest()` builds the separate dedicated chat app manifest; `verify_setup()` validates tokens, resolves/joins the channel, runs a live socket self-test, writes `slackclaw.env`; `setup()` is the interactive wizard. Groups the human-only browser steps so there's no back-and-forth
 
 ### Data Flow
 
@@ -67,6 +70,24 @@ Caveat for multi-instance setups: all channels of one Slack app arrive on one so
 ### Socket Fleet (full-workspace push)
 
 `run_socket_fleet(configs::Vector{SlackClawConfig})` serves MANY channels over ONE socket — the correct shape for a whole workspace on push. Each config gets its own `MonitorState` (threads, persistence, proactive, budgets — semantics identical to a single-channel monitor); the FIFO consumer offers every event to every state and non-matching states ignore it via `classify_socket_event`. Per-state housekeeping tasks are start-staggered (7s apart) to spread reconcile load. `validate_fleet` enforces: same bot+app token across the fleet, unique primary channels, and unique `(repo_dir, state_file)` pairs — channels sharing a `repo_dir` must override `config.state_file` or startup errors (state files are last-writer-wins). `socket_loop!` (single channel) is just a fleet of one.
+
+### Chat child
+
+The child is a transport for a supervising daemon, separate from monitor dispatch. Keep these constraints when changing it:
+
+- Ack Socket Mode envelopes before queueing; acknowledgements must not wait for API work or protocol output. A full queue reports a gap for daemon reconciliation.
+- Every admitted request has one reply owner, including its deadline race. Clients must use fresh IDs: a duplicate pending ID is rejected separately and the original still replies. Late results never add a second reply.
+- An unknown mutation is never retried or switched to another posting form. API rate limits return promptly; socket reconnects have a separate backoff.
+- Tokens enter only through `configure` on private stdin, never argv, row environments or output/logs. Do not read daemon secret files from a session. `ready` is not Slack connectivity, and successful configure is not authentication.
+- Parsed JSON is `AbstractDict`, never assumed to be `Dict`; support JSON.jl 0.21 and 1.
+- The chat HTTP transport supports HTTP.jl 1.x and 2.x through `CHAT_HTTP_V2`. Preserve both streaming paths and test on both HTTP versions, including redirects, response discard and uploads.
+- No agent, directive, `MonitorState`, proactive work or daemon cache policy belongs in the child. The supervisor owns retirement if output or a transport wedges.
+
+See `docs/src/chat-child.md` for the protocol, bounds, file-directory ownership and mutation outcomes. `generate_chat_manifest` stays unexported, like `generate_manifest`. Each workspace uses a dedicated chat app, never an app shared with a running fleet.
+
+### Fleet control
+
+`run_socket_fleet(configs; control=nothing)` preserves the default path. Passing a `FleetControl()` attaches the fleet's states; `quiesce!` blocks the retired primary's direct/thread/scheduled/proactive paths and the retired source in other states' listen paths. It does not stop the socket or delete pending schedules. `quiesce_report` and `wait_quiesced` classify the unfinished tasks snapshotted at admission cutoff; `complete` can coexist with failed tasks or pending schedules, and normal task completion does not prove a successful Slack response. The caller must check actual outcomes and persist primary/listen route removal across restarts. See `docs/src/socket-mode.md` for the retirement procedure.
 
 ### Concurrency
 

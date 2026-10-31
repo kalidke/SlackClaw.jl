@@ -8,6 +8,11 @@ Notable changes to SlackClaw.jl. Format follows
 
 ### Added
 
+- **Dedicated chat app manifest.** `SlackClaw.generate_chat_manifest()` returns
+  the channel, file and user scopes, message events and Socket Mode settings for
+  one chat app per workspace. Customized-author permission is optional.
+- **Chat documentation.** Protocol, API and dedicated-app setup references cover
+  attribution, history bounds, transfers, lifecycle and fleet retirement.
 - **Supervised chat child.** A separate stdio mode serves bounded JSON frames,
   channel history, posts and file transfers without starting agent work. It
   acknowledges Socket Mode events independently of API work and protocol output,

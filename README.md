@@ -83,6 +83,37 @@ Message events (delivered over the socket): `message.channels`, `message.groups`
 
 Two tokens are involved: the **bot** token (`xoxb-`) does all Slack Web API work (reading history, posting, reactions, uploads); the **app-level** token (`xapp-`) only authorizes the Socket Mode websocket connection.
 
+### Dedicated chat apps
+
+For Ship of Tools chat, create **one dedicated app per workspace** from
+`SlackClaw.generate_chat_manifest()`; never share it with a running monitor or
+fleet. Use `customize=false` for prefix attribution without `chat:write.customize`.
+The manifest enables Socket Mode, channel history/read, chat/file write, file
+read and user read scopes, with `message.channels` and `message.groups` events.
+Install the app for its `xoxb-…` bot token, create an `xapp-…` app token with
+`connections:write`, and invite the app to every mapped public or private channel.
+The daemon supplies both tokens only through `configure` on the child's private
+stdin; keep them out of argv and row environments. See the
+[dedicated chat setup](docs/src/setup.md#dedicated-chat-apps) for the full
+manifest, credentials and live verification steps.
+
+## Chat child (Ship of Tools)
+
+`chat_child_main()` serves a supervised JSON-lines interface for channel/thread
+history, attributed posts, file transfers and Socket Mode events. It runs no
+agent or directives and creates no `MonitorState`. The daemon owns mapping,
+mail delivery, recovery and child retirement. See the
+[protocol reference](docs/src/chat-child.md) for payloads, bounds and mutation
+outcomes.
+
+## Retiring a channel (fleet quiesce)
+
+Pass a `FleetControl()` as `run_socket_fleet(configs; control)`, then use
+`quiesce!`, `quiesce_report` and `wait_quiesced` to stop a channel's new admission
+and inspect already accepted tasks while other channels continue. Task completion
+alone does not prove a successful Slack response. The launcher must persist route
+removal before cutover. See [fleet retirement](docs/src/socket-mode.md#retiring-a-channel-fleet-quiesce).
+
 ## Environment Variables
 
 `SlackClaw.setup()` writes these to `slackclaw.env` — `source` it before running. All three are **required**:

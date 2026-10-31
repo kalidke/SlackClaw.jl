@@ -1,3 +1,32 @@
+@testset "chat_manifest_lists_plan_scopes" begin
+    function manifest_list(manifest, heading)
+        section = split(manifest, heading; limit=2)[2]
+        entries = String[]
+        for line in split(section, '\n')
+            startswith(line, "      - ") || break
+            push!(entries, String(chopprefix(line, "      - ")))
+        end
+        return entries
+    end
+
+    scopes = ["channels:read", "channels:history", "groups:read", "groups:history",
+              "chat:write", "files:read", "files:write", "users:read"]
+    events = ["message.channels", "message.groups"]
+    for customize in (false, true)
+        manifest = SlackClaw.generate_chat_manifest(; customize)
+        expected_scopes = customize ? [scopes; "chat:write.customize"] : scopes
+        @test manifest_list(manifest, "    bot:\n") == expected_scopes
+        @test manifest_list(manifest, "    bot_events:\n") == events
+        @test occursin("  socket_mode_enabled: true\n", manifest)
+        @test occursin("  name: Ship of Tools\n", manifest)
+        @test occursin("    display_name: Ship of Tools\n", manifest)
+    end
+    @test SlackClaw.generate_chat_manifest() == SlackClaw.generate_chat_manifest(; customize=true)
+    named = SlackClaw.generate_chat_manifest(; app_name="Example Chat")
+    @test occursin("  name: Example Chat\n", named)
+    @test occursin("    display_name: Example Chat\n", named)
+end
+
 # These helpers refer to new SlackClaw names only inside function bodies. Each
 # testset therefore fails at runtime on the base commit, rather than at load.
 
