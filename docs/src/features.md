@@ -181,12 +181,14 @@ failed reaction is logged and never stops the post.
 - When it printed none (a timeout, or a failure with nothing on stdout), the
   thread keeps the session it already had, so the next reply resumes the
   earlier conversation (a thread with no session yet starts fresh, told that
-  the earlier context is not available). The failed request never reached
-  that session, so the reply ends with "Reply in this thread to try again, and
-  include the request: this run left nothing to resume."
-- A follow-up queued in a conversation the CLI no longer has (see below) is
-  told so when it fires in the thread's new session, and asks rather than
-  guesses what it refers to.
+  the earlier context is not available). The failed run's work is not in that
+  session, so the reply ends with "Reply in this thread to try again, saying
+  what is still to be done: this run left nothing to resume, though some of
+  its work may have run." A timeout keeps the id of a result printed before
+  it ran over.
+- A scheduled follow-up that fires in a session other than the one that
+  scheduled it (the thread started over since) is told so, and asks rather
+  than guesses what it refers to.
 - A step-limit stop reads "Claude stopped at the step limit before finishing."
   Raise `max_turns` for a channel whose tasks need more steps.
 - A session the CLI no longer has (its transcripts were moved or removed, for

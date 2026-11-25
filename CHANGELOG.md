@@ -32,12 +32,20 @@ Patch: a failed Claude run no longer ends its Slack thread.
   finishing."
 - **Every failed run's reply ends with a line about replying**: "Reply in this
   thread to continue; the next run resumes this one." when the failed run
-  printed a session id of its own, and "Reply in this thread to try again, and
-  include the request: this run left nothing to resume." when it did not (the
-  thread's earlier session, if any, is still resumed, but the failed request
-  never reached it). A follow-up queued in a conversation the CLI refused is
-  told so when it fires (`FOLLOWUP_CONTEXT_LOST_NOTE`). The reason text before
-  it is unchanged from 0.7.2, cut to 3000 characters so the line always fits.
+  printed a session id of its own, and "Reply in this thread to try again,
+  saying what is still to be done: this run left nothing to resume, though
+  some of its work may have run." when it did not (the thread's earlier
+  session, if any, is still resumed, but the failed run's work is not in it).
+  A timeout keeps the id of a result printed before the overrun, and a lone
+  stdout event of another type (`system` init) is not read as a result. The
+  reason text before it is unchanged from 0.7.2, cut to 3000 characters so
+  the line always fits.
+- **A follow-up firing in another session is told so.** When a scheduled
+  follow-up resumes a session other than the one that scheduled it (the
+  thread started over since: a refused resume, or a late message an older
+  version ran fresh), its prompt carries `FOLLOWUP_OTHER_SESSION_NOTE`, so
+  Claude asks rather than guesses what it refers to. It is decided when the
+  follow-up fires, so a restart in between does not lose it.
 - **A stale session id is dropped, and the message runs again.** A
   `--resume` of a session the CLI no longer has ("No conversation found with
   session ID") failed every reply in that thread. The id is now cleared and

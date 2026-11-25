@@ -187,7 +187,9 @@ id: the run was killed before printing anything. A refused resume sets
 function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::AbstractString="")
     if res.timed_out
         @warn "SlackClaw: claude timed out" timeout_s
-        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, "")
+        # A result printed before the overrun still names the run's session
+        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0,
+                            stdout_session_id(res.stdout))
     end
 
     if res.exitcode != 0
@@ -307,6 +309,8 @@ function result_entry(data)
     entry = if data isa AbstractVector
         idx = findlast(d -> d isa AbstractDict && get(d, "type", "") == "result", data)
         idx === nothing ? nothing : data[idx]
+    elseif data isa AbstractDict && get(data, "type", "result") != "result"
+        nothing     # a lone event of another type (e.g. system init) is no result
     else
         data
     end

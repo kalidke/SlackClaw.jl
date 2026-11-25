@@ -1013,7 +1013,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
         auth_reason = "Claude exited non-zero (code 1), stderr: Failed to authenticate: token expired"
         note = "NOT available to you"
         continue_line = "_Reply in this thread to continue; the next run resumes this one._"
-        retry_line = "_Reply in this thread to try again, and include the request: this run left nothing to resume._"
+        retry_line = "_Reply in this thread to try again, saying what is still to be done: this run left nothing to resume, though some of its work may have run._"
 
         cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
                               claude_max_retries=0, max_active_threads=50)
@@ -1114,7 +1114,8 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test held(state, T) == "s-fresh"
 
             #    A follow-up queued in the lost conversation is told so when it
-            #    fires, in the thread's new session
+            #    fires, in the thread's new session (decided when it fires, so
+            #    a restart in between cannot lose it)
             T = "1700000721.000000"
             track!(state, T, "s-A")
             push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-A", "report the status of that job", time() + 600))
@@ -1127,9 +1128,38 @@ mkstate(cfg) = SlackClaw.MonitorState(
             foreach(wait, state.active_tasks)
             c = new_calls(n0)
             @test length(c) == 3 && resumed(c[3]) == "s-B" &&
-                  occursin(SlackClaw.FOLLOWUP_CONTEXT_LOST_NOTE, c[3]) &&
-                  occursin("report the status of that job", c[3])
-            @test count(cc -> occursin(SlackClaw.FOLLOWUP_CONTEXT_LOST_NOTE, cc), c) == 1
+                  occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE * "\nreport the status of that job", c[3])
+            @test count(cc -> occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, cc), c) == 1
+            #    State saved and loaded with the follow-up under A and the thread
+            #    under B (a restart, or a state an older version wrote): the
+            #    same note
+            T = "1700000722.000000"
+            track!(state, T, "s-B2")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-A2", "report the status of that job", time() + 600))
+            SlackClaw.save_state!(state)
+            loaded = SlackClaw.load_state(cfg)
+            @test any(sc -> sc.thread_ts == T && sc.session_id == "s-A2" &&
+                            sc.prompt == "report the status of that job", loaded[3])
+            foreach(sc -> sc.thread_ts == T && (sc.due_at = 0.0), state.scheduled)
+            next_run(stdout=ok_json("s-B2") * "\n")
+            n0 = length(calls())
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 1 && resumed(c[1]) == "s-B2" &&
+                  occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, c[1])
+            #    ... and a follow-up firing in the session that scheduled it gets
+            #    no note
+            T = "1700000723.000000"
+            track!(state, T, "s-C")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-C", "check it", 0.0))
+            next_run(stdout=ok_json("s-C") * "\n")
+            n0 = length(calls())
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 1 && resumed(c[1]) == "s-C" &&
+                  !occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, c[1])
 
             # 6. A scheduled run fires with an older id than the thread now
             #    holds, and the CLI refuses it: the rerun resumes the thread's
@@ -1679,6 +1709,15 @@ end
     @test !rr(fake(err="Failed to authenticate\n"), "s1")
     @test !rr(fake(code=0), "s1")
     @test !rr(fake(timed_out=true), "s1")
+    # a timeout keeps the id of a result printed before the overrun
+    @test SlackClaw.interpret_claude_run(fake(timed_out=true,
+              out="""{"type":"result","is_error":false,"result":"x","session_id":"s-T"}"""), 5, 60).session_id == "s-T"
+    @test SlackClaw.interpret_claude_run(fake(timed_out=true, out=""), 5, 60).session_id == ""
+    # a lone event of another type is no result: its id promises nothing
+    @test SlackClaw.interpret_claude_run(fake(err="boom\n",
+              out="""{"type":"system","subtype":"init","session_id":"A"}"""), 5, 60).session_id == ""
+    @test SlackClaw.interpret_claude_run(fake(err="boom\n",
+              out="""{"is_error":true,"result":"x","session_id":"L"}"""), 5, 60).session_id == "L"   # legacy, no type
     r = SlackClaw.interpret_claude_run(fake(), 5, 60; resumed="s1")
     @test !r.success && r.session_missing && r.session_id == ""
     @test !SlackClaw.interpret_claude_run(fake(), 5, 60).session_missing

@@ -610,7 +610,17 @@ function check_scheduled!(state::MonitorState)
         # thread moved to a fresh session after the follow-up was scheduled).
         # The saved id is used only when the thread is no longer tracked.
         sid = tracked === nothing ? sched.session_id : tracked.session_id
-        prompt = isempty(sid) ? REVIVED_THREAD_NOTE * "\n" * sched.prompt : sched.prompt
+        # A follow-up resuming a session other than the one that scheduled it
+        # (the thread started over: a refused resume, a late message run fresh
+        # by an older version) is told so, decided here when it fires, so a
+        # restart in between cannot lose it
+        prompt = if isempty(sid)
+            REVIVED_THREAD_NOTE * "\n" * sched.prompt
+        elseif !isempty(sched.session_id) && sched.session_id != sid
+            FOLLOWUP_OTHER_SESSION_NOTE * "\n" * sched.prompt
+        else
+            sched.prompt
+        end
         # The notice is posted inside the run, before Claude starts; its Slack ts
         # is the cursor if the thread has to be tracked again
         started = run_agent_loop!(state, sched.thread_ts, prompt, sid; channel_id=ch,
@@ -797,7 +807,7 @@ end
 const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
 
 """Line ending a failed run's reply when the failed run left no session of its own."""
-const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, and include the request: this run left nothing to resume._"
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, saying what is still to be done: this run left nothing to resume, though some of its work may have run._"
 
 """
     failure_reply(reason, session_id) -> String
@@ -805,8 +815,9 @@ const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, and include t
 Thread text for a failed run: the reason, then a line saying that a reply in the
 thread starts the next run. `session_id` is the session the failed run itself
 printed: only then does the next run hold the request, and the line says the
-run continues; otherwise (a timeout, a start-up failure) the request never
-reached a session the thread can resume, so the line asks for it again. A long
+run continues; otherwise (a timeout, a start-up failure) the run's work is in no
+session the thread can resume, so the line asks what is still to be done (some
+of it may have run: a job submitted, an earlier step posted). A long
 reason (an error result's whole text) is cut to 3000 characters, so the line is
 never lost to the post's chunk limit.
 """
@@ -950,12 +961,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     held = track_thread!(state, thread_ts, channel_id;
                         attempted=current_session, session_missing=true, cursor=new_cursor)
                     @info "SlackClaw: session not found, running again" thread_ts refused=current_session resume=held
-                    if isempty(held)
-                        current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt
-                        # The thread starts over: a follow-up it has queued now
-                        # runs in a session that never saw what it refers to
-                        mark_followups_context_lost!(state, thread_ts)
-                    end
+                    isempty(held) && (current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt)
                     current_session = held
                     continue
                 end
@@ -1153,28 +1159,14 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
 end
 
 """
-Prepended to a queued follow-up's prompt when the conversation that scheduled it
-is lost (the CLI refused the thread's session and the thread started over): the
-follow-up then runs in a session that never saw what it refers to.
+Prepended to a scheduled follow-up's prompt when it fires in a session other
+than the one that scheduled it (the thread started over since): that session
+may not have what the follow-up refers to.
 """
-const FOLLOWUP_CONTEXT_LOST_NOTE = """
+const FOLLOWUP_OTHER_SESSION_NOTE = """
 [note from the dispatcher: this is a follow-up scheduled earlier in this Slack thread, in a \
-conversation that is no longer available to you. If it refers to something you do not \
-have, say so and ask the user; do not guess.]"""
-
-"""
-    mark_followups_context_lost!(state, thread_ts)
-
-Prepend [`FOLLOWUP_CONTEXT_LOST_NOTE`](@ref) (once) to every follow-up queued for
-the thread. Saved with the state at the run's next save.
-"""
-function mark_followups_context_lost!(state::MonitorState, thread_ts::AbstractString)
-    for s in state.scheduled
-        s.thread_ts == thread_ts && !startswith(s.prompt, FOLLOWUP_CONTEXT_LOST_NOTE) &&
-            (s.prompt = FOLLOWUP_CONTEXT_LOST_NOTE * "\n" * s.prompt)
-    end
-    return nothing
-end
+conversation that may not be this one. If it refers to something you do not have, say so \
+and ask the user; do not guess.]"""
 
 """
 Prepended to a top-level message that reaches the monitor after a reply in its
