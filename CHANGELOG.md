@@ -4,7 +4,7 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
-## [Unreleased] (0.7.4-DEV)
+## [0.7.4] — 2026-11-25
 
 Patch: a failed Claude run no longer ends its Slack thread.
 
