@@ -77,8 +77,14 @@ Patch: a failed Claude run no longer ends its Slack thread.
   top-level message but delivered a reply in its thread, the reply revives
   the thread and runs (as before: a webhook post, whose event never moves the
   cursor, has nothing else to read its replies). When reconciliation then
-  reads the message and finds its thread running, the message says it was not
-  run and asks for a reply with the request, instead of "Still working".
+  reads the message and finds its thread running, the message is not run (one
+  run per thread; 0.7.3 ran it beside the reply) and says so, asking for a
+  reply with the request. When
+  it finds its thread tracked and idle (the reply already ran), it resumes the
+  thread's session instead of starting a new one, so the thread keeps one
+  conversation and a follow-up the reply scheduled resumes the one that has its
+  request. This also covers Slack's `me_message` status posts, which the socket
+  skips and reconciliation reads.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside
   `max_active_threads`, which counts the other threads only.
@@ -87,9 +93,10 @@ Patch: a failed Claude run no longer ends its Slack thread.
   with `REVIVED_THREAD_NOTE`). It waits while its thread is running or no task
   slot is free, instead of running beside it, and is saved as deferred
   (`ScheduledTask` gains `deferred::Bool`; the four-argument constructor
-  stays), so a restart keeps it though its time has passed.
+  stays), so a restart keeps it though its time has passed, for up to a day.
 - **A failed state save no longer hides the run's reply.** It is logged, and
-  the run's reason is still posted.
+  the run's reason is still posted. A failed ✅ after a posted answer is only
+  logged too, instead of an error reply inviting a retry of finished work.
 - The status-file watcher stops when `run_claude` throws, and no longer posts
   once more after its run has ended.
 

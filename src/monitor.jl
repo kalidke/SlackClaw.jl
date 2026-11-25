@@ -155,8 +155,9 @@ function load_state(config::SlackClawConfig)
             due = d["due_at"]
             deferred = get(d, "deferred", false) === true
             # Skip follow-ups whose time passed while the monitor was down; keep
-            # one that came due and was waiting for its thread
-            due > now || deferred || continue
+            # one that came due and was waiting for its thread, for up to a day
+            # (after a longer stop it would fire at once in a stale thread)
+            due > now || (deferred && now - due < 86400) || continue
             push!(scheduled, ScheduledTask(
                 d["thread_ts"], d["session_id"], d["prompt"], due, deferred))
         end
@@ -1023,8 +1024,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
 
                 else  # :done
                     # No checkmark on a deliberately skipped message — it would itself be noise
-                    !isempty(react_ts) && !skipped &&
-                        slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
+                    # Best effort: the answer is posted, so a failed reaction
+                    # must not turn into an error reply inviting a retry
+                    !skipped && react_quietly(config, react_ts, "white_check_mark"; channel_id)
                     break
                 end
             end
@@ -1111,7 +1113,14 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # Claude starts. The run tracks the thread when it ends, whatever the
     # outcome, with its cursor at this message, so a reply posted during the run
     # is read afterwards by the reconcile poll.
-    run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), "";
+    #
+    # A message whose thread is already tracked reached us late (a reply in its
+    # thread was delivered and ran first, e.g. under a `me_message` the socket
+    # skips): it resumes the thread's session rather than starting one, so the
+    # thread keeps one conversation (a follow-up the reply scheduled resumes it).
+    tracked = get(state.threads, msg.ts, nothing)
+    sid = tracked === nothing ? "" : tracked.session_id
+    run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), sid;
                     react_ts=msg.ts, channel_id,
                     before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id))
 end

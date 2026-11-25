@@ -1352,6 +1352,26 @@ mkstate(cfg) = SlackClaw.MonitorState(
             reloaded_sched = SlackClaw.load_state(cfg)[3]
             @test any(s -> s.thread_ts == T && s.deferred, reloaded_sched)
             filter!(s -> s.thread_ts != T, state.scheduled)
+            #     ... for up to a day: after a longer stop it is dropped, as a
+            #     follow-up whose time passed while the monitor was down is
+            state.scheduled = [SlackClaw.ScheduledTask(T, "s-held", "check later", time() - 2 * 86400, true)]
+            SlackClaw.save_state!(state)
+            @test !any(s -> s.thread_ts == T, SlackClaw.load_state(cfg)[3])
+            empty!(state.scheduled)
+
+            #     A first save that fails does not leave the deferral unsaved: the
+            #     next poll saves it again
+            cfg_ds = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                     state_file="later-dir/state.json")
+            state_ds = mkstate(cfg_ds)
+            T = "1700000893.000000"
+            track!(state_ds, T, "s-held")
+            state_ds.busy_threads[T] = time()
+            push!(state_ds.scheduled, SlackClaw.ScheduledTask(T, "s-held", "check later", time() - 5))
+            SlackClaw.check_scheduled!(state_ds)          # save fails: no such directory
+            mkpath(f("later-dir"))
+            SlackClaw.check_scheduled!(state_ds)          # saved now
+            @test any(s -> s.thread_ts == T && s.deferred, SlackClaw.load_state(cfg_ds)[3])
 
             # 29. A due follow-up with no free task slot waits for the next poll
             cfg_full = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
@@ -1433,6 +1453,45 @@ mkstate(cfg) = SlackClaw.MonitorState(
             SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "status", ""))
             foreach(wait, state.active_tasks)
             @test !isfile(joinpath(dir, cfg.status_file))
+
+            # 34. A late top-level message whose thread is tracked and idle (a
+            #     reply under it ran first: Slack's me_message status posts are
+            #     skipped on the socket and read by reconciliation) resumes the
+            #     thread's session, so the follow-up the reply scheduled resumes
+            #     the conversation that has the request
+            T = "1700000994.000000"
+            state.last_ts = "1700000980.000000"
+            sched_json = """{"type":"result","subtype":"success","is_error":false,"result":"Watching job 42. [SCHEDULE: 10m: check job 42]","session_id":"s-R"}"""
+            next_runs((stdout=sched_json * "\n",), (stdout=ok_json("s-R") * "\n",),
+                      (stdout=ok_json("s-R") * "\n",))
+            n0 = length(calls())
+            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"watch job 42, check again in ten minutes","ts":"1700000994.000100","thread_ts":"$T"}""")
+            SlackClaw.route_socket_event!(state, ev)
+            foreach(wait, state.active_tasks)
+            @test held(state, T) == "s-R"
+            @test SlackClaw.claim_primary!(state, T)     # reconciliation reads the status post
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "is debugging the pipeline", ""))
+            foreach(wait, state.active_tasks)
+            foreach(s -> s.thread_ts == T && (s.due_at = 0.0), state.scheduled)
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 3
+            @test length(c) == 3 && resumed(c[2]) == "s-R" && resumed(c[3]) == "s-R"
+            @test held(state, T) == "s-R"
+            state.last_ts = "100.0"
+
+            # 35. A failed ✅ after the answer is posted is only logged: no error
+            #     reply inviting a retry of finished work
+            T = "1700000995.000000"
+            clear_logs!()
+            react_hook[] = e -> e == "white_check_mark" && error("simulated reactions.add failure")
+            next_run(stdout=ok_json("s-ok") * "\n")
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "quick one", ""))
+            foreach(wait, state.active_tasks)
+            react_hook[] = nothing
+            @test posted == ["all done"]
+            @test isempty(top_posted)
 
             # 14. A failed ❌ reaction does not cost the failure reply
             T = "1700000810.000000"
