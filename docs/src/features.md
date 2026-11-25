@@ -156,7 +156,8 @@ release must add `files:write` and reinstall.
   "busy" reply.
 - A busy thread that receives another message reports elapsed time instead of
   starting a second run.
-- At most `max_active_threads` (default 3) conversation threads are tracked;
+- At most `max_active_threads` (default 3) conversation threads are tracked,
+  besides those with a run in flight or a follow-up scheduled (never retired);
   the oldest are retired first. Threads idle longer than `max_thread_idle_s`
   (default 7 days; `0` disables) are also retired — each tracked thread costs a
   `conversations.replies` call per reconciliation, so this bounds steady load.
@@ -164,9 +165,9 @@ release must add `files:write` and reinstall.
 ## Failed runs
 
 A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
-does not end its thread. A top-level message's thread is tracked the moment it
-is dispatched, so whatever happens to the run, a reply there starts a new run:
-by socket, or by the next reconciliation poll if the socket missed it.
+does not end its thread. Every run leaves its thread tracked, whatever the
+outcome, so a reply there starts a new run: by socket, or by the next
+reconciliation poll if the socket missed it.
 SlackClaw adds ❌, frees the thread, and then posts the reason, so a reply sent
 the moment the reason appears starts a run instead of "Still working". A
 failed reaction is logged and never stops the post.
@@ -192,17 +193,14 @@ failed reaction is logged and never stops the post.
   reruns once per dispatched message.
 - A scheduled follow-up resumes the thread's current session, not the id it
   was saved with, and waits while its thread is running.
-- A request turned away because every task slot is busy says "reply in this
-  thread with the request to try again"; its thread is tracked, so that reply
-  is read.
+- A thread has one run at a time: a message in a thread that already has a
+  run gets "Still working", whatever dispatched it.
 
 A failed thread counts toward `max_active_threads` like any other. A thread
 with a run in flight or a follow-up scheduled is never expired, and sits beside
 the cap rather than in it. A thread's reply cursor follows Slack's timestamps
-(the parent message, then the last reply read), so a reply posted while a run
-is finishing is read by the next poll. The host clock is used only as a last
-resort, for a scheduled follow-up whose thread is no longer tracked and whose
-notice failed to post.
+only (the message a run answered, then the last reply read), so a reply posted
+during a run, or while it is finishing, is read by the next poll.
 
 ## Persistence
 

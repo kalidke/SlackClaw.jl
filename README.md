@@ -154,7 +154,7 @@ All options are fields on `SlackClawConfig`:
 | `claude_timeout_s` | `3600` | Max seconds per Claude call |
 | `max_turns` | `30` | Max agent turns per invocation |
 | `max_concurrent_tasks` | `5` | Parallel Claude invocations |
-| `max_active_threads` | `3` | Tracked thread sessions (oldest expire) |
+| `max_active_threads` | `3` | Tracked thread sessions (oldest expire; threads with a run in flight or a follow-up scheduled sit beside the cap) |
 | `max_thread_idle_s` | `604800` (7 d) | Drop tracked threads idle this long (`0` = never) |
 | `max_continue` | `10` | Max consecutive `[CONTINUE]` directives |
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |

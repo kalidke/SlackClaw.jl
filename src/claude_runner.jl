@@ -154,15 +154,17 @@ end
 Whether a finished run is the CLI refusing `--resume` of the session `resumed`
 (the id it was given; "" when it resumed nothing): it exited non-zero, printed
 nothing on stdout, and printed `No conversation found with session ID: <that id>`
-on stderr, as a line of its own. Judged on the raw streams, not the posted
-reason, so a result text that merely quotes the phrase never counts, nor a line
-naming another id, nor a warning that quotes the refusal inside other text.
+on stderr, ending a line (a prefix such as "Error: " is allowed). Judged on the raw
+streams, not the posted reason, so a result text that merely quotes the phrase
+never counts, nor a line naming another id, nor a warning that quotes the refusal
+inside other text.
 """
 function resume_refused(res, resumed::AbstractString)
     isempty(resumed) && return false
     (res.timed_out || res.exitcode == 0 || !isempty(strip(res.stdout))) && return false
     refusal = "No conversation found with session ID: $(resumed)"
-    return any(l -> strip(l) == refusal, split(res.stderr, '\n'))
+    # Its own line, allowing a prefix ("Error: ") a later CLI may add
+    return any(l -> endswith(strip(l), refusal), split(res.stderr, '\n'))
 end
 
 """
