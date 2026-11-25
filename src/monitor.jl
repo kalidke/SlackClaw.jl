@@ -8,17 +8,23 @@ mutable struct ThreadSession
     thread_ts::String
     session_id::String
     last_reply_ts::String  # newest reply we've seen in this thread
-    created::Float64       # time() when created, for expiry
+    created::Float64       # time() of the last run recorded (track_thread!), for expiry and the cap
     channel_id::String     # which channel this thread lives in
 end
 
-"""A scheduled future invocation."""
+"""A scheduled future invocation. `deferred` marks one that came due but had to
+wait (its thread was running, or no slot was free): it is kept across a restart
+even once its time has passed, where a follow-up that never came due is not."""
 mutable struct ScheduledTask
     thread_ts::String
     session_id::String
     prompt::String
     due_at::Float64  # time() when this should fire
+    deferred::Bool
 end
+
+ScheduledTask(thread_ts, session_id, prompt, due_at) =
+    ScheduledTask(thread_ts, session_id, prompt, due_at, false)
 
 """
 Runtime state of a monitor: cursors, tracked threads, scheduled tasks, and
@@ -94,6 +100,7 @@ function save_state!(state::MonitorState)
         "session_id" => s.session_id,
         "prompt" => s.prompt,
         "due_at" => s.due_at,
+        "deferred" => s.deferred,
     ) for s in state.scheduled]
     data = Dict(
         "last_ts" => state.last_ts,
@@ -146,9 +153,12 @@ function load_state(config::SlackClawConfig)
         now = time()
         for d in get(data, "scheduled", [])
             due = d["due_at"]
-            due > now || continue  # skip expired scheduled tasks
+            deferred = get(d, "deferred", false) === true
+            # Skip follow-ups whose time passed while the monitor was down; keep
+            # one that came due and was waiting for its thread
+            due > now || deferred || continue
             push!(scheduled, ScheduledTask(
-                d["thread_ts"], d["session_id"], d["prompt"], due))
+                d["thread_ts"], d["session_id"], d["prompt"], due, deferred))
         end
         for (ch, ts) in get(data, "listen_last_ts", Dict())
             listen_last_ts[ch] = ts
@@ -222,9 +232,15 @@ function claim_primary!(state::MonitorState, ts::AbstractString)
     end
 end
 
-"""Claim a thread reply against the session's reply cursor."""
+"""
+Claim a thread reply against the session's reply cursor. Fails when `session` is
+no longer the thread's tracked entry (it expired, or was re-tracked, while the
+caller held it across a yield): its cursor is dead, and a claim on it would
+dispatch a reply the live entry may already have.
+"""
 function claim_thread_reply!(state::MonitorState, session::ThreadSession, ts::AbstractString)
     lock(state.dispatch_lock) do
+        get(state.threads, session.thread_ts, nothing) === session || return false
         ts > session.last_reply_ts || return false
         session.last_reply_ts = ts
         return true
@@ -270,6 +286,7 @@ function watch_status_file(config::SlackClawConfig, thread_ts::String, stop::Ref
             stop[] && return
             sleep(1)
         end
+        stop[] && return  # the run ended during the last sleep
         try
             isfile(path) || continue
             content = strip(read(path, String))
@@ -476,9 +493,7 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
 
             # Track the thread for follow-up replies
             if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
+                track_thread!(state, thread_ts, primary; session_id=result.session_id)
             end
         catch e
             @error "SlackClaw listen dispatch error" channel=ch_name exception=(e, catch_backtrace())
@@ -492,7 +507,8 @@ end
 # --- Thread polling ---
 
 function poll_threads!(state::MonitorState)
-    for (thread_ts, session) in state.threads
+    # A snapshot: agent-loop tasks add threads while this loop waits on Slack
+    for (thread_ts, session) in collect(state.threads)
         state.running || break
         try
             raw_replies = slack_get_replies(state.config, thread_ts, session.last_reply_ts;
@@ -500,6 +516,9 @@ function poll_threads!(state::MonitorState)
             isempty(raw_replies) && continue
             parsed = parse_slack_messages(raw_replies)
             for (msg, raw) in zip(parsed, raw_replies)
+                # Fails once the thread expired or was re-tracked (during the
+                # call, or while an earlier reply here dispatched): the next poll
+                # reads the rest against the live cursor
                 claim_thread_reply!(state, session, msg.ts) || continue
                 should_process(msg, state.config, raw) || continue
                 dispatch_thread_reply!(state, msg, session)
@@ -533,22 +552,29 @@ posted (a bookkeeping announcement only pulls readers back into a dead
 thread). A later user reply in an expired thread re-tracks it via the
 `:thread_revive` route (fresh Claude session, same Slack thread), so expiry
 costs the user nothing but the dropped conversation context.
+
+A thread with work still to come (a run in flight, or a scheduled follow-up
+pending) is never expired: the run's end, or the follow-up, would track it again
+with a fresh cursor and lose the reply cursor it had.
 """
 function expire_threads!(state::MonitorState)
     dropped = 0
+    pending = Set(s.thread_ts for s in state.scheduled)
+    evictable(s) = !haskey(state.busy_threads, s.thread_ts) && !(s.thread_ts in pending)
 
     for s in idle_expired_threads(state.threads, state.config.max_thread_idle_s, time())
+        evictable(s) || continue
         delete!(state.threads, s.thread_ts)
         dropped += 1
     end
 
-    max = state.config.max_active_threads
-    if length(state.threads) > max
-        sorted = sort(collect(values(state.threads)); by=s -> s.created)
-        for i in 1:(length(sorted) - max)
-            delete!(state.threads, sorted[i].thread_ts)
-            dropped += 1
-        end
+    # The cap counts evictable threads only: threads kept for work to come sit
+    # beside it, so they never push out a recent conversation
+    cap = state.config.max_active_threads
+    sorted = sort(filter(evictable, collect(values(state.threads))); by=s -> s.created)
+    for s in first(sorted, Base.max(length(sorted) - cap, 0))
+        delete!(state.threads, s.thread_ts)
+        dropped += 1
     end
 
     dropped == 0 && return
@@ -560,20 +586,49 @@ end
 
 function check_scheduled!(state::MonitorState)
     now = time()
-    due = filter(s -> s.due_at <= now, state.scheduled)
-    filter!(s -> s.due_at > now, state.scheduled)
-
-    for sched in due
-        @info "SlackClaw: firing scheduled task for thread $(sched.thread_ts)"
-        ch = if haskey(state.threads, sched.thread_ts)
-            state.threads[sched.thread_ts].channel_id
-        else
-            state.config.slack_channel_id
+    filter!(!istaskdone, state.active_tasks)
+    fired = ScheduledTask[]
+    waiting = false
+    # No yield in this loop: each due follow-up stays in `state.scheduled` (so
+    # its thread cannot expire) until its run has the thread and a slot, and
+    # nothing else can take either between the check and the start.
+    for sched in filter(s -> s.due_at <= now, state.scheduled)
+        # A follow-up whose thread is running, or with no free slot, waits until
+        # both are free: two runs in one thread would write the same session.
+        # It is marked deferred, so a restart (which drops follow-ups whose time
+        # passed while the monitor was down) keeps it.
+        if haskey(state.busy_threads, sched.thread_ts) ||
+           length(state.active_tasks) >= state.config.max_concurrent_tasks
+            sched.deferred = true
+            waiting = true
+            continue
         end
-        slack_post_message(state.config, "_Scheduled follow-up firing..._";
-            thread_ts=sched.thread_ts, channel_id=ch)
-        run_agent_loop!(state, sched.thread_ts, sched.prompt, sched.session_id;
-                        channel_id=ch)
+        tracked = get(state.threads, sched.thread_ts, nothing)
+        ch = tracked === nothing ? state.config.slack_channel_id : tracked.channel_id
+        # Resume the thread's current session: the saved id can be older (the
+        # thread moved to a fresh session after the follow-up was scheduled).
+        # The saved id is used only when the thread is no longer tracked.
+        sid = tracked === nothing ? sched.session_id : tracked.session_id
+        prompt = isempty(sid) ? REVIVED_THREAD_NOTE * "\n" * sched.prompt : sched.prompt
+        # The notice is posted inside the run, before Claude starts; its Slack ts
+        # is the cursor if the thread has to be tracked again
+        started = run_agent_loop!(state, sched.thread_ts, prompt, sid; channel_id=ch,
+            before_run = () -> slack_post_message(state.config, "_Scheduled follow-up firing..._";
+                                                  thread_ts=sched.thread_ts, channel_id=ch))
+        started || continue
+        filter!(s -> s !== sched, state.scheduled)
+        push!(fired, sched)
+    end
+    # Saved on every poll while a follow-up waits, not only the first: a save
+    # that failed once must not leave the deferral unsaved
+    (waiting || !isempty(fired)) || return
+    try
+        save_state!(state)
+    catch e
+        @error "SlackClaw: state save failed" exception=(e, catch_backtrace())
+    end
+    for sched in fired
+        @info "SlackClaw: fired scheduled task for thread $(sched.thread_ts)"
     end
 end
 
@@ -666,9 +721,7 @@ function check_proactive!(state::MonitorState)
 
             # Track thread for follow-up replies
             if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
+                track_thread!(state, thread_ts, primary; session_id=result.session_id)
             end
 
             @info "SlackClaw: proactive check posted to channel"
@@ -684,59 +737,239 @@ end
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
+    track_thread!(state, thread_ts, channel_id; session_id="", attempted="", session_missing=false,
+                  cursor=thread_ts) -> String
+
+Record a finished run in `thread_ts` and save state; returns the session id the
+thread now holds (empty: nothing to resume, so the next reply starts a fresh
+session with [`REVIVED_THREAD_NOTE`](@ref) in its prompt).
+
+- `session_id` non-empty (the run printed one): the thread holds it.
+- Otherwise (a failed run with no id): a tracked thread keeps the id it holds,
+  which may be newer than the one this run `attempted` to resume (a scheduled
+  task fires with the id it was saved with); an untracked thread starts with
+  `attempted`. With `session_missing` (the CLI refused to resume `attempted`) that
+  id is dropped, but only where the thread still holds it.
+
+A tracked thread's `ThreadSession` is updated in place under `dispatch_lock`, never
+replaced: a poll or socket claim holding the object keeps claiming against the
+live cursor, and a tracked thread keeps the last reply it claimed, so a reply
+posted while the run was finishing is still read. An untracked thread starts at
+`cursor`, always a Slack timestamp: its parent `thread_ts` for a thread that is
+new (a just-posted message, so no reply in it has been read), or the message a
+run answered. The host clock is never used. With `cursor = ""` (the caller knows
+no such boundary) an untracked thread is not tracked at all: reading it from a
+guessed point could run handled replies again or skip unread ones.
+A failed state save is logged, never thrown: it must not replace the run's reply.
+"""
+function track_thread!(state::MonitorState, thread_ts::AbstractString, channel_id::AbstractString;
+                       session_id::AbstractString="", attempted::AbstractString="",
+                       session_missing::Bool=false, cursor::AbstractString=thread_ts)
+    held = lock(state.dispatch_lock) do
+        s = get(state.threads, thread_ts, nothing)
+        if s === nothing
+            sid = !isempty(session_id) ? session_id : session_missing ? "" : attempted
+            isempty(cursor) && return (String(sid), false)
+            state.threads[thread_ts] = ThreadSession(
+                String(thread_ts), String(sid), String(cursor), time(), String(channel_id))
+            return (String(sid), true)
+        end
+        if !isempty(session_id)
+            s.session_id = String(session_id)
+        elseif session_missing && s.session_id == attempted
+            s.session_id = ""
+        end
+        s.created = time()  # recent activity: the thread is not the oldest for the cap
+        return (s.session_id, true)
+    end
+    sid, changed = held
+    changed || return sid
+    try
+        save_state!(state)
+    catch e
+        @error "SlackClaw: state save failed" thread_ts exception=(e, catch_backtrace())
+    end
+    return sid
+end
+
+"""Line ending a failed run's reply when the next run resumes its session."""
+const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
+
+"""Line ending a failed run's reply when there is no session to resume."""
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again; this run kept no context, so include the request._"
+
+"""
+    failure_reply(reason, session_id) -> String
+
+Thread text for a failed run: the reason, then a line saying that a reply in the
+thread starts the next run. The line says the run continues only when there is a
+session to resume. A long reason (an error result's whole text) is cut to 3000
+characters, so the line is never lost to the post's chunk limit.
+"""
+function failure_reply(reason::AbstractString, session_id::AbstractString)
+    reason = length(reason) > 3000 ? first(reason, 3000) * " …" : reason
+    return string(reason, "\n\n", isempty(session_id) ? FAILED_RUN_RETRY_LINE : FAILED_RUN_CONTINUE_LINE)
+end
+
+"""Tell a message in a busy thread that the thread's run is still going (and
+for how long); the message itself starts no run."""
+function post_still_working(state::MonitorState, thread_ts::AbstractString,
+                            channel_id::AbstractString)
+    elapsed = round(Int, time() - get(state.busy_threads, thread_ts, time()))
+    mins, secs = divrem(elapsed, 60)
+    elapsed_str = mins > 0 ? "$(mins)m $(secs)s" : "$(secs)s"
+    slack_post_message(state.config, "_Still working... ($(elapsed_str) elapsed)_";
+                       thread_ts, channel_id)
+end
+
+"""Add a reaction, logging instead of throwing: on a failure path a lost reaction
+must not cost the post that tells the user what happened."""
+function react_quietly(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
+                       channel_id::AbstractString=config.slack_channel_id)
+    isempty(ts) && return nothing
+    try
+        slack_add_reaction(config, ts, emoji; channel_id)
+    catch e
+        @error "SlackClaw: reaction failed" ts emoji exception=(e, catch_backtrace())
+    end
+    return nothing
+end
+
+"""Clear the thread's busy mark only if it is still `mark` (this run's): a run
+that released it early must not clear the mark of a newer run in the thread."""
+release_busy!(state::MonitorState, thread_ts::AbstractString, mark::Float64) =
+    get(state.busy_threads, thread_ts, nothing) === mark && delete!(state.busy_threads, thread_ts)
+
+"""
     run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="", channel_id=state.config.slack_channel_id)
 
 Run Claude in a loop, handling [CONTINUE] and [SCHEDULE] directives.
 Posts each response to the thread. Watches status file during execution.
 User-message callers pass `prompt` already sender-attributed
 ([`attribute_sender`](@ref)); scheduled/directive prompts are not user
-messages and arrive bare.
+messages and arrive bare. Returns `true` when the run started, `false` when it
+was turned away: the thread already has a run (one run per thread, whatever
+dispatched it: the message gets "Still working"), or every task slot is taken.
+
+The check and the busy mark are one step with no yield in between.
+`before_run` (the dispatcher's first Slack call: the 👀 reaction, the
+follow-up notice) runs inside the task before Claude starts, so it is ordered
+before anything the run posts, and its failure is logged, never fatal. When it
+returns a Slack ts (a posted notice), that ts is the reply cursor should the run
+have to track the thread again.
 """
 function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                          session_id::String; react_ts::String="",
-                         channel_id::String=state.config.slack_channel_id)
+                         channel_id::String=state.config.slack_channel_id,
+                         before_run=nothing)
     config = state.config
     filter!(!istaskdone, state.active_tasks)
 
+    if haskey(state.busy_threads, thread_ts)
+        post_still_working(state, thread_ts, channel_id)
+        return false
+    end
     if length(state.active_tasks) >= config.max_concurrent_tasks
-        slack_post_message(config, "Busy — please wait."; thread_ts, channel_id)
-        return
+        slack_post_message(config, "Busy — reply in this thread with the request to try again."; thread_ts, channel_id)
+        return false
     end
 
-    state.busy_threads[thread_ts] = time()
+    busy_mark = time()
+    state.busy_threads[thread_ts] = busy_mark
 
     task = @async begin
         current_prompt = prompt
         current_session = session_id
         continue_count = 0
+        reran_missing = false
+        # A thread this run has to track (it was untracked) starts after the
+        # message being answered, else after the run's own notice (set below):
+        # both Slack timestamps. With neither, the run does not track it.
+        new_cursor = react_ts
+
+        # Ends this run's hold on the thread once: releases the busy mark, then
+        # clears the status file. A failed run calls it before posting its
+        # reason, so a reply meanwhile can start a run that this run no longer
+        # touches. A cleanup error is logged.
+        released = false
+        function finish_run!()
+            released && return
+            released = true
+            release_busy!(state, thread_ts, busy_mark)
+            try
+                status_path = joinpath(config.repo_dir, config.status_file)
+                isfile(status_path) && rm(status_path; force=true)
+            catch e
+                @error "SlackClaw: status file cleanup failed" thread_ts exception=(e, catch_backtrace())
+            end
+        end
 
         try
+            # Inside the try: nothing after the busy mark can skip its release
+            if before_run !== nothing
+                try
+                    r = before_run()
+                    isempty(new_cursor) && r isa AbstractString && (new_cursor = String(r))
+                catch e
+                    @error "SlackClaw: dispatch notice failed" thread_ts exception=(e, catch_backtrace())
+                end
+            end
             while true
                 # Start status file watcher
                 stop_watcher = Ref(false)
                 watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
                 # Run Claude (pass thread context for file upload support)
-                result = run_claude(current_prompt, config;
-                    session_id=current_session,
-                    thread_ts=thread_ts,
-                    channel_id=channel_id)
-
-                # Stop watcher
-                stop_watcher[] = true
-
-                # Update session tracking
-                if !isempty(result.session_id)
-                    current_session = result.session_id
-                    state.threads[thread_ts] = ThreadSession(
-                        thread_ts, current_session, slack_ts_now(), time(),
-                        channel_id)
-                    save_state!(state)
+                result = try
+                    run_claude(current_prompt, config;
+                        session_id=current_session,
+                        thread_ts=thread_ts,
+                        channel_id=channel_id)
+                finally
+                    stop_watcher[] = true
                 end
 
+                # The CLI has no such session (its transcripts moved or were
+                # removed): drop the id and run this message again at once, so a
+                # stale id never costs the user a reply. The rerun resumes the
+                # thread's own session when it holds a different one (a scheduled
+                # task fires with the id it was saved with), else starts fresh
+                # with REVIVED_THREAD_NOTE. Once per dispatched message, its
+                # [CONTINUE] steps included.
+                if result.session_missing && !reran_missing
+                    reran_missing = true
+                    held = track_thread!(state, thread_ts, channel_id;
+                        attempted=current_session, session_missing=true, cursor=new_cursor)
+                    @info "SlackClaw: session not found, running again" thread_ts refused=current_session resume=held
+                    isempty(held) && (current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt)
+                    current_session = held
+                    continue
+                end
+
+                # Update session tracking after every run. A failed run keeps its
+                # thread tracked even with no session id (a timeout, or a failure
+                # that printed none): the reconcile poll then reads replies in the
+                # thread, so a reply starts a new run with or without a socket
+                # event. A session the CLI refused to resume is dropped.
+                current_session = track_thread!(state, thread_ts, channel_id;
+                    session_id=result.session_id, attempted=current_session,
+                    session_missing=result.session_missing, cursor=new_cursor)
+
                 if !result.success
-                    post_response(config, result.result_text, thread_ts; channel_id)
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
+                    # The reply invites an immediate answer, so the run lets go
+                    # of the thread before it is posted: a reply that arrives
+                    # while the post is in flight starts a run instead of "Still
+                    # working". A failed reaction must not cost the post, and a
+                    # failed post is only logged: the run's bookkeeping is done,
+                    # and a newer run may own the thread by then.
+                    react_quietly(config, react_ts, "x"; channel_id)
+                    finish_run!()
+                    try
+                        post_response(config, failure_reply(result.result_text, current_session),
+                                      thread_ts; channel_id)
+                    catch e
+                        @error "SlackClaw: failure reply not posted" thread_ts exception=(e, catch_backtrace())
+                    end
                     break
                 end
 
@@ -797,21 +1030,29 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             end
         catch e
             @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
-            try
-                err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
-                slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts, channel_id)
-                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
-            catch; end
+            # Once the run has let go of the thread it records nothing more
+            if !released
+                try
+                    # Same as a failed run: the thread stays reachable by a reply
+                    current_session = track_thread!(state, thread_ts, channel_id;
+                                                    attempted=current_session, cursor=new_cursor)
+                    err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
+                    react_quietly(config, react_ts, "x"; channel_id)
+                    finish_run!()
+                    slack_post_message(config,
+                        failure_reply("Error: $err_msg (check server logs)", current_session);
+                        thread_ts, channel_id)
+                catch e2
+                    @error "SlackClaw: error reply not posted" thread_ts exception=(e2, catch_backtrace())
+                end
+            end
         finally
-            delete!(state.busy_threads, thread_ts)
-            # Clean up status file
-            status_path = joinpath(config.repo_dir, config.status_file)
-            isfile(status_path) && rm(status_path; force=true)
+            finish_run!()
         end
     end
 
     push!(state.active_tasks, task)
-    return nothing
+    return true
 end
 
 # --- Dispatch: top-level messages ---
@@ -843,6 +1084,19 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
 
     filter!(!istaskdone, state.active_tasks)
 
+    # The message's own thread already has a run: a reply in it arrived first
+    # (this message reached us late, by reconciliation) and revived the thread.
+    # One run per thread, so this one does not run, and says so plainly rather
+    # than "Still working", which would read as if it were being handled.
+    # Checked before the slot limit, so the user gets the resend instruction.
+    if haskey(state.busy_threads, msg.ts)
+        slack_post_message(config,
+            "_A reply in this thread is already running, so this message was not run. " *
+            "Reply in this thread with the request when it finishes._";
+            thread_ts=msg.ts, channel_id)
+        return
+    end
+
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config,
             "Busy with $(length(state.active_tasks)) task(s) — please wait.";
@@ -853,28 +1107,32 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # Eyes-as-intent: eyes go on at dispatch on ALL channels — on allow_skip
     # channels the skip branch of run_agent_loop! takes them back OFF when the
     # reply is [SKIP]. Lingering eyes = reply coming; vanished eyes = seen,
-    # deliberately staying out.
-    slack_add_reaction(config, msg.ts, "eyes"; channel_id)
+    # deliberately staying out. The reaction goes on inside the run, before
+    # Claude starts. The run tracks the thread when it ends, whatever the
+    # outcome, with its cursor at this message, so a reply posted during the run
+    # is read afterwards by the reconcile poll.
     run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), "";
-                    react_ts=msg.ts, channel_id)
+                    react_ts=msg.ts, channel_id,
+                    before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id))
 end
 
 # --- Dispatch: thread replies ---
 
 """
-Prepended to the prompt when dispatching into a revived thread (empty
-`session_id`): the Slack thread looks continuous to the user, but the expired
-Claude session's context is gone. The note makes Claude disclose that only
-when the message actually depends on the missing context — an unconditional
-"context expired" reply would be the same bookkeeping noise the silent-expiry
-change removed.
+Prepended to the prompt when dispatching into a thread with no Claude session to
+resume (empty `session_id`): a revived expired thread, or a thread whose earlier
+run failed without a session id. The Slack thread looks continuous to the user,
+but the earlier context is gone. The note makes Claude disclose that only when
+the message actually depends on the missing context — an unconditional "context
+expired" reply would be the same bookkeeping noise the silent-expiry change
+removed.
 """
 const REVIVED_THREAD_NOTE = """
-[note from the dispatcher: this reply revives an expired Slack thread — the earlier \
-conversation in this thread is NOT available to you. If the message relies on that \
-earlier content, say the thread's context expired and ask the user to restate what \
-you need; do not guess. If the message stands on its own, just answer it and do not \
-mention this.]"""
+[note from the dispatcher: the earlier conversation in this Slack thread is NOT \
+available to you (the thread expired, or an earlier run in it failed before its \
+session could be resumed). If the message relies on that earlier content, say the \
+earlier context is not available and ask the user to restate what you need; do not \
+guess. If the message stands on its own, just answer it and do not mention this.]"""
 
 """Prompt for a thread dispatch: sender-attributed text, with
 [`REVIVED_THREAD_NOTE`](@ref) prepended when the session has no Claude context
@@ -887,22 +1145,13 @@ function dispatch_thread_reply!(state::MonitorState, msg::SlackMessage, session:
     config = state.config
     ch = session.channel_id
 
-    # If thread is busy, report elapsed time
-    if haskey(state.busy_threads, session.thread_ts)
-        elapsed = round(Int, time() - state.busy_threads[session.thread_ts])
-        mins, secs = divrem(elapsed, 60)
-        elapsed_str = mins > 0 ? "$(mins)m $(secs)s" : "$(secs)s"
-        slack_post_message(config,
-            "_Still working... ($(elapsed_str) elapsed)_";
-            thread_ts=session.thread_ts, channel_id=ch)
-        return
-    end
-
     # Same eyes-as-intent contract as dispatch_command! — a [SKIP]ped thread
-    # reply gets its eyes removed in the agent loop's skip branch
-    slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch)
+    # reply gets its eyes removed in the agent loop's skip branch. The reaction
+    # goes on inside the run, before Claude starts. A busy thread gets "Still
+    # working" from run_agent_loop! (one run per thread).
     run_agent_loop!(state, session.thread_ts, thread_prompt(session, msg),
-                    session.session_id; react_ts=msg.ts, channel_id=ch)
+                    session.session_id; react_ts=msg.ts, channel_id=ch,
+                    before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id=ch))
 end
 
 # --- Shutdown ---

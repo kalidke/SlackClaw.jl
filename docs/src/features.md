@@ -156,10 +156,55 @@ release must add `files:write` and reinstall.
   "busy" reply.
 - A busy thread that receives another message reports elapsed time instead of
   starting a second run.
-- At most `max_active_threads` (default 3) conversation threads are tracked;
+- At most `max_active_threads` (default 3) conversation threads are tracked,
+  besides those with a run in flight or a follow-up scheduled (never retired);
   the oldest are retired first. Threads idle longer than `max_thread_idle_s`
   (default 7 days; `0` disables) are also retired — each tracked thread costs a
   `conversations.replies` call per reconciliation, so this bounds steady load.
+
+## Failed runs
+
+A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
+does not end its thread. Every run leaves its thread tracked, whatever the
+outcome (the one exception: a follow-up saved by an older version, whose
+thread is no longer tracked and whose notice fails to post), so a reply there
+starts a new run: by socket, or by the next reconciliation poll if the socket
+missed it.
+SlackClaw adds ❌, frees the thread, and then posts the reason, so a reply sent
+the moment the reason appears starts a run instead of "Still working". A
+failed reaction is logged and never stops the post.
+
+- When the CLI printed a session id (it does for a step-limit stop, and for
+  any failure that prints its result object), the next run resumes that
+  session, with what the failed run already did. The reply ends with "Reply in
+  this thread to continue; the next run resumes this one."
+- When it printed none (a timeout, or a failure with nothing on stdout), the
+  thread keeps the session it already had: a failed reply in a running
+  conversation still resumes that conversation, with the same line. Only a
+  thread with no session yet (its first run failed this way) starts the next
+  run fresh, told that the earlier context is not available; its reply ends
+  with "Reply in this thread to try again; this run kept no context, so
+  include the request."
+- A step-limit stop reads "Claude stopped at the step limit before finishing."
+  Raise `max_turns` for a channel whose tasks need more steps.
+- A session the CLI no longer has (its transcripts were moved or removed, for
+  example after the account behind `CLAUDE_CONFIG_DIR` changed) is dropped,
+  and the same message runs again at once, so the user never has to send it
+  twice. The rerun starts fresh, told the earlier context is not available,
+  unless the thread holds a different session, which the rerun resumes. It
+  reruns once per dispatched message.
+- A scheduled follow-up resumes the thread's current session, not the id it
+  was saved with, and waits while its thread is running.
+- A thread has one run at a time: a message in a thread that already has a
+  run gets "Still working", whatever dispatched it.
+
+A failed thread counts toward `max_active_threads` like any other. A thread
+with a run in flight or a follow-up scheduled is never expired, and sits beside
+the cap rather than in it. A thread's reply cursor follows Slack's timestamps
+only (the message a run answered, then the last reply read), never the host
+clock. A reply posted during a thread's first run is read by the next poll
+after the run; one the poll or socket reads while a run is going is answered
+"Still working".
 
 ## Persistence
 

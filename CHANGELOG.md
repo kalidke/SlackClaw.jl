@@ -4,6 +4,99 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [0.7.4] — 2026-11-25
+
+Patch: a failed Claude run no longer ends its Slack thread.
+
+### Fixed
+
+- **A failed run keeps its thread.** `run_agent_loop!` tracked a thread only
+  when the run returned a session id, and `run_claude` returned none on a
+  non-zero exit, so a thread whose first run failed was never tracked: the
+  reconcile poll reads replies only in tracked threads, and a reply there
+  started a run only if Socket Mode delivered it. Now every run (a non-zero
+  exit, a step-limit stop, a timeout, an exception in the loop, a success that
+  prints no id) leaves its thread tracked, so the next reply starts a new run
+  whether it arrives by socket or by the reconcile poll.
+- **A failed exit keeps its session id.** With `--output-format json` the CLI
+  prints its result object on a failed exit too, with `session_id`. It is
+  now kept, so the next reply resumes the same session with what the failed
+  run already did. With no id (a timeout, nothing on stdout) the thread keeps
+  the session it had; a thread with none yet starts the next reply fresh, and
+  its prompt carries `REVIVED_THREAD_NOTE`, now worded for both an expired
+  thread and a failed run.
+- **A step-limit stop reads as one.** A run stopped at `max_turns` (result
+  `subtype` `error_max_turns`) has no result text, so the reply was the bare
+  exit code. It now reads "Claude stopped at the step limit before
+  finishing."
+- **Every failed run's reply ends with a line about replying**: "Reply in
+  this thread to continue; the next run resumes this one." when there is a
+  session to resume, and "Reply in this thread to try again; this run kept
+  no context, so include the request." when there is not. The reason text
+  before it is unchanged from 0.7.2, cut to 3000 characters so the line always
+  fits.
+- **A stale session id is dropped, and the message runs again.** A
+  `--resume` of a session the CLI no longer has ("No conversation found with
+  session ID") failed every reply in that thread. The id is now cleared and
+  the same message runs again at once, once per dispatched message: fresh,
+  with `REVIVED_THREAD_NOTE`, or resuming the thread's own session when it
+  holds a different one. The refusal is read from the raw run (a resume was
+  asked, nothing on stdout, the refusal for that id as its own stderr line,
+  bare or after "Error: "), never from posted text, and only the refused id is
+  cleared.
+  `ClaudeResult` gains `session_missing::Bool`; the five-argument constructor
+  stays and sets it false. The transient-failure retries skip a refused
+  resume.
+- **A thread's reply cursor is on Slack's clock.** After each run the cursor
+  was reset to the host's current time, so a reply posted while the run was
+  finishing (or within any host clock lead over Slack) was never read by the
+  poll. A thread now starts at the message its run answered (or the parent
+  post, or a follow-up's notice) and keeps the last reply read, on every path
+  that tracks threads (the agent loop, listen, proactive). A run that knows no
+  such Slack timestamp does not track a thread it finds untracked. A reply
+  posted during a thread's first run is read by the next poll after the run.
+  The tracked session is updated in place under the dispatch lock, and
+  `claim_thread_reply!` claims only against the thread's tracked entry, so a
+  poll holding a session across a Slack call never claims on a dead cursor.
+- **One run per thread.** `run_agent_loop!` refuses a second run in a thread
+  that already has one, whatever dispatched it (a reply, a late top-level
+  message, a scheduled follow-up); a reply gets "Still working", as before.
+  The check and the busy mark are one step with no yield in between. The dispatcher's own Slack call (👀, the follow-up
+  notice) runs inside the run, before Claude starts, so it is never posted
+  after the run's reply. `run_agent_loop!` gains a `before_run` keyword for it
+  and returns whether the run started.
+- **A reply to a failure notice starts a run.** The ❌ reaction goes on
+  first, then the run lets go of the thread (busy mark released, status file
+  cleared), then the reason is posted, so a reply sent while the notice is
+  still being posted starts a run instead of "Still working". A run clears
+  only its own busy mark, and once it has let go it records nothing more: a
+  failed post is logged, never sent back through the loop's error path. A
+  failed reaction or status-file cleanup on that path is logged and never
+  stops the release or the post.
+- **A late top-level message says it was not run.** When the socket missed a
+  top-level message but delivered a reply in its thread, the reply revives
+  the thread and runs (as before: a webhook post, whose event never moves the
+  cursor, has nothing else to read its replies). When reconciliation then
+  reads the message and finds its thread running, the message says it was not
+  run and asks for a reply with the request, instead of "Still working".
+- **Expiry spares threads with work to come.** A thread with a run in flight
+  or a follow-up scheduled is not expired, and such threads sit beside
+  `max_active_threads`, which counts the other threads only.
+- **A scheduled follow-up resumes the thread's current session**, not the
+  older id it was saved with (a thread that holds no session runs it fresh,
+  with `REVIVED_THREAD_NOTE`). It waits while its thread is running or no task
+  slot is free, instead of running beside it, and is saved as deferred
+  (`ScheduledTask` gains `deferred::Bool`; the four-argument constructor
+  stays), so a restart keeps it though its time has passed.
+- **A failed state save no longer hides the run's reply.** It is logged, and
+  the run's reason is still posted.
+- The status-file watcher stops when `run_claude` throws, and no longer posts
+  once more after its run has ended.
+
+Threads already untracked in a saved state stay untracked; a new top-level
+message starts a new thread. A request turned away because every task slot is
+busy is not tracked, as before.
+
 ## [0.7.3] — 2026-10-15
 
 Patch: a message with files and no text is dispatched, and its files are named

@@ -91,6 +91,10 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
         # a thread — the bot's own trailing post into a just-expired thread
         # would otherwise resurrect it indefinitely.
         should_process(msg, config, event) || return nothing
+        # No guard on the thread's own top-level message being unread: a parent
+        # that never moves the primary cursor here (a `bot_message` webhook post)
+        # or never runs (filtered) would leave the reply lost. A late parent is
+        # told it was not run instead (dispatch_command!).
         session = claim_thread_revive!(state, msg, get(event, "channel", ""))
         session === nothing && return nothing
         save_state!(state)
