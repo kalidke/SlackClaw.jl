@@ -1014,11 +1014,18 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     due = time() + directive.delay_s
                     push!(state.scheduled, ScheduledTask(
                         thread_ts, current_session, directive.prompt, due))
-                    save_state!(state)
-                    mins = round(Int, directive.delay_s / 60)
-                    slack_post_message(config,
-                        "_Scheduled follow-up in $(mins)m._";
-                        thread_ts, channel_id)
+                    # The follow-up is queued: a failed save or confirmation is
+                    # logged, never an error reply inviting a retry (which would
+                    # queue it twice)
+                    try
+                        save_state!(state)
+                        mins = round(Int, directive.delay_s / 60)
+                        slack_post_message(config,
+                            "_Scheduled follow-up in $(mins)m._";
+                            thread_ts, channel_id)
+                    catch e
+                        @error "SlackClaw: follow-up queued, but its save or notice failed" thread_ts exception=(e, catch_backtrace())
+                    end
                     @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
                     break
 
@@ -1093,7 +1100,7 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # Checked before the slot limit, so the user gets the resend instruction.
     if haskey(state.busy_threads, msg.ts)
         slack_post_message(config,
-            "_A reply in this thread is already running, so this message was not run. " *
+            "_This thread already has a run going, so this message was not run. " *
             "Reply in this thread with the request when it finishes._";
             thread_ts=msg.ts, channel_id)
         return
@@ -1118,12 +1125,27 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # thread was delivered and ran first, e.g. under a `me_message` the socket
     # skips): it resumes the thread's session rather than starting one, so the
     # thread keeps one conversation (a follow-up the reply scheduled resumes it).
+    # The prompt says the message is older than the replies already handled, so
+    # a later correction in a reply is not read as overridden by it.
     tracked = get(state.threads, msg.ts, nothing)
     sid = tracked === nothing ? "" : tracked.session_id
-    run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), sid;
+    prompt = (isempty(sid) ? "" : LATE_PARENT_NOTE * "\n") * attribute_sender(msg.text, msg.user)
+    run_agent_loop!(state, msg.ts, prompt, sid;
                     react_ts=msg.ts, channel_id,
                     before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id))
 end
+
+"""
+Prepended to a top-level message that reaches the monitor after a reply in its
+thread already ran, when it resumes that thread's session: the message is the
+thread's original post, older than the replies already in the session, so a
+later reply (a correction, a new instruction) takes precedence over it.
+"""
+const LATE_PARENT_NOTE = """
+[note from the dispatcher: the message below is this Slack thread's original top-level \
+post. It reached you late: it was posted BEFORE the replies in this thread that you have \
+already handled. Where it conflicts with those replies, the replies are the more recent \
+instructions.]"""
 
 # --- Dispatch: thread replies ---
 
@@ -1138,8 +1160,8 @@ removed.
 """
 const REVIVED_THREAD_NOTE = """
 [note from the dispatcher: the earlier conversation in this Slack thread is NOT \
-available to you (the thread expired, or an earlier run in it failed before its \
-session could be resumed). If the message relies on that earlier content, say the \
+available to you (the thread expired, an earlier run in it failed before its \
+session could be resumed, or its first message has not reached you yet). If the message relies on that earlier content, say the \
 earlier context is not available and ask the user to restate what you need; do not \
 guess. If the message stands on its own, just answer it and do not mention this.]"""
 

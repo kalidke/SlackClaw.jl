@@ -73,7 +73,7 @@ Patch: a failed Claude run no longer ends its Slack thread.
   failed post is logged, never sent back through the loop's error path. A
   failed reaction or status-file cleanup on that path is logged and never
   stops the release or the post.
-- **A late top-level message says it was not run.** When the socket missed a
+- **A late top-level message keeps its thread's conversation.** When the socket missed a
   top-level message but delivered a reply in its thread, the reply revives
   the thread and runs (as before: a webhook post, whose event never moves the
   cursor, has nothing else to read its replies). When reconciliation then
@@ -83,8 +83,10 @@ Patch: a failed Claude run no longer ends its Slack thread.
   it finds its thread tracked and idle (the reply already ran), it resumes the
   thread's session instead of starting a new one, so the thread keeps one
   conversation and a follow-up the reply scheduled resumes the one that has its
-  request. This also covers Slack's `me_message` status posts, which the socket
-  skips and reconciliation reads.
+  request. Its prompt carries `LATE_PARENT_NOTE`: it is the thread's original
+  post, older than the replies already handled, which take precedence where
+  they conflict. This also covers Slack's `me_message` status posts, which the
+  socket skips and reconciliation reads.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside
   `max_active_threads`, which counts the other threads only.
@@ -96,7 +98,8 @@ Patch: a failed Claude run no longer ends its Slack thread.
   stays), so a restart keeps it though its time has passed, for up to a day.
 - **A failed state save no longer hides the run's reply.** It is logged, and
   the run's reason is still posted. A failed ✅ after a posted answer is only
-  logged too, instead of an error reply inviting a retry of finished work.
+  logged too, instead of an error reply inviting a retry of finished work, as
+  is a failed save or confirmation of a follow-up that is already queued.
 - The status-file watcher stops when `run_claude` throws, and no longer posts
   once more after its run has ended.
 

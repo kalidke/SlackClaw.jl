@@ -1338,7 +1338,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             foreach(wait, state.active_tasks)
             delete!(state.busy_threads, T)
             @test length(calls()) == n0
-            @test top_posted == ["_A reply in this thread is already running, so this message was not run. " *
+            @test top_posted == ["_This thread already has a run going, so this message was not run. " *
                                  "Reply in this thread with the request when it finishes._"]
 
             # 28. A follow-up held back by a busy thread survives a restart however
@@ -1478,6 +1478,12 @@ mkstate(cfg) = SlackClaw.MonitorState(
             c = new_calls(n0)
             @test length(c) == 3
             @test length(c) == 3 && resumed(c[2]) == "s-R" && resumed(c[3]) == "s-R"
+            #     The late message's prompt says it predates the replies handled,
+            #     and keeps its authenticated sender
+            @test length(c) == 3 && occursin("posted BEFORE the replies", c[2]) &&
+                  occursin("[from <@U9>]", c[2]) && occursin("is debugging the pipeline", c[2])
+            #     A message with no session to resume gets no such note
+            @test !occursin("posted BEFORE the replies", c[1])
             @test held(state, T) == "s-R"
             state.last_ts = "100.0"
 
@@ -1492,6 +1498,19 @@ mkstate(cfg) = SlackClaw.MonitorState(
             react_hook[] = nothing
             @test posted == ["all done"]
             @test isempty(top_posted)
+
+            # 36. A follow-up that is queued but whose confirmation post fails is
+            #     only logged: no error reply inviting a retry (a second one)
+            T = "1700000996.000000"
+            clear_logs!()
+            top_hook[] = t -> startswith(t, "_Scheduled follow-up in") && error("simulated chat.postMessage failure")
+            next_run(stdout=replace(sched_json, "s-R" => "s-Q") * "\n")
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "watch it", ""))
+            foreach(wait, state.active_tasks)
+            top_hook[] = nothing
+            @test !any(t -> startswith(t, "Error:"), top_posted)
+            @test count(sc -> sc.thread_ts == T, state.scheduled) == 1
+            filter!(sc -> sc.thread_ts != T, state.scheduled)
 
             # 14. A failed ❌ reaction does not cost the failure reply
             T = "1700000810.000000"
