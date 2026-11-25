@@ -124,7 +124,7 @@ A parsed Slack message.
 struct ClaudeResult
 ```
 Result of one `claude` CLI invocation.
-**Fields:** `success::Bool`, `result_text::String`, `duration_ms::Int`, `cost_usd::Float64`, `session_id::String`. A failed run carries the `session_id` of the CLI's stdout result object when it printed one (a step-limit or usage-limit stop does); a timeout or a failure with nothing on stdout has `""`.
+**Fields:** `success::Bool`, `result_text::String`, `duration_ms::Int`, `cost_usd::Float64`, `session_id::String`, `session_missing::Bool`. A failed run carries the `session_id` of the CLI's stdout result object when it printed one (a step-limit or usage-limit stop does); a timeout or a failure with nothing on stdout has `""`. `session_missing` is true only when the run asked to `--resume` and the CLI refused the session as unknown. The five-argument constructor `ClaudeResult(success, result_text, duration_ms, cost_usd, session_id)` stays and sets `session_missing = false`.
 
 ### MonitorState
 ```julia

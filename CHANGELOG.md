@@ -14,28 +14,53 @@ Patch: a failed Claude run no longer ends its Slack thread.
   when the run returned a session id, and `run_claude` returned none on a
   non-zero exit, so a thread whose first run failed was never tracked: the
   reconcile poll reads replies only in tracked threads, and a reply there
-  started a run only if Socket Mode delivered it. Now any failed run (a
-  non-zero exit, a step-limit stop, a timeout, an exception in the loop)
-  leaves its thread tracked, and the next reply starts a new run whether it
-  arrives by socket or by the reconcile poll.
+  started a run only if Socket Mode delivered it. Now a top-level message's
+  thread is tracked at dispatch, and any run (a non-zero exit, a step-limit
+  stop, a timeout, an exception in the loop, a success that prints no id)
+  leaves its thread tracked, so the next reply starts a new run whether it
+  arrives by socket or by the reconcile poll. A request turned away as busy
+  is tracked too, and its message now reads "Busy with N task(s) — reply in
+  this thread to try again."
 - **A failed exit keeps its session id.** With `--output-format json` the CLI
   prints its result object on a failed exit too, with `session_id`. It is
   now kept, so the next reply resumes the same session with what the failed
-  run already did. With no id (a timeout, nothing on stdout) the next reply
-  starts a fresh session, and its prompt carries `REVIVED_THREAD_NOTE`, now
-  worded for both an expired thread and a failed run.
+  run already did. With no id (a timeout, nothing on stdout) the thread keeps
+  the session it had; a thread with none yet starts the next reply fresh, and
+  its prompt carries `REVIVED_THREAD_NOTE`, now worded for both an expired
+  thread and a failed run.
 - **A step-limit stop reads as one.** A run stopped at `max_turns` (result
   `subtype` `error_max_turns`) has no result text, so the reply was the bare
   exit code. It now reads "Claude stopped at the step limit before
   finishing."
 - **Every failed run's reply ends with a line about replying**: "Reply in
   this thread to continue; the next run resumes this one." when there is a
-  session to resume, and "Reply in this thread to try again, with the
-  request: this run kept no context." when there is not. The reason text
+  session to resume, and "Reply in this thread to try again; this run kept
+  no context, so include the request." when there is not. The reason text
   before it is unchanged from 0.7.2.
-- **A stale session id is dropped.** A `--resume` of a session the CLI no
-  longer has ("No conversation found with session ID") failed every reply in
-  that thread. The id is now cleared, so the next reply starts fresh.
+- **A stale session id is dropped, and the message runs again.** A
+  `--resume` of a session the CLI no longer has ("No conversation found with
+  session ID") failed every reply in that thread. The id is now cleared and
+  the same message runs again at once: fresh, with `REVIVED_THREAD_NOTE`, or
+  resuming the thread's own session when it holds a newer one (a scheduled
+  task fires with the id it was saved with). Once per message. The refusal is
+  read from the raw run (a resume was asked, nothing on stdout, the phrase on
+  stderr), never from posted text, and only the refused id is cleared.
+  `ClaudeResult` gains `session_missing::Bool`; the five-argument constructor
+  stays and sets it false. The transient-failure retries skip a refused
+  resume.
+- **A thread's reply cursor follows Slack's clock only.** After each run the
+  cursor was reset to the host's current time, so a reply posted while the
+  run was finishing (or within any host clock lead over Slack) was never read
+  by the poll. A thread's cursor now starts at its parent's timestamp and
+  stays at the last reply read, on every path that tracks threads (the agent
+  loop, listen, proactive). The tracked session is updated in place, so a
+  poll that holds it across a Slack call claims against the live cursor, and
+  a poll whose thread was re-tracked during the call drops its stale read.
+- **A failed run's reply is the run's last Slack call.** The ❌ reaction goes
+  on first, so a reply sent the moment the failure notice appears finds the
+  thread free instead of "Still working".
+- **A failed state save no longer hides the run's reply.** It is logged, and
+  the run's reason is still posted.
 
 Threads already untracked in a saved state stay untracked; a new top-level
 message starts a new thread.

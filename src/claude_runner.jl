@@ -1,5 +1,9 @@
 """
 Result from a Claude CLI invocation.
+
+`session_missing` is true only when the run asked to `--resume` a session and the
+CLI refused it as unknown (see [`resume_refused`](@ref)); the five-argument
+constructor sets it false.
 """
 struct ClaudeResult
     success::Bool
@@ -7,7 +11,11 @@ struct ClaudeResult
     duration_ms::Int
     cost_usd::Float64
     session_id::String
+    session_missing::Bool
 end
+
+ClaudeResult(success, result_text, duration_ms, cost_usd, session_id) =
+    ClaudeResult(success, result_text, duration_ms, cost_usd, session_id, false)
 
 """
 Appended to the system prompt when the upload helper and a Slack thread are
@@ -124,11 +132,12 @@ function run_claude(prompt::String, config::SlackClawConfig;
     # before giving up. The failure reason is the stdout result text first, then
     # stderr as a fallback (see `exit_failure_message`). We do NOT retry a
     # timeout, nor a non-zero exit that already produced stdout (it may have done
-    # partial work).
+    # partial work), nor a refused --resume (the session will not reappear).
+    resumed = !isempty(session_id)
     res = _run_claude_once(cmd, config.claude_timeout_s)
     attempt = 0
     while !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
-          attempt < config.claude_max_retries
+          !resume_refused(res, resumed) && attempt < config.claude_max_retries
         attempt += 1
         backoff = config.claude_retry_backoff_s * 2.0^(attempt - 1)
         @warn "SlackClaw: claude exited non-zero — retrying" attempt exitcode=res.exitcode backoff_s=backoff stderr=last(strip(res.stderr), 300)
@@ -137,23 +146,37 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     duration_ms = round(Int, (time() - t_start) * 1000)
-    return interpret_claude_run(res, duration_ms, config.claude_timeout_s)
+    return interpret_claude_run(res, duration_ms, config.claude_timeout_s; resumed)
 end
 
 """
-    interpret_claude_run(res, duration_ms, timeout_s) -> ClaudeResult
+    resume_refused(res, resumed) -> Bool
+
+Whether a finished run is the CLI refusing `--resume` of a session it does not
+have: the run asked to resume (`resumed`), exited non-zero, printed nothing on
+stdout, and printed `No conversation found with session ID` on stderr. Judged on
+the raw streams, not the posted reason, so a result text that merely quotes the
+phrase never counts.
+"""
+resume_refused(res, resumed::Bool) =
+    resumed && !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
+    occursin("No conversation found with session ID", res.stderr)
+
+"""
+    interpret_claude_run(res, duration_ms, timeout_s; resumed=false) -> ClaudeResult
 
 Turn one finished `claude` run (the NamedTuple from `_run_claude_once`:
 `exitcode`, `stdout`, `stderr`, `timed_out`) into a `ClaudeResult`. The
 subprocess and its retries stay in `run_claude`; this part reads only the
-captured output.
+captured output. `resumed` says whether the run was given `--resume`.
 
 A non-zero exit keeps the `session_id` of the CLI's stdout result object when it
 printed one: with `--output-format json` it does on a failed exit too (a step
 limit, a usage limit), so the thread can resume that session. A timeout has no
-id: the run was killed before printing anything.
+id: the run was killed before printing anything. A refused resume sets
+`session_missing` ([`resume_refused`](@ref)).
 """
-function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real)
+function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::Bool=false)
     if res.timed_out
         @warn "SlackClaw: claude timed out" timeout_s
         return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, "")
@@ -162,8 +185,9 @@ function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real)
     if res.exitcode != 0
         msg = exit_failure_message(res.exitcode, res.stdout, res.stderr)
         sid = stdout_session_id(res.stdout)
-        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg session_id=sid stderr=strip(res.stderr)
-        return ClaudeResult(false, msg, duration_ms, 0.0, sid)
+        missing_session = resume_refused(res, resumed)
+        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg session_id=sid session_missing=missing_session stderr=strip(res.stderr)
+        return ClaudeResult(false, msg, duration_ms, 0.0, sid, missing_session)
     end
 
     return parse_claude_output(res.stdout, duration_ms)

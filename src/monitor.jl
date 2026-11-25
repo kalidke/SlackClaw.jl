@@ -476,9 +476,7 @@ function dispatch_listen_command!(state::MonitorState, msg::SlackMessage, ch_nam
 
             # Track the thread for follow-up replies
             if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
+                track_thread!(state, thread_ts, primary; session_id=result.session_id)
             end
         catch e
             @error "SlackClaw listen dispatch error" channel=ch_name exception=(e, catch_backtrace())
@@ -492,12 +490,16 @@ end
 # --- Thread polling ---
 
 function poll_threads!(state::MonitorState)
-    for (thread_ts, session) in state.threads
+    # A snapshot: agent-loop tasks add threads while this loop waits on Slack
+    for (thread_ts, session) in collect(state.threads)
         state.running || break
         try
             raw_replies = slack_get_replies(state.config, thread_ts, session.last_reply_ts;
                                            channel_id=session.channel_id)
             isempty(raw_replies) && continue
+            # The thread expired or was re-tracked during the call: this read is
+            # against a dead cursor, and the next poll reads it against the live one
+            get(state.threads, thread_ts, nothing) === session || continue
             parsed = parse_slack_messages(raw_replies)
             for (msg, raw) in zip(parsed, raw_replies)
                 claim_thread_reply!(state, session, msg.ts) || continue
@@ -666,9 +668,7 @@ function check_proactive!(state::MonitorState)
 
             # Track thread for follow-up replies
             if !isempty(result.session_id)
-                state.threads[thread_ts] = ThreadSession(
-                    thread_ts, result.session_id, slack_ts_now(), time(), primary)
-                save_state!(state)
+                track_thread!(state, thread_ts, primary; session_id=result.session_id)
             end
 
             @info "SlackClaw: proactive check posted to channel"
@@ -684,33 +684,58 @@ end
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
-    track_thread!(state, thread_ts, session_id, channel_id)
+    track_thread!(state, thread_ts, channel_id; session_id="", attempted="", session_missing=false) -> String
 
-Track `thread_ts` (replacing any earlier session for it) and save state. An empty
-`session_id` means there is no Claude session to resume: the next reply starts a
-fresh one, with [`REVIVED_THREAD_NOTE`](@ref) in its prompt.
+Record a finished run in `thread_ts` and save state; returns the session id the
+thread now holds (empty: nothing to resume, so the next reply starts a fresh
+session with [`REVIVED_THREAD_NOTE`](@ref) in its prompt).
+
+- `session_id` non-empty (the run printed one): the thread holds it.
+- Otherwise (a failed run with no id): a tracked thread keeps the id it holds,
+  which may be newer than the one this run `attempted` to resume (a scheduled
+  task fires with the id it was saved with); an untracked thread starts with
+  `attempted`. With `session_missing` (the CLI refused to resume `attempted`) that
+  id is dropped, but only where the thread still holds it.
+
+A tracked thread's `ThreadSession` is updated in place under `dispatch_lock`, never
+replaced: a poll or socket claim holding the object keeps claiming against the
+live cursor. The reply cursor is never moved by the host clock: a new thread's
+starts at its parent `thread_ts` (Slack's clock), and a tracked thread keeps the
+last reply it claimed, so a reply posted while the run was finishing is still read.
+A failed state save is logged, never thrown: it must not replace the run's reply.
 """
-function track_thread!(state::MonitorState, thread_ts::AbstractString,
-                       session_id::AbstractString, channel_id::AbstractString)
-    state.threads[thread_ts] = ThreadSession(
-        String(thread_ts), String(session_id), slack_ts_now(), time(), String(channel_id))
-    save_state!(state)
+function track_thread!(state::MonitorState, thread_ts::AbstractString, channel_id::AbstractString;
+                       session_id::AbstractString="", attempted::AbstractString="",
+                       session_missing::Bool=false)
+    held = lock(state.dispatch_lock) do
+        s = get(state.threads, thread_ts, nothing)
+        if s === nothing
+            sid = !isempty(session_id) ? session_id : session_missing ? "" : attempted
+            state.threads[thread_ts] = ThreadSession(
+                String(thread_ts), String(sid), String(thread_ts), time(), String(channel_id))
+            return String(sid)
+        end
+        if !isempty(session_id)
+            s.session_id = String(session_id)
+        elseif session_missing && s.session_id == attempted
+            s.session_id = ""
+        end
+        s.created = time()  # recent activity: the thread is not the oldest for the cap
+        return s.session_id
+    end
+    try
+        save_state!(state)
+    catch e
+        @error "SlackClaw: state save failed" thread_ts exception=(e, catch_backtrace())
+    end
+    return held
 end
-
-"""
-    session_not_found(reason) -> Bool
-
-Whether a failed run's reason is the CLI refusing `--resume` of a session it does
-not have. It exits 1 with nothing on stdout and `No conversation found with
-session ID: <id>` on stderr, which reaches the reason as its stderr tail.
-"""
-session_not_found(reason::AbstractString) = occursin("No conversation found with session ID", reason)
 
 """Line ending a failed run's reply when the next run resumes its session."""
 const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
 
 """Line ending a failed run's reply when there is no session to resume."""
-const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, with the request: this run kept no context._"
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again; this run kept no context, so include the request._"
 
 """
     failure_reply(reason, session_id) -> String
@@ -748,6 +773,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         current_prompt = prompt
         current_session = session_id
         continue_count = 0
+        reran_missing = false
 
         try
             while true
@@ -764,24 +790,37 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # Stop watcher
                 stop_watcher[] = true
 
-                # Update session tracking. A failed run keeps its thread tracked
-                # even with no session id (a timeout, or a failure that printed
-                # none): the reconcile poll then reads replies in the thread, so
-                # a reply starts a new run with or without a socket event.
-                !isempty(result.session_id) && (current_session = result.session_id)
-                # A session the CLI no longer has (its transcripts moved or were
-                # removed) fails every resume: drop the id, so the next reply
-                # starts a fresh session instead of failing the same way.
-                !result.success && session_not_found(result.result_text) &&
-                    (current_session = "")
-                if !isempty(result.session_id) || !result.success
-                    track_thread!(state, thread_ts, current_session, channel_id)
+                # The CLI has no such session (its transcripts moved or were
+                # removed): drop the id and run this message again at once, so a
+                # stale id never costs the user a reply. The rerun resumes the
+                # thread's own session when it holds a different one (a scheduled
+                # task fires with the id it was saved with), else starts fresh
+                # with REVIVED_THREAD_NOTE. Once per message.
+                if result.session_missing && !reran_missing
+                    reran_missing = true
+                    held = track_thread!(state, thread_ts, channel_id;
+                        attempted=current_session, session_missing=true)
+                    @info "SlackClaw: session not found, running again" thread_ts refused=current_session resume=held
+                    isempty(held) && (current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt)
+                    current_session = held
+                    continue
                 end
 
+                # Update session tracking after every run. A failed run keeps its
+                # thread tracked even with no session id (a timeout, or a failure
+                # that printed none): the reconcile poll then reads replies in the
+                # thread, so a reply starts a new run with or without a socket
+                # event. A session the CLI refused to resume is dropped.
+                current_session = track_thread!(state, thread_ts, channel_id;
+                    session_id=result.session_id, attempted=current_session,
+                    session_missing=result.session_missing)
+
                 if !result.success
+                    # React first: the reply invites an immediate answer, and
+                    # this thread stays busy until the loop exits
+                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                     post_response(config, failure_reply(result.result_text, current_session),
                                   thread_ts; channel_id)
-                    !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                     break
                 end
 
@@ -844,13 +883,13 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
             try
                 # Same as a failed run: the thread stays reachable by a reply
-                haskey(state.threads, thread_ts) ||
-                    track_thread!(state, thread_ts, current_session, channel_id)
+                current_session = track_thread!(state, thread_ts, channel_id;
+                                                attempted=current_session)
                 err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
+                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                 slack_post_message(config,
                     failure_reply("Error: $err_msg (check server logs)", current_session);
                     thread_ts, channel_id)
-                !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
             catch; end
         finally
             delete!(state.busy_threads, thread_ts)
@@ -891,11 +930,16 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
         return
     end
 
+    # Track the thread at dispatch, before anything can go wrong: whatever
+    # happens to the run (busy, failed, no session id printed), a reply in the
+    # thread is read by the reconcile poll, with or without a socket event.
+    track_thread!(state, msg.ts, channel_id)
+
     filter!(!istaskdone, state.active_tasks)
 
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config,
-            "Busy with $(length(state.active_tasks)) task(s) — please wait.";
+            "Busy with $(length(state.active_tasks)) task(s) — reply in this thread to try again.";
             thread_ts=msg.ts, channel_id)
         return
     end

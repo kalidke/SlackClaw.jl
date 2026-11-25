@@ -164,24 +164,39 @@ release must add `files:write` and reinstall.
 ## Failed runs
 
 A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
-does not end its thread. SlackClaw posts the reason, adds ❌, and keeps the
-thread tracked, so a reply there starts a new run: by socket, or by the next
-reconciliation poll if the socket missed it.
+does not end its thread. A top-level message's thread is tracked the moment it
+is dispatched, so whatever happens to the run, a reply there starts a new run:
+by socket, or by the next reconciliation poll if the socket missed it.
+SlackClaw adds ❌ and then posts the reason, so a reply sent the moment the
+reason appears finds the thread free.
 
-- When the CLI printed a session id (it does for a step-limit or usage-limit
-  stop), the next run resumes that session, with what the failed run already
-  did. The reply ends with "Reply in this thread to continue; the next run
-  resumes this one."
-- When there is none (a timeout, or a failure with nothing on stdout), the next
-  run starts a fresh session, told that the earlier context is not available.
-  The reply ends with "Reply in this thread to try again, with the request:
-  this run kept no context."
+- When the CLI printed a session id (it does for a step-limit stop, and for
+  any failure that prints its result object), the next run resumes that
+  session, with what the failed run already did. The reply ends with "Reply in
+  this thread to continue; the next run resumes this one."
+- When it printed none (a timeout, or a failure with nothing on stdout), the
+  thread keeps the session it already had: a failed reply in a running
+  conversation still resumes that conversation, with the same line. Only a
+  thread with no session yet (its first run failed this way) starts the next
+  run fresh, told that the earlier context is not available; its reply ends
+  with "Reply in this thread to try again; this run kept no context, so
+  include the request."
 - A step-limit stop reads "Claude stopped at the step limit before finishing."
   Raise `max_turns` for a channel whose tasks need more steps.
-- A session the CLI no longer has (its transcripts were moved or removed) is
-  dropped after the first refused resume, so the next reply starts fresh.
+- A session the CLI no longer has (its transcripts were moved or removed, for
+  example after the account behind `CLAUDE_CONFIG_DIR` changed) is dropped,
+  and the same message runs again at once, so the user never has to send it
+  twice. The rerun starts fresh, told the earlier context is not available,
+  unless the thread holds a newer session (a scheduled follow-up fires with
+  the id it was saved with), which the rerun resumes. It reruns once per
+  message.
+- A request turned away because every task slot is busy says "reply in this
+  thread to try again"; its thread is tracked, so that reply is read.
 
-A failed thread counts toward `max_active_threads` like any other.
+A failed thread counts toward `max_active_threads` like any other. A thread's
+reply cursor follows Slack's timestamps only (the parent message, then the last
+reply read), never the host clock, so a reply posted while a run is finishing
+is read by the next poll.
 
 ## Persistence
 
