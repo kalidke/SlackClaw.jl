@@ -588,7 +588,7 @@ function check_scheduled!(state::MonitorState)
     now = time()
     filter!(!istaskdone, state.active_tasks)
     fired = ScheduledTask[]
-    newly_deferred = false
+    waiting = false
     # No yield in this loop: each due follow-up stays in `state.scheduled` (so
     # its thread cannot expire) until its run has the thread and a slot, and
     # nothing else can take either between the check and the start.
@@ -599,8 +599,8 @@ function check_scheduled!(state::MonitorState)
         # passed while the monitor was down) keeps it.
         if haskey(state.busy_threads, sched.thread_ts) ||
            length(state.active_tasks) >= state.config.max_concurrent_tasks
-            newly_deferred |= !sched.deferred
             sched.deferred = true
+            waiting = true
             continue
         end
         tracked = get(state.threads, sched.thread_ts, nothing)
@@ -619,7 +619,9 @@ function check_scheduled!(state::MonitorState)
         filter!(s -> s !== sched, state.scheduled)
         push!(fired, sched)
     end
-    (newly_deferred || !isempty(fired)) || return
+    # Saved on every poll while a follow-up waits, not only the first: a save
+    # that failed once must not leave the deferral unsaved
+    (waiting || !isempty(fired)) || return
     try
         save_state!(state)
     catch e
@@ -1082,21 +1084,22 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
 
     filter!(!istaskdone, state.active_tasks)
 
-    if length(state.active_tasks) >= config.max_concurrent_tasks
-        slack_post_message(config,
-            "Busy with $(length(state.active_tasks)) task(s) — please wait.";
-            thread_ts=msg.ts, channel_id)
-        return
-    end
-
     # The message's own thread already has a run: a reply in it arrived first
     # (this message reached us late, by reconciliation) and revived the thread.
     # One run per thread, so this one does not run, and says so plainly rather
     # than "Still working", which would read as if it were being handled.
+    # Checked before the slot limit, so the user gets the resend instruction.
     if haskey(state.busy_threads, msg.ts)
         slack_post_message(config,
             "_A reply in this thread is already running, so this message was not run. " *
             "Reply in this thread with the request when it finishes._";
+            thread_ts=msg.ts, channel_id)
+        return
+    end
+
+    if length(state.active_tasks) >= config.max_concurrent_tasks
+        slack_post_message(config,
+            "Busy with $(length(state.active_tasks)) task(s) — please wait.";
             thread_ts=msg.ts, channel_id)
         return
     end

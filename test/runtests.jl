@@ -1350,7 +1350,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             SlackClaw.check_scheduled!(state)
             delete!(state.busy_threads, T)
             reloaded_sched = SlackClaw.load_state(cfg)[3]
-            @test any(s -> s.thread_ts == T, reloaded_sched)
+            @test any(s -> s.thread_ts == T && s.deferred, reloaded_sched)
             filter!(s -> s.thread_ts != T, state.scheduled)
 
             # 29. A due follow-up with no free task slot waits for the next poll
@@ -1387,37 +1387,32 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test posted == ["all done"]
             @test held(state, T) == "s-eyes2"
 
-            # 31. A socket reply in a thread whose top-level message has not been
-            #     read yet (its event was missed) does not revive the thread: the
-            #     message runs first, then the poll runs the reply in its session
+            # 31. A socket reply under a top-level post the primary cursor has not
+            #     passed (a webhook post: its bot_message event never moves the
+            #     cursor) revives the thread and runs: nothing else would read it
             T = "1700000990.000000"
             state.last_ts = "1700000980.000000"   # the primary cursor is behind T
+            next_run(stdout=ok_json("s-hook") * "\n")
             n0 = length(calls())
-            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"?","ts":"1700000990.000100","thread_ts":"$T"}""")
+            hook = SlackClaw.JSON.parse("""{"type":"message","subtype":"bot_message","channel":"C0","bot_id":"B7","text":"CI failed on main","ts":"$T"}""")
+            SlackClaw.route_socket_event!(state, hook)
+            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"why did it fail?","ts":"1700000990.000100","thread_ts":"$T"}""")
             SlackClaw.route_socket_event!(state, ev)
             foreach(wait, state.active_tasks)
-            @test length(calls()) == n0
-            @test held(state, T) === nothing
-            next_run(stdout=ok_json("s-parent") * "\n")
-            @test SlackClaw.claim_primary!(state, T)     # reconciliation reads the message
-            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "the request", ""))
-            foreach(wait, state.active_tasks)
-            next_run(stdout=ok_json("s-parent") * "\n")
-            poll!(state, reply("1700000990.000100", "?", T))
             c = new_calls(n0)
-            @test length(c) == 2 && occursin("the request", c[1]) && occursin("?", c[2]) &&
-                  resumed(c[2]) == "s-parent"
-            #     A reply in an expired thread (its message read long ago) still
-            #     revives it
-            T = "1700000970.000000"
-            next_run(stdout=ok_json("s-rev") * "\n")
-            n0 = length(calls())
-            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"again","ts":"1700000999.000100","thread_ts":"$T"}""")
-            SlackClaw.route_socket_event!(state, ev)
-            foreach(wait, state.active_tasks)
-            @test length(new_calls(n0)) == 1
-            @test held(state, T) == "s-rev"
+            @test length(c) == 1 && occursin("why did it fail?", c[1])
+            @test held(state, T) == "s-hook"
             state.last_ts = "100.0"
+
+            #     A late top-level message whose thread is running says it was
+            #     not run, also when every slot is taken
+            cfg_one = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                      max_concurrent_tasks=0, state_file="one-state.json")
+            state_one = mkstate(cfg_one)
+            state_one.busy_threads[T] = time()
+            clear_logs!()
+            SlackClaw.dispatch_command!(state_one, SlackMessage(T, "U9", "the request", ""))
+            @test length(top_posted) == 1 && occursin("this message was not run", top_posted[1])
 
             # 32. A polled reply in a thread that already has a run starts no
             #     second run; it is told the run is going

@@ -73,13 +73,12 @@ Patch: a failed Claude run no longer ends its Slack thread.
   failed post is logged, never sent back through the loop's error path. A
   failed reaction or status-file cleanup on that path is logged and never
   stops the release or the post.
-- **A reply never runs ahead of its thread's own message.** When the socket
-  missed a top-level message but delivered a reply in its thread, the reply
-  revived the thread and ran without it. A socket reply in a thread whose
-  message the reconcile poll has not read yet now waits: the message runs
-  first, and the poll after it runs the reply in the message's session. A
-  top-level message that still finds its thread running says it was not run
-  and asks for a reply with the request.
+- **A late top-level message says it was not run.** When the socket missed a
+  top-level message but delivered a reply in its thread, the reply revives
+  the thread and runs (as before: a webhook post, whose event never moves the
+  cursor, has nothing else to read its replies). When reconciliation then
+  reads the message and finds its thread running, the message says it was not
+  run and asks for a reply with the request, instead of "Still working".
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside
   `max_active_threads`, which counts the other threads only.
