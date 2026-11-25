@@ -166,8 +166,10 @@ release must add `files:write` and reinstall.
 
 A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
 does not end its thread. Every run leaves its thread tracked, whatever the
-outcome, so a reply there starts a new run: by socket, or by the next
-reconciliation poll if the socket missed it.
+outcome (the one exception: a follow-up saved by an older version, whose
+thread is no longer tracked and whose notice fails to post), so a reply there
+starts a new run: by socket, or by the next reconciliation poll if the socket
+missed it.
 SlackClaw adds ❌, frees the thread, and then posts the reason, so a reply sent
 the moment the reason appears starts a run instead of "Still working". A
 failed reaction is logged and never stops the post.
@@ -199,8 +201,10 @@ failed reaction is logged and never stops the post.
 A failed thread counts toward `max_active_threads` like any other. A thread
 with a run in flight or a follow-up scheduled is never expired, and sits beside
 the cap rather than in it. A thread's reply cursor follows Slack's timestamps
-only (the message a run answered, then the last reply read), so a reply posted
-during a run, or while it is finishing, is read by the next poll.
+only (the message a run answered, then the last reply read), never the host
+clock. A reply posted during a thread's first run is read by the next poll
+after the run; one the poll or socket reads while a run is going is answered
+"Still working".
 
 ## Persistence
 

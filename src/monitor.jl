@@ -12,13 +12,19 @@ mutable struct ThreadSession
     channel_id::String     # which channel this thread lives in
 end
 
-"""A scheduled future invocation."""
+"""A scheduled future invocation. `deferred` marks one that came due but had to
+wait (its thread was running, or no slot was free): it is kept across a restart
+even once its time has passed, where a follow-up that never came due is not."""
 mutable struct ScheduledTask
     thread_ts::String
     session_id::String
     prompt::String
     due_at::Float64  # time() when this should fire
+    deferred::Bool
 end
+
+ScheduledTask(thread_ts, session_id, prompt, due_at) =
+    ScheduledTask(thread_ts, session_id, prompt, due_at, false)
 
 """
 Runtime state of a monitor: cursors, tracked threads, scheduled tasks, and
@@ -94,6 +100,7 @@ function save_state!(state::MonitorState)
         "session_id" => s.session_id,
         "prompt" => s.prompt,
         "due_at" => s.due_at,
+        "deferred" => s.deferred,
     ) for s in state.scheduled]
     data = Dict(
         "last_ts" => state.last_ts,
@@ -146,9 +153,12 @@ function load_state(config::SlackClawConfig)
         now = time()
         for d in get(data, "scheduled", [])
             due = d["due_at"]
-            due > now || continue  # skip expired scheduled tasks
+            deferred = get(d, "deferred", false) === true
+            # Skip follow-ups whose time passed while the monitor was down; keep
+            # one that came due and was waiting for its thread
+            due > now || deferred || continue
             push!(scheduled, ScheduledTask(
-                d["thread_ts"], d["session_id"], d["prompt"], due))
+                d["thread_ts"], d["session_id"], d["prompt"], due, deferred))
         end
         for (ch, ts) in get(data, "listen_last_ts", Dict())
             listen_last_ts[ch] = ts
@@ -578,19 +588,19 @@ function check_scheduled!(state::MonitorState)
     now = time()
     filter!(!istaskdone, state.active_tasks)
     fired = ScheduledTask[]
-    deferred = false
+    newly_deferred = false
     # No yield in this loop: each due follow-up stays in `state.scheduled` (so
     # its thread cannot expire) until its run has the thread and a slot, and
     # nothing else can take either between the check and the start.
     for sched in filter(s -> s.due_at <= now, state.scheduled)
         # A follow-up whose thread is running, or with no free slot, waits until
         # both are free: two runs in one thread would write the same session.
-        # Its due time moves just ahead, so a restart (which drops past-due
-        # follow-ups) keeps it.
+        # It is marked deferred, so a restart (which drops follow-ups whose time
+        # passed while the monitor was down) keeps it.
         if haskey(state.busy_threads, sched.thread_ts) ||
            length(state.active_tasks) >= state.config.max_concurrent_tasks
-            sched.due_at = now + state.config.poll_interval_s
-            deferred = true
+            newly_deferred |= !sched.deferred
+            sched.deferred = true
             continue
         end
         tracked = get(state.threads, sched.thread_ts, nothing)
@@ -609,7 +619,7 @@ function check_scheduled!(state::MonitorState)
         filter!(s -> s !== sched, state.scheduled)
         push!(fired, sched)
     end
-    (deferred || !isempty(fired)) || return
+    (newly_deferred || !isempty(fired)) || return
     try
         save_state!(state)
     catch e
@@ -1030,7 +1040,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     slack_post_message(config,
                         failure_reply("Error: $err_msg (check server logs)", current_session);
                         thread_ts, channel_id)
-                catch; end
+                catch e2
+                    @error "SlackClaw: error reply not posted" thread_ts exception=(e2, catch_backtrace())
+                end
             end
         finally
             finish_run!()
@@ -1073,6 +1085,18 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     if length(state.active_tasks) >= config.max_concurrent_tasks
         slack_post_message(config,
             "Busy with $(length(state.active_tasks)) task(s) — please wait.";
+            thread_ts=msg.ts, channel_id)
+        return
+    end
+
+    # The message's own thread already has a run: a reply in it arrived first
+    # (this message reached us late, by reconciliation) and revived the thread.
+    # One run per thread, so this one does not run, and says so plainly rather
+    # than "Still working", which would read as if it were being handled.
+    if haskey(state.busy_threads, msg.ts)
+        slack_post_message(config,
+            "_A reply in this thread is already running, so this message was not run. " *
+            "Reply in this thread with the request when it finishes._";
             thread_ts=msg.ts, channel_id)
         return
     end

@@ -91,6 +91,11 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
         # a thread — the bot's own trailing post into a just-expired thread
         # would otherwise resurrect it indefinitely.
         should_process(msg, config, event) || return nothing
+        # The thread's own top-level message is not read yet (its socket event
+        # was missed; reconciliation will read it): reviving now would run this
+        # reply without it and turn the message away when it is read. Leave the
+        # reply: the message runs first, and the poll after it reads the reply.
+        msg.thread_ts > state.last_ts && return nothing
         session = claim_thread_revive!(state, msg, get(event, "channel", ""))
         session === nothing && return nothing
         save_state!(state)

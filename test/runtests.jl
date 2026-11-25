@@ -1029,7 +1029,9 @@ mkstate(cfg) = SlackClaw.MonitorState(
             T = "1700000700.000000"
             clear_logs!()
             busy_at = Dict{String,Bool}()
-            react_hook[] = e -> (busy_at["react:" * e] = haskey(state.busy_threads, T))
+            tracked_at_eyes = Ref(true)
+            react_hook[] = e -> (busy_at["react:" * e] = haskey(state.busy_threads, T);
+                                 e == "eyes" && (tracked_at_eyes[] = haskey(state.threads, T)))
             post_hook[] = ts -> (busy_at["post"] = haskey(state.busy_threads, T))
             next_run(stdout=steps_json * "\n", code=1)
             SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "refactor the parser", "");
@@ -1040,6 +1042,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test posted_to == [(T, "C7")]
             @test slack_log == ["react:eyes", "react:x", "post"]
             @test busy_at == Dict("react:eyes" => true, "react:x" => true, "post" => false)
+            @test !tracked_at_eyes[]   # tracked when its run ends, not at dispatch
             @test held(state, T) == "s-steps"
             sess = get(state.threads, T, nothing)
 
@@ -1054,10 +1057,13 @@ mkstate(cfg) = SlackClaw.MonitorState(
             bot_post = Dict{String,Any}("ts" => "1700000700.000050", "user" => "UBOT",
                                         "bot_id" => "B1", "text" => "stopped", "thread_ts" => T)
             busy_at = Dict{String,Bool}()
-            react_hook[] = e -> (busy_at["react:" * e] = haskey(state.busy_threads, T))
+            eyes_calls = Ref(-1)
+            react_hook[] = e -> (busy_at["react:" * e] = haskey(state.busy_threads, T);
+                                 e == "eyes" && (sleep(0.3); eyes_calls[] = length(calls())))
             poll!(state, bot_post, reply("1700000700.000100", "please continue", T))
             react_hook[] = nothing
             @test get(busy_at, "react:eyes", false)   # the run was busy before 👀
+            @test eyes_calls[] == n0                   # and Claude had not started
             c = new_calls(n0)
             @test length(c) == 1
             @test length(c) == 1 && occursin("please continue", c[1]) && resumed(c[1]) == "s-steps" &&
@@ -1262,9 +1268,8 @@ mkstate(cfg) = SlackClaw.MonitorState(
             n0 = length(calls())
             SlackClaw.check_scheduled!(state)
             @test length(calls()) == n0
-            @test any(s -> s.thread_ts == T && s.due_at > time(), state.scheduled)  # next poll
+            @test any(s -> s.thread_ts == T && s.deferred, state.scheduled)
             delete!(state.busy_threads, T)
-            foreach(s -> s.thread_ts == T && (s.due_at = 0.0), state.scheduled)  # that poll comes
             next_run(stdout=ok_json("s-run") * "\n")
             SlackClaw.check_scheduled!(state)
             foreach(wait, state.active_tasks)
@@ -1322,9 +1327,9 @@ mkstate(cfg) = SlackClaw.MonitorState(
                 @test posted == [auth_reason * "\n\n" * retry_line]
             end
 
-            # 27. One run per thread: a message whose thread already has a run
-            #     (here a top-level message arriving after a reply revived its
-            #     thread) starts no second run and is told the run is going
+            # 27. One run per thread: a top-level message arriving after a reply
+            #     revived its thread starts no second run, and says plainly that
+            #     it was not run and how to run it
             T = "1700000895.000000"
             state.busy_threads[T] = time()
             clear_logs!()
@@ -1333,10 +1338,11 @@ mkstate(cfg) = SlackClaw.MonitorState(
             foreach(wait, state.active_tasks)
             delete!(state.busy_threads, T)
             @test length(calls()) == n0
-            @test length(top_posted) == 1 && startswith(top_posted[1], "_Still working...")
+            @test top_posted == ["_A reply in this thread is already running, so this message was not run. " *
+                                 "Reply in this thread with the request when it finishes._"]
 
-            # 28. A follow-up held back by a busy thread survives a restart: its
-            #     due time moves ahead, and the saved state keeps it
+            # 28. A follow-up held back by a busy thread survives a restart however
+            #     long: it is saved as deferred, kept though its time has passed
             T = "1700000896.000000"
             track!(state, T, "s-held")
             state.busy_threads[T] = time()
@@ -1358,7 +1364,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             SlackClaw.check_scheduled!(state_full)
             @test length(calls()) == n0
             @test isempty(top_posted)   # no "Busy" post for a follow-up: it just waits
-            @test any(s -> s.thread_ts == T && s.due_at > time(), state_full.scheduled)
+            @test any(s -> s.thread_ts == T && s.deferred, state_full.scheduled)
 
             # 30. 👀 goes on inside the run, before Claude starts, even when the
             #     reaction is slow; and a failing 👀 does not stop the run
@@ -1380,6 +1386,58 @@ mkstate(cfg) = SlackClaw.MonitorState(
             react_hook[] = nothing
             @test posted == ["all done"]
             @test held(state, T) == "s-eyes2"
+
+            # 31. A socket reply in a thread whose top-level message has not been
+            #     read yet (its event was missed) does not revive the thread: the
+            #     message runs first, then the poll runs the reply in its session
+            T = "1700000990.000000"
+            state.last_ts = "1700000980.000000"   # the primary cursor is behind T
+            n0 = length(calls())
+            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"?","ts":"1700000990.000100","thread_ts":"$T"}""")
+            SlackClaw.route_socket_event!(state, ev)
+            foreach(wait, state.active_tasks)
+            @test length(calls()) == n0
+            @test held(state, T) === nothing
+            next_run(stdout=ok_json("s-parent") * "\n")
+            @test SlackClaw.claim_primary!(state, T)     # reconciliation reads the message
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "the request", ""))
+            foreach(wait, state.active_tasks)
+            next_run(stdout=ok_json("s-parent") * "\n")
+            poll!(state, reply("1700000990.000100", "?", T))
+            c = new_calls(n0)
+            @test length(c) == 2 && occursin("the request", c[1]) && occursin("?", c[2]) &&
+                  resumed(c[2]) == "s-parent"
+            #     A reply in an expired thread (its message read long ago) still
+            #     revives it
+            T = "1700000970.000000"
+            next_run(stdout=ok_json("s-rev") * "\n")
+            n0 = length(calls())
+            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"again","ts":"1700000999.000100","thread_ts":"$T"}""")
+            SlackClaw.route_socket_event!(state, ev)
+            foreach(wait, state.active_tasks)
+            @test length(new_calls(n0)) == 1
+            @test held(state, T) == "s-rev"
+            state.last_ts = "100.0"
+
+            # 32. A polled reply in a thread that already has a run starts no
+            #     second run; it is told the run is going
+            T = "1700000991.000000"
+            track!(state, T, "s-busy")
+            state.busy_threads[T] = time()
+            clear_logs!()
+            n0 = length(calls())
+            poll!(state, reply("1700000991.000100", "and now?", T))
+            delete!(state.busy_threads, T)
+            @test length(calls()) == n0
+            @test length(top_posted) == 1 && startswith(top_posted[1], "_Still working...")
+
+            # 33. A run clears the status file it may have left
+            T = "1700000992.000000"
+            write(joinpath(dir, cfg.status_file), "halfway")
+            next_run(stdout=ok_json("s-status") * "\n")
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "status", ""))
+            foreach(wait, state.active_tasks)
+            @test !isfile(joinpath(dir, cfg.status_file))
 
             # 14. A failed ❌ reaction does not cost the failure reply
             T = "1700000810.000000"
@@ -1492,6 +1550,7 @@ end
     @test !rr(fake(err="No conversation found with session ID: s10\n"), "s1")  # a longer id
     @test !rr(fake(err="Warning: retry saw 'No conversation found with session ID: s1'\n"), "s1")
     @test rr(fake(err="Error: No conversation found with session ID: s1\n"), "s1")  # a prefix
+    @test !rr(fake(err="Previous attempt logged: No conversation found with session ID: s1\n"), "s1")
     @test rr(fake(err="Warning: MCP server blocked\nNo conversation found with session ID: s1\n" *
                       "x"^800 * "\n"), "s1")           # its own line, wherever it falls
     @test !rr(fake(out="""{"result":"x"}"""), "s1")  # stdout carried a result

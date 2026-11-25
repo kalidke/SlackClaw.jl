@@ -41,8 +41,9 @@ Patch: a failed Claude run no longer ends its Slack thread.
   the same message runs again at once, once per dispatched message: fresh,
   with `REVIVED_THREAD_NOTE`, or resuming the thread's own session when it
   holds a different one. The refusal is read from the raw run (a resume was
-  asked, nothing on stdout, a stderr line ending in the refusal for that id),
-  never from posted text, and only the refused id is cleared.
+  asked, nothing on stdout, the refusal for that id as its own stderr line,
+  bare or after "Error: "), never from posted text, and only the refused id is
+  cleared.
   `ClaudeResult` gains `session_missing::Bool`; the five-argument constructor
   stays and sets it false. The transient-failure retries skip a refused
   resume.
@@ -59,28 +60,35 @@ Patch: a failed Claude run no longer ends its Slack thread.
   poll holding a session across a Slack call never claims on a dead cursor.
 - **One run per thread.** `run_agent_loop!` refuses a second run in a thread
   that already has one, whatever dispatched it (a reply, a late top-level
-  message, a scheduled follow-up); the message gets "Still working", as a
-  reply in a busy thread did before. The check and the busy mark are one step
-  with no yield in between. The dispatcher's own Slack call (👀, the follow-up
+  message, a scheduled follow-up); a reply gets "Still working", as before.
+  The check and the busy mark are one step with no yield in between. The dispatcher's own Slack call (👀, the follow-up
   notice) runs inside the run, before Claude starts, so it is never posted
   after the run's reply. `run_agent_loop!` gains a `before_run` keyword for it
   and returns whether the run started.
 - **A reply to a failure notice starts a run.** The ❌ reaction goes on
-  first, then the run lets go of the thread (status file cleared, busy mark
-  released), then the reason is posted, so a reply sent while the notice is
+  first, then the run lets go of the thread (busy mark released, status file
+  cleared), then the reason is posted, so a reply sent while the notice is
   still being posted starts a run instead of "Still working". A run clears
   only its own busy mark, and once it has let go it records nothing more: a
   failed post is logged, never sent back through the loop's error path. A
   failed reaction or status-file cleanup on that path is logged and never
   stops the release or the post.
+- **A reply never runs ahead of its thread's own message.** When the socket
+  missed a top-level message but delivered a reply in its thread, the reply
+  revived the thread and ran without it. A socket reply in a thread whose
+  message the reconcile poll has not read yet now waits: the message runs
+  first, and the poll after it runs the reply in the message's session. A
+  top-level message that still finds its thread running says it was not run
+  and asks for a reply with the request.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside
   `max_active_threads`, which counts the other threads only.
 - **A scheduled follow-up resumes the thread's current session**, not the
   older id it was saved with (a thread that holds no session runs it fresh,
   with `REVIVED_THREAD_NOTE`). It waits while its thread is running or no task
-  slot is free, instead of running beside it; its due time moves one poll
-  ahead, so a restart keeps it.
+  slot is free, instead of running beside it, and is saved as deferred
+  (`ScheduledTask` gains `deferred::Bool`; the four-argument constructor
+  stays), so a restart keeps it though its time has passed.
 - **A failed state save no longer hides the run's reply.** It is logged, and
   the run's reason is still posted.
 - The status-file watcher stops when `run_claude` throws, and no longer posts
