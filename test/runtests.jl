@@ -547,8 +547,9 @@ end
     @test !SlackClaw.claim_primary!(state, "150.0")
     @test state.last_ts == "200.0"
 
-    # Thread reply cursor
+    # Thread reply cursor (claims are against the thread's tracked entry)
     sess = SlackClaw.ThreadSession("111.0", "sid", "111.0", 0.0, "C0")
+    state.threads["111.0"] = sess
     @test SlackClaw.claim_thread_reply!(state, sess, "112.0")
     @test !SlackClaw.claim_thread_reply!(state, sess, "112.0")
     @test sess.last_reply_ts == "112.0"
@@ -909,6 +910,8 @@ prompts = String[]
 claude_reply = Ref("[SKIP]")
 thread_replies = Ref(Any[])     # replies the slack_get_replies stub serves
 replies_hook = Ref{Any}(nothing)  # run inside the stub, as if during the API call
+react_hook = Ref{Any}(nothing)    # run inside slack_add_reaction (emoji); may throw
+post_hook = Ref{Any}(nothing)     # run inside post_response (thread_ts)
 Core.eval(SlackClaw, quote
     slack_post_message(config::SlackClawConfig, text::AbstractString;
                        thread_ts::AbstractString="",
@@ -916,11 +919,13 @@ Core.eval(SlackClaw, quote
         (push!($top_posted, String(text)); "500.0")
     post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
                   channel_id::AbstractString=config.slack_channel_id) =
-        (push!($posted_to, (String(thread_ts), String(channel_id))); push!($slack_log, "post");
+        ($post_hook[] === nothing || $post_hook[](thread_ts);
+         push!($posted_to, (String(thread_ts), String(channel_id))); push!($slack_log, "post");
          push!($posted, String(text)))
     slack_add_reaction(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
                        channel_id::AbstractString=config.slack_channel_id) =
-        (push!($slack_log, "react:" * emoji); push!($reacted, String(emoji)))
+        ($react_hook[] === nothing || $react_hook[](emoji);
+         push!($slack_log, "react:" * emoji); push!($reacted, String(emoji)))
     slack_reactions_remove(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
                            channel_id::AbstractString=config.slack_channel_id) =
         push!($unreacted, String(emoji))
@@ -1015,14 +1020,23 @@ mkstate(cfg) = SlackClaw.MonitorState(
             #    reply line are posted in its thread, the reaction goes on
             #    before the post (the post is the loop's last Slack call), and
             #    the thread is tracked with the run's id
+            #    The thread is busy from dispatch (before the 👀 reaction yields,
+            #    so a polled reply cannot start ahead of it) and is released
+            #    before the failure reply is posted
             T = "1700000700.000000"
             clear_logs!()
+            busy_at = Dict{String,Bool}()
+            react_hook[] = e -> (busy_at["react:" * e] = haskey(state.busy_threads, T))
+            post_hook[] = ts -> (busy_at["post"] = haskey(state.busy_threads, T))
             next_run(stdout=steps_json * "\n", code=1)
-            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "refactor the parser", ""))
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "refactor the parser", "");
+                                        channel_id="C7")
             foreach(wait, state.active_tasks)
+            react_hook[] = nothing; post_hook[] = nothing
             @test posted == ["Claude stopped at the step limit before finishing.\n\n" * continue_line]
-            @test posted_to == [(T, "C0")]
+            @test posted_to == [(T, "C7")]
             @test slack_log == ["react:eyes", "react:x", "post"]
+            @test busy_at == Dict("react:eyes" => true, "react:x" => true, "post" => false)
             @test held(state, T) == "s-steps"
             sess = get(state.threads, T, nothing)
 
@@ -1042,7 +1056,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test length(c) == 1 && occursin("please continue", c[1]) && resumed(c[1]) == "s-steps" &&
                   !occursin(note, c[1])
             @test posted == ["all done"]
-            @test posted_to == [(T, "C0")]
+            @test posted_to == [(T, "C7")]
             @test sess !== nothing && get(state.threads, T, nothing) === sess
             @test sess !== nothing && sess.last_reply_ts == "1700000700.000100"
 
@@ -1187,7 +1201,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
         state_busy = mkstate(cfg_busy)
         clear_logs!()
         SlackClaw.dispatch_command!(state_busy, SlackMessage("1700000790.000000", "U9", "deploy", ""))
-        @test top_posted == ["Busy with 0 task(s) — reply in this thread to try again."]
+        @test top_posted == ["Busy with 0 task(s) — reply in this thread with the request to try again."]
         @test held(state_busy, "1700000790.000000") == ""
 
         # 13. A state save that fails is logged; the run's own reason is still posted
@@ -1202,6 +1216,85 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test posted == [auth_reason * "\n\n" * retry_line]
             @test held(state_nosave, "1700000770.000000") == ""
         end
+
+        withenv("PATH" => dir * ":" * ENV["PATH"]) do
+            # 19. The transient-failure retries skip a refused resume: the next
+            #     call is the fresh rerun, not the same resume again
+            cfg_retry = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                        claude_max_retries=2, claude_retry_backoff_s=0.01,
+                                        state_file="retry-state.json")
+            state_retry = mkstate(cfg_retry)
+            T = "1700000840.000000"
+            track!(state_retry, T, "s-gone2")
+            next_runs((stderr=refused("s-gone2"), code=1), (stdout=ok_json("s-fresh2") * "\n",))
+            n0 = length(calls())
+            poll!(state_retry, reply("1700000840.000100", "status?", T))
+            c = new_calls(n0)
+            @test length(c) == 2 && resumed(c[1]) == "s-gone2" && resumed(c[2]) == ""
+            @test held(state_retry, T) == "s-fresh2"
+
+            # 14. A failed ❌ reaction does not cost the failure reply
+            T = "1700000810.000000"
+            clear_logs!()
+            react_hook[] = e -> e == "x" && error("simulated reactions.add failure")
+            next_run(stderr=auth_fail, code=1)
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "lint it", ""))
+            foreach(wait, state.active_tasks)
+            react_hook[] = nothing
+            @test posted == [auth_reason * "\n\n" * retry_line]
+
+            # 15. A scheduled follow-up resumes the thread's current session, not
+            #     the older id it was saved with
+            T = "1700000820.000000"
+            track!(state, T, "s-current")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-saved", "check the pipeline", 0.0))
+            next_run(stdout=ok_json("s-current") * "\n")
+            n0 = length(calls())
+            clear_logs!()
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 1 && resumed(c[1]) == "s-current"
+            @test top_posted == ["_Scheduled follow-up firing..._"]
+
+            # 16. A thread whose run ended after it expired is tracked again from
+            #     the time of the run, not from its parent: replies it already
+            #     handled are not run again
+            T = "1700000830.000000"
+            next_run(stdout=ok_json("s-late") * "\n")
+            SlackClaw.run_agent_loop!(state, T, "scheduled check", "s-late"; channel_id="C0")
+            foreach(wait, state.active_tasks)
+            @test held(state, T) == "s-late"
+            n0 = length(calls())
+            poll!(state, reply("1700000830.000100", "an old, handled reply", T))
+            @test length(calls()) == n0
+        end
+
+        # 17. Expiry passes over a thread with a run in flight or a follow-up
+        #     scheduled, which would otherwise come back with a fresh cursor
+        #     (at the default cap of 3: the two oldest of the rest go)
+        cfg_cap = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                  state_file="cap-state.json")
+        @test cfg_cap.max_active_threads == 3
+        state_cap = mkstate(cfg_cap)
+        caps = ["170000090$(i).000000" for i in 0:4]
+        for (i, ts) in enumerate(caps)
+            # recent activity, oldest first, so only the cap applies (not idle expiry)
+            state_cap.threads[ts] = SlackClaw.ThreadSession(ts, "s$i", ts, time() - 10.0 * (6 - i), "C0")
+        end
+        state_cap.busy_threads[caps[1]] = time()
+        push!(state_cap.scheduled, SlackClaw.ScheduledTask(caps[2], "s2", "later", time() + 3600))
+        SlackClaw.expire_threads!(state_cap)
+        @test sort(collect(keys(state_cap.threads))) == [caps[1], caps[2], caps[5]]
+
+        # 18. A claim on a session object that is no longer the thread's entry
+        #     fails: its cursor is dead
+        stale = SlackClaw.ThreadSession("1700000950.000000", "s-old", "1700000950.000000", time(), "C0")
+        state_cap.threads["1700000950.000000"] =
+            SlackClaw.ThreadSession("1700000950.000000", "s-new", "1700000950.000000", time(), "C0")
+        @test !SlackClaw.claim_thread_reply!(state_cap, stale, "1700000950.000100")
+        @test SlackClaw.claim_thread_reply!(state_cap, state_cap.threads["1700000950.000000"],
+                                            "1700000950.000100")
     end
 end
 
@@ -1210,13 +1303,14 @@ end
     rr = SlackClaw.resume_refused
     fake(; code=1, out="", err="No conversation found with session ID: s1\n", timed_out=false) =
         (exitcode=code, stdout=out, stderr=err, timed_out=timed_out)
-    @test rr(fake(), true)
-    @test !rr(fake(), false)                      # no --resume was given
-    @test !rr(fake(out="""{"result":"x"}"""), true)  # stdout carried a result
-    @test !rr(fake(err="Failed to authenticate\n"), true)
-    @test !rr(fake(code=0), true)
-    @test !rr(fake(timed_out=true), true)
-    r = SlackClaw.interpret_claude_run(fake(), 5, 60; resumed=true)
+    @test rr(fake(), "s1")
+    @test !rr(fake(), "")                         # no --resume was given
+    @test !rr(fake(), "s2")                       # the refusal names another id
+    @test !rr(fake(out="""{"result":"x"}"""), "s1")  # stdout carried a result
+    @test !rr(fake(err="Failed to authenticate\n"), "s1")
+    @test !rr(fake(code=0), "s1")
+    @test !rr(fake(timed_out=true), "s1")
+    r = SlackClaw.interpret_claude_run(fake(), 5, 60; resumed="s1")
     @test !r.success && r.session_missing && r.session_id == ""
     @test !SlackClaw.interpret_claude_run(fake(), 5, 60).session_missing
     # the five-argument constructor stays

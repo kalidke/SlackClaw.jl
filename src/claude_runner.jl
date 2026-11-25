@@ -133,11 +133,10 @@ function run_claude(prompt::String, config::SlackClawConfig;
     # stderr as a fallback (see `exit_failure_message`). We do NOT retry a
     # timeout, nor a non-zero exit that already produced stdout (it may have done
     # partial work), nor a refused --resume (the session will not reappear).
-    resumed = !isempty(session_id)
     res = _run_claude_once(cmd, config.claude_timeout_s)
     attempt = 0
     while !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
-          !resume_refused(res, resumed) && attempt < config.claude_max_retries
+          !resume_refused(res, session_id) && attempt < config.claude_max_retries
         attempt += 1
         backoff = config.claude_retry_backoff_s * 2.0^(attempt - 1)
         @warn "SlackClaw: claude exited non-zero — retrying" attempt exitcode=res.exitcode backoff_s=backoff stderr=last(strip(res.stderr), 300)
@@ -146,29 +145,30 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     duration_ms = round(Int, (time() - t_start) * 1000)
-    return interpret_claude_run(res, duration_ms, config.claude_timeout_s; resumed)
+    return interpret_claude_run(res, duration_ms, config.claude_timeout_s; resumed=session_id)
 end
 
 """
     resume_refused(res, resumed) -> Bool
 
-Whether a finished run is the CLI refusing `--resume` of a session it does not
-have: the run asked to resume (`resumed`), exited non-zero, printed nothing on
-stdout, and printed `No conversation found with session ID` on stderr. Judged on
-the raw streams, not the posted reason, so a result text that merely quotes the
-phrase never counts.
+Whether a finished run is the CLI refusing `--resume` of the session `resumed`
+(the id it was given; "" when it resumed nothing): it exited non-zero, printed
+nothing on stdout, and printed `No conversation found with session ID: <that id>`
+on stderr. Judged on the raw streams, not the posted reason, so a result text
+that merely quotes the phrase never counts, nor a stderr line naming another id.
 """
-resume_refused(res, resumed::Bool) =
-    resumed && !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
-    occursin("No conversation found with session ID", res.stderr)
+resume_refused(res, resumed::AbstractString) =
+    !isempty(resumed) && !res.timed_out && res.exitcode != 0 && isempty(strip(res.stdout)) &&
+    occursin("No conversation found with session ID: $(resumed)", res.stderr)
 
 """
-    interpret_claude_run(res, duration_ms, timeout_s; resumed=false) -> ClaudeResult
+    interpret_claude_run(res, duration_ms, timeout_s; resumed="") -> ClaudeResult
 
 Turn one finished `claude` run (the NamedTuple from `_run_claude_once`:
 `exitcode`, `stdout`, `stderr`, `timed_out`) into a `ClaudeResult`. The
 subprocess and its retries stay in `run_claude`; this part reads only the
-captured output. `resumed` says whether the run was given `--resume`.
+captured output. `resumed` is the session id the run was given with `--resume`
+("" for none).
 
 A non-zero exit keeps the `session_id` of the CLI's stdout result object when it
 printed one: with `--output-format json` it does on a failed exit too (a step
@@ -176,7 +176,7 @@ limit, a usage limit), so the thread can resume that session. A timeout has no
 id: the run was killed before printing anything. A refused resume sets
 `session_missing` ([`resume_refused`](@ref)).
 """
-function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::Bool=false)
+function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::AbstractString="")
     if res.timed_out
         @warn "SlackClaw: claude timed out" timeout_s
         return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, "")

@@ -167,8 +167,9 @@ A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
 does not end its thread. A top-level message's thread is tracked the moment it
 is dispatched, so whatever happens to the run, a reply there starts a new run:
 by socket, or by the next reconciliation poll if the socket missed it.
-SlackClaw adds ❌ and then posts the reason, so a reply sent the moment the
-reason appears finds the thread free.
+SlackClaw adds ❌, frees the thread, and then posts the reason, so a reply sent
+the moment the reason appears starts a run instead of "Still working". A
+failed reaction is logged and never stops the post.
 
 - When the CLI printed a session id (it does for a step-limit stop, and for
   any failure that prints its result object), the next run resumes that
@@ -187,16 +188,19 @@ reason appears finds the thread free.
   example after the account behind `CLAUDE_CONFIG_DIR` changed) is dropped,
   and the same message runs again at once, so the user never has to send it
   twice. The rerun starts fresh, told the earlier context is not available,
-  unless the thread holds a newer session (a scheduled follow-up fires with
-  the id it was saved with), which the rerun resumes. It reruns once per
-  message.
+  unless the thread holds a different session, which the rerun resumes. It
+  reruns once per dispatched message.
+- A scheduled follow-up resumes the thread's current session, not the id it
+  was saved with.
 - A request turned away because every task slot is busy says "reply in this
-  thread to try again"; its thread is tracked, so that reply is read.
+  thread with the request to try again"; its thread is tracked, so that reply
+  is read.
 
-A failed thread counts toward `max_active_threads` like any other. A thread's
-reply cursor follows Slack's timestamps only (the parent message, then the last
-reply read), never the host clock, so a reply posted while a run is finishing
-is read by the next poll.
+A failed thread counts toward `max_active_threads` like any other, but a
+thread with a run in flight or a follow-up scheduled is never expired. A
+thread's reply cursor follows Slack's timestamps only (the parent message, then
+the last reply read), never the host clock, so a reply posted while a run is
+finishing is read by the next poll.
 
 ## Persistence
 
