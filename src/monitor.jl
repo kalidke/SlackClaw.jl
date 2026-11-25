@@ -1019,12 +1019,16 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     # queue it twice)
                     try
                         save_state!(state)
+                    catch e
+                        @error "SlackClaw: follow-up queued, but saving it failed" thread_ts exception=(e, catch_backtrace())
+                    end
+                    try
                         mins = round(Int, directive.delay_s / 60)
                         slack_post_message(config,
                             "_Scheduled follow-up in $(mins)m._";
                             thread_ts, channel_id)
                     catch e
-                        @error "SlackClaw: follow-up queued, but its save or notice failed" thread_ts exception=(e, catch_backtrace())
+                        @error "SlackClaw: follow-up queued, but its notice failed" thread_ts exception=(e, catch_backtrace())
                     end
                     @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
                     break
@@ -1137,15 +1141,16 @@ end
 
 """
 Prepended to a top-level message that reaches the monitor after a reply in its
-thread already ran, when it resumes that thread's session: the message is the
-thread's original post, older than the replies already in the session, so a
-later reply (a correction, a new instruction) takes precedence over it.
+thread already ran, when it resumes that thread's session. The message was
+posted first but may have been edited since (Slack keeps its ts), so the note
+states no precedence: on a conflict with the replies Claude asks which stands.
 """
 const LATE_PARENT_NOTE = """
 [note from the dispatcher: the message below is this Slack thread's original top-level \
-post. It reached you late: it was posted BEFORE the replies in this thread that you have \
-already handled. Where it conflicts with those replies, the replies are the more recent \
-instructions.]"""
+post. It reached the dispatcher late: replies in this thread were already handled before \
+it arrived, and it may have been edited since it was first posted, so which instruction is \
+newer is not known. If it conflicts with those replies, ask the user which one stands; do \
+not guess. Who sent each message is given by that message's own [from] line.]"""
 
 # --- Dispatch: thread replies ---
 
@@ -1160,10 +1165,9 @@ removed.
 """
 const REVIVED_THREAD_NOTE = """
 [note from the dispatcher: the earlier conversation in this Slack thread is NOT \
-available to you (the thread expired, an earlier run in it failed before its \
-session could be resumed, or its first message has not reached you yet). If the message relies on that earlier content, say the \
-earlier context is not available and ask the user to restate what you need; do not \
-guess. If the message stands on its own, just answer it and do not mention this.]"""
+available to you. If the message relies on that earlier content, say the earlier \
+context is not available and ask the user to restate what you need; do not guess. \
+If the message stands on its own, just answer it and do not mention this.]"""
 
 """Prompt for a thread dispatch: sender-attributed text, with
 [`REVIVED_THREAD_NOTE`](@ref) prepended when the session has no Claude context

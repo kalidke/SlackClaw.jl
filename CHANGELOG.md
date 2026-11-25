@@ -23,8 +23,9 @@ Patch: a failed Claude run no longer ends its Slack thread.
   now kept, so the next reply resumes the same session with what the failed
   run already did. With no id (a timeout, nothing on stdout) the thread keeps
   the session it had; a thread with none yet starts the next reply fresh, and
-  its prompt carries `REVIVED_THREAD_NOTE`, now worded for both an expired
-  thread and a failed run.
+  its prompt carries `REVIVED_THREAD_NOTE`, which now says only that the
+  earlier conversation is not available (it no longer names a cause, which
+  did not fit every case).
 - **A step-limit stop reads as one.** A run stopped at `max_turns` (result
   `subtype` `error_max_turns`) has no result text, so the reply was the bare
   exit code. It now reads "Claude stopped at the step limit before
@@ -84,8 +85,8 @@ Patch: a failed Claude run no longer ends its Slack thread.
   thread's session instead of starting a new one, so the thread keeps one
   conversation and a follow-up the reply scheduled resumes the one that has its
   request. Its prompt carries `LATE_PARENT_NOTE`: it is the thread's original
-  post, older than the replies already handled, which take precedence where
-  they conflict. This also covers Slack's `me_message` status posts, which the
+  post, reaching Claude after replies already handled and possibly edited
+  since, so on a conflict with those replies Claude asks which one stands. This also covers Slack's `me_message` status posts, which the
   socket skips and reconciliation reads.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside

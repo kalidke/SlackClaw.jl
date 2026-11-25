@@ -198,7 +198,8 @@ failed reaction is logged and never stops the post.
 - A thread has one run at a time: a reply in a thread that already has a run
   gets "Still working". A top-level message that reached SlackClaw late, after a
   reply in its thread, says it was not run while that thread is running, and
-  otherwise resumes the thread's conversation, told it predates the replies.
+  otherwise resumes the thread's conversation, told it came after replies
+  already handled (and may have been edited), so a conflict is asked about.
 
 A failed thread counts toward `max_active_threads` like any other. A thread
 with a run in flight or a follow-up scheduled is never expired, and sits beside

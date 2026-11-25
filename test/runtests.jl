@@ -1480,10 +1480,27 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test length(c) == 3 && resumed(c[2]) == "s-R" && resumed(c[3]) == "s-R"
             #     The late message's prompt says it predates the replies handled,
             #     and keeps its authenticated sender
-            @test length(c) == 3 && occursin("posted BEFORE the replies", c[2]) &&
+            @test length(c) == 3 && occursin("replies in this thread were already handled", c[2]) &&
+                  occursin("ask the user which one stands", c[2]) &&
                   occursin("[from <@U9>]", c[2]) && occursin("is debugging the pipeline", c[2])
-            #     A message with no session to resume gets no such note
-            @test !occursin("posted BEFORE the replies", c[1])
+            #     The note comes first, then the sender line, then the text
+            @test length(c) == 3 &&
+                  findfirst("replies in this thread were already handled", c[2]).start <
+                  findfirst("[from <@U9>]", c[2]).start <
+                  findfirst("is debugging the pipeline", c[2]).start
+            #     A late message whose thread holds no session (the reply's run
+            #     printed none) runs fresh, with no note
+            T2 = "1700000997.000000"
+            track!(state, T2, "")
+            @test SlackClaw.claim_primary!(state, T2)
+            next_run(stdout=ok_json("s-P2") * "\n")
+            n1 = length(calls())
+            SlackClaw.dispatch_command!(state, SlackMessage(T2, "U9", "first post", ""))
+            foreach(wait, state.active_tasks)
+            c2 = new_calls(n1)
+            @test length(c2) == 1 && resumed(c2[1]) == "" &&
+                  !occursin("replies in this thread were already handled", c2[1])
+            @test held(state, T2) == "s-P2"
             @test held(state, T) == "s-R"
             state.last_ts = "100.0"
 
