@@ -20,7 +20,7 @@ Patch: a failed Claude run no longer ends its Slack thread.
   leaves its thread tracked, so the next reply starts a new run whether it
   arrives by socket or by the reconcile poll. A request turned away as busy
   is tracked too, and its message now reads "Busy with N task(s) — reply in
-  this thread to try again."
+  this thread with the request to try again."
 - **A failed exit keeps its session id.** With `--output-format json` the CLI
   prints its result object on a failed exit too, with `session_id`. It is
   now kept, so the next reply resumes the same session with what the failed
@@ -43,9 +43,9 @@ Patch: a failed Claude run no longer ends its Slack thread.
   the same message runs again at once: fresh, with `REVIVED_THREAD_NOTE`, or
   resuming the thread's own session when it holds a newer one (a scheduled
   task fires with the id it was saved with). Once per dispatched message. The refusal is
-  read from the raw run (a resume was asked, nothing on stdout, the phrase
-  naming that id on stderr), never from posted text, and only the refused id
-  is cleared.
+  read from the raw run (a resume was asked, nothing on stdout, the refusal
+  line for that id on stderr, as a line of its own), never from posted text,
+  and only the refused id is cleared.
   `ClaudeResult` gains `session_missing::Bool`; the five-argument constructor
   stays and sets it false. The transient-failure retries skip a refused
   resume.
@@ -58,24 +58,33 @@ Patch: a failed Claude run no longer ends its Slack thread.
   poll that holds it across a Slack call claims against the live cursor, and
   a poll whose thread was re-tracked during the call drops its stale read.
 - **A reply to a failure notice starts a run.** The ❌ reaction goes on
-  first, then the thread is freed, then the reason is posted, so a reply sent
-  while the notice is still being posted starts a run instead of "Still
-  working". A run clears only its own busy mark. A failed reaction on a
-  failure path is logged and never stops the post.
+  first, then the run lets go of the thread (status file cleared, busy mark
+  released), then the reason is posted, so a reply sent while the notice is
+  still being posted starts a run instead of "Still working". A run clears
+  only its own busy mark, and once it has let go it records nothing more: a
+  failed post is logged, never sent back through the loop's error path. A
+  failed reaction on a failure path is logged and never stops the post.
 - **A thread is busy from dispatch.** Every dispatcher (top-level message,
   thread reply, scheduled follow-up) starts the run, which marks the thread
-  busy, before its own Slack calls (👀, the follow-up notice), so a reply
-  read during those calls cannot start a second run ahead of the first.
+  busy, before anything that can yield, so a reply read meanwhile cannot start
+  a second run ahead of the first. The dispatcher's own Slack call (👀, the
+  follow-up notice) runs inside the run, before Claude starts, so it is never
+  posted after the run's reply. `run_agent_loop!` gains a `before_run` keyword
+  for it and returns whether the run started.
 - **A claim on a stale session fails.** `claim_thread_reply!` claims only
   against the thread's tracked entry, so a poll whose thread expired or was
   re-tracked while it dispatched an earlier reply drops the rest of its batch.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired: re-tracking it afterwards would
-  read its replies again from an earlier point. A thread the agent loop must
-  track again starts after the message it answered (a scheduled run: at the
-  current time), never at its parent.
+  read its replies again from an earlier point. Such threads sit beside
+  `max_active_threads`, which counts the other threads only, so they never
+  push out a recent conversation. A thread the agent loop must track again
+  starts after the message it answered, or after the follow-up notice it
+  posted (both Slack timestamps), never at its parent.
 - **A scheduled follow-up resumes the thread's current session**, not the
-  older id it was saved with.
+  older id it was saved with (a thread that holds no session runs it fresh,
+  with `REVIVED_THREAD_NOTE`), and waits while its thread is running or no
+  task slot is free instead of running beside it.
 - **A failed state save no longer hides the run's reply.** It is logged, and
   the run's reason is still posted.
 - The status-file watcher stops even when `run_claude` throws.

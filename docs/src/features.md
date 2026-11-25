@@ -191,16 +191,18 @@ failed reaction is logged and never stops the post.
   unless the thread holds a different session, which the rerun resumes. It
   reruns once per dispatched message.
 - A scheduled follow-up resumes the thread's current session, not the id it
-  was saved with.
+  was saved with, and waits while its thread is running.
 - A request turned away because every task slot is busy says "reply in this
   thread with the request to try again"; its thread is tracked, so that reply
   is read.
 
-A failed thread counts toward `max_active_threads` like any other, but a
-thread with a run in flight or a follow-up scheduled is never expired. A
-thread's reply cursor follows Slack's timestamps only (the parent message, then
-the last reply read), never the host clock, so a reply posted while a run is
-finishing is read by the next poll.
+A failed thread counts toward `max_active_threads` like any other. A thread
+with a run in flight or a follow-up scheduled is never expired, and sits beside
+the cap rather than in it. A thread's reply cursor follows Slack's timestamps
+(the parent message, then the last reply read), so a reply posted while a run
+is finishing is read by the next poll. The host clock is used only as a last
+resort, for a scheduled follow-up whose thread is no longer tracked and whose
+notice failed to post.
 
 ## Persistence
 
