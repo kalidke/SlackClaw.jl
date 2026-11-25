@@ -161,6 +161,28 @@ release must add `files:write` and reinstall.
   (default 7 days; `0` disables) are also retired — each tracked thread costs a
   `conversations.replies` call per reconciliation, so this bounds steady load.
 
+## Failed runs
+
+A failed run (a step-limit stop, a usage limit, a timeout, any non-zero exit)
+does not end its thread. SlackClaw posts the reason, adds ❌, and keeps the
+thread tracked, so a reply there starts a new run: by socket, or by the next
+reconciliation poll if the socket missed it.
+
+- When the CLI printed a session id (it does for a step-limit or usage-limit
+  stop), the next run resumes that session, with what the failed run already
+  did. The reply ends with "Reply in this thread to continue; the next run
+  resumes this one."
+- When there is none (a timeout, or a failure with nothing on stdout), the next
+  run starts a fresh session, told that the earlier context is not available.
+  The reply ends with "Reply in this thread to try again, with the request:
+  this run kept no context."
+- A step-limit stop reads "Claude stopped at the step limit before finishing."
+  Raise `max_turns` for a channel whose tasks need more steps.
+- A session the CLI no longer has (its transcripts were moved or removed) is
+  dropped after the first refused resume, so the next reply starts fresh.
+
+A failed thread counts toward `max_active_threads` like any other.
+
 ## Persistence
 
 State is saved to `state_file` (`.slackclaw_state.json` in `repo_dir`): the

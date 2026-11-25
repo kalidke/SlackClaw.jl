@@ -137,16 +137,33 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     duration_ms = round(Int, (time() - t_start) * 1000)
+    return interpret_claude_run(res, duration_ms, config.claude_timeout_s)
+end
 
+"""
+    interpret_claude_run(res, duration_ms, timeout_s) -> ClaudeResult
+
+Turn one finished `claude` run (the NamedTuple from `_run_claude_once`:
+`exitcode`, `stdout`, `stderr`, `timed_out`) into a `ClaudeResult`. The
+subprocess and its retries stay in `run_claude`; this part reads only the
+captured output.
+
+A non-zero exit keeps the `session_id` of the CLI's stdout result object when it
+printed one: with `--output-format json` it does on a failed exit too (a step
+limit, a usage limit), so the thread can resume that session. A timeout has no
+id: the run was killed before printing anything.
+"""
+function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real)
     if res.timed_out
-        @warn "SlackClaw: claude timed out" timeout_s=config.claude_timeout_s
-        return ClaudeResult(false, "Timed out after $(config.claude_timeout_s)s", duration_ms, 0.0, "")
+        @warn "SlackClaw: claude timed out" timeout_s
+        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, "")
     end
 
     if res.exitcode != 0
         msg = exit_failure_message(res.exitcode, res.stdout, res.stderr)
-        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg stderr=strip(res.stderr)
-        return ClaudeResult(false, msg, duration_ms, 0.0, "")
+        sid = stdout_session_id(res.stdout)
+        @error "SlackClaw: claude dispatch failed" exitcode=res.exitcode reason=msg session_id=sid stderr=strip(res.stderr)
+        return ClaudeResult(false, msg, duration_ms, 0.0, sid)
     end
 
     return parse_claude_output(res.stdout, duration_ms)
@@ -205,8 +222,10 @@ function parse_claude_output(output::String, duration_ms::Int)
         else
             data  # legacy single-object format
         end
-        result_text = get(entry, "result", "")
         is_error = get(entry, "is_error", false)
+        # A step-limit result carries no `result` text; posting "" would fail
+        result_text = is_error && is_step_limit(entry) ? STEP_LIMIT_MESSAGE :
+                      get(entry, "result", "")
         cost = get(entry, "total_cost_usd", 0.0)
         session_id = get(entry, "session_id", "")
         cli_duration = get(entry, "duration_ms", duration_ms)
@@ -239,17 +258,59 @@ function stdout_failure_reason(stdout::AbstractString)
         # Not valid JSON -- the raw stdout is the reason
         return _clip_tail(String(strip(stdout)))
     end
+    entry = result_entry(data)
+    entry === nothing && return ""
+    text = get(entry, "result", nothing)
+    text isa AbstractString || return ""
+    return _clip_head(String(strip(text)))
+end
+
+"""
+    result_entry(data) -> Union{AbstractDict,Nothing}
+
+The CLI's result object in parsed stdout: the last `"type" => "result"` entry of
+an array, or the object itself. `nothing` when there is none.
+"""
+function result_entry(data)
     entry = if data isa AbstractVector
         idx = findlast(d -> d isa AbstractDict && get(d, "type", "") == "result", data)
         idx === nothing ? nothing : data[idx]
     else
         data
     end
-    entry isa AbstractDict || return ""
-    text = get(entry, "result", nothing)
-    text isa AbstractString || return ""
-    return _clip_head(String(strip(text)))
+    return entry isa AbstractDict ? entry : nothing
 end
+
+"""`result_entry` of raw stdout; `nothing` when stdout is not JSON."""
+stdout_result_entry(stdout::AbstractString) =
+    try
+        result_entry(JSON.parse(stdout))
+    catch
+        nothing
+    end
+
+"""
+    stdout_session_id(stdout) -> String
+
+The `session_id` of the CLI's result object on stdout, or "" when stdout is not
+JSON or carries no string id.
+"""
+function stdout_session_id(stdout::AbstractString)
+    entry = stdout_result_entry(stdout)
+    entry === nothing && return ""
+    sid = get(entry, "session_id", nothing)
+    return sid isa AbstractString ? String(sid) : ""
+end
+
+"""
+Reason posted for a run the CLI stopped at `--max-turns` (result subtype
+`error_max_turns`). Its result object has no `result` text, so the reason was
+the bare exit code before.
+"""
+const STEP_LIMIT_MESSAGE = "Claude stopped at the step limit before finishing."
+
+"""Whether a CLI result object is a step-limit stop (`subtype` `error_max_turns`)."""
+is_step_limit(entry) = entry isa AbstractDict && get(entry, "subtype", "") == "error_max_turns"
 
 # Reasons are capped at 500 characters with an explicit marker. A parsed result
 # keeps its head (where the reason is); raw stdout and the stderr tail keep their end.
@@ -263,9 +324,10 @@ Describe a non-zero `claude` exit for the Slack reply. With `--output-format jso
 the CLI prints its result object to stdout even when it fails, so the reason is
 that object's `result` text (see `stdout_failure_reason`). Only when stdout carries
 no reason is the stderr tail used, labelled `stderr:` because it is evidence
-rather than a parsed reason.
+rather than a parsed reason. A step-limit stop gets [`STEP_LIMIT_MESSAGE`](@ref).
 """
 function exit_failure_message(exitcode::Integer, stdout::String, stderr::String)
+    is_step_limit(stdout_result_entry(stdout)) && return STEP_LIMIT_MESSAGE
     reason = stdout_failure_reason(stdout)
     if !isempty(reason)
         return "Claude exited non-zero (code $(exitcode)): $(reason)"

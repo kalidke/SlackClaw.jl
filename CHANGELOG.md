@@ -4,6 +4,42 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [Unreleased] (0.7.4-DEV)
+
+Patch: a failed Claude run no longer ends its Slack thread.
+
+### Fixed
+
+- **A failed run keeps its thread.** `run_agent_loop!` tracked a thread only
+  when the run returned a session id, and `run_claude` returned none on a
+  non-zero exit, so a thread whose first run failed was never tracked: the
+  reconcile poll reads replies only in tracked threads, and a reply there
+  started a run only if Socket Mode delivered it. Now any failed run (a
+  non-zero exit, a step-limit stop, a timeout, an exception in the loop)
+  leaves its thread tracked, and the next reply starts a new run whether it
+  arrives by socket or by the reconcile poll.
+- **A failed exit keeps its session id.** With `--output-format json` the CLI
+  prints its result object on a failed exit too, with `session_id`. It is
+  now kept, so the next reply resumes the same session with what the failed
+  run already did. With no id (a timeout, nothing on stdout) the next reply
+  starts a fresh session, and its prompt carries `REVIVED_THREAD_NOTE`, now
+  worded for both an expired thread and a failed run.
+- **A step-limit stop reads as one.** A run stopped at `max_turns` (result
+  `subtype` `error_max_turns`) has no result text, so the reply was the bare
+  exit code. It now reads "Claude stopped at the step limit before
+  finishing."
+- **Every failed run's reply ends with a line about replying**: "Reply in
+  this thread to continue; the next run resumes this one." when there is a
+  session to resume, and "Reply in this thread to try again, with the
+  request: this run kept no context." when there is not. The reason text
+  before it is unchanged from 0.7.2.
+- **A stale session id is dropped.** A `--resume` of a session the CLI no
+  longer has ("No conversation found with session ID") failed every reply in
+  that thread. The id is now cleared, so the next reply starts fresh.
+
+Threads already untracked in a saved state stay untracked; a new top-level
+message starts a new thread.
+
 ## [0.7.3] — 2026-10-15
 
 Patch: a message with files and no text is dispatched, and its files are named

@@ -684,6 +684,45 @@ end
 # --- Agent loop: the core dispatch with CONTINUE/SCHEDULE support ---
 
 """
+    track_thread!(state, thread_ts, session_id, channel_id)
+
+Track `thread_ts` (replacing any earlier session for it) and save state. An empty
+`session_id` means there is no Claude session to resume: the next reply starts a
+fresh one, with [`REVIVED_THREAD_NOTE`](@ref) in its prompt.
+"""
+function track_thread!(state::MonitorState, thread_ts::AbstractString,
+                       session_id::AbstractString, channel_id::AbstractString)
+    state.threads[thread_ts] = ThreadSession(
+        String(thread_ts), String(session_id), slack_ts_now(), time(), String(channel_id))
+    save_state!(state)
+end
+
+"""
+    session_not_found(reason) -> Bool
+
+Whether a failed run's reason is the CLI refusing `--resume` of a session it does
+not have. It exits 1 with nothing on stdout and `No conversation found with
+session ID: <id>` on stderr, which reaches the reason as its stderr tail.
+"""
+session_not_found(reason::AbstractString) = occursin("No conversation found with session ID", reason)
+
+"""Line ending a failed run's reply when the next run resumes its session."""
+const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
+
+"""Line ending a failed run's reply when there is no session to resume."""
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, with the request: this run kept no context._"
+
+"""
+    failure_reply(reason, session_id) -> String
+
+Thread text for a failed run: the reason, then a line saying that a reply in the
+thread starts the next run. The line says the run continues only when there is a
+session to resume.
+"""
+failure_reply(reason::AbstractString, session_id::AbstractString) =
+    string(reason, "\n\n", isempty(session_id) ? FAILED_RUN_RETRY_LINE : FAILED_RUN_CONTINUE_LINE)
+
+"""
     run_agent_loop!(state, thread_ts, prompt, session_id; react_ts="", channel_id=state.config.slack_channel_id)
 
 Run Claude in a loop, handling [CONTINUE] and [SCHEDULE] directives.
@@ -725,17 +764,23 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # Stop watcher
                 stop_watcher[] = true
 
-                # Update session tracking
-                if !isempty(result.session_id)
-                    current_session = result.session_id
-                    state.threads[thread_ts] = ThreadSession(
-                        thread_ts, current_session, slack_ts_now(), time(),
-                        channel_id)
-                    save_state!(state)
+                # Update session tracking. A failed run keeps its thread tracked
+                # even with no session id (a timeout, or a failure that printed
+                # none): the reconcile poll then reads replies in the thread, so
+                # a reply starts a new run with or without a socket event.
+                !isempty(result.session_id) && (current_session = result.session_id)
+                # A session the CLI no longer has (its transcripts moved or were
+                # removed) fails every resume: drop the id, so the next reply
+                # starts a fresh session instead of failing the same way.
+                !result.success && session_not_found(result.result_text) &&
+                    (current_session = "")
+                if !isempty(result.session_id) || !result.success
+                    track_thread!(state, thread_ts, current_session, channel_id)
                 end
 
                 if !result.success
-                    post_response(config, result.result_text, thread_ts; channel_id)
+                    post_response(config, failure_reply(result.result_text, current_session),
+                                  thread_ts; channel_id)
                     !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
                     break
                 end
@@ -798,8 +843,13 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         catch e
             @error "SlackClaw agent loop error" exception=(e, catch_backtrace())
             try
+                # Same as a failed run: the thread stays reachable by a reply
+                haskey(state.threads, thread_ts) ||
+                    track_thread!(state, thread_ts, current_session, channel_id)
                 err_msg = e isa Exception ? string(typeof(e).name.name) : "Unknown error"
-                slack_post_message(config, "Error: $err_msg (check server logs)"; thread_ts, channel_id)
+                slack_post_message(config,
+                    failure_reply("Error: $err_msg (check server logs)", current_session);
+                    thread_ts, channel_id)
                 !isempty(react_ts) && slack_add_reaction(config, react_ts, "x"; channel_id)
             catch; end
         finally
@@ -862,19 +912,20 @@ end
 # --- Dispatch: thread replies ---
 
 """
-Prepended to the prompt when dispatching into a revived thread (empty
-`session_id`): the Slack thread looks continuous to the user, but the expired
-Claude session's context is gone. The note makes Claude disclose that only
-when the message actually depends on the missing context — an unconditional
-"context expired" reply would be the same bookkeeping noise the silent-expiry
-change removed.
+Prepended to the prompt when dispatching into a thread with no Claude session to
+resume (empty `session_id`): a revived expired thread, or a thread whose earlier
+run failed without a session id. The Slack thread looks continuous to the user,
+but the earlier context is gone. The note makes Claude disclose that only when
+the message actually depends on the missing context — an unconditional "context
+expired" reply would be the same bookkeeping noise the silent-expiry change
+removed.
 """
 const REVIVED_THREAD_NOTE = """
-[note from the dispatcher: this reply revives an expired Slack thread — the earlier \
-conversation in this thread is NOT available to you. If the message relies on that \
-earlier content, say the thread's context expired and ask the user to restate what \
-you need; do not guess. If the message stands on its own, just answer it and do not \
-mention this.]"""
+[note from the dispatcher: the earlier conversation in this Slack thread is NOT \
+available to you (the thread expired, or an earlier run in it failed before its \
+session could be resumed). If the message relies on that earlier content, say the \
+earlier context is not available and ask the user to restate what you need; do not \
+guess. If the message stands on its own, just answer it and do not mention this.]"""
 
 """Prompt for a thread dispatch: sender-attributed text, with
 [`REVIVED_THREAD_NOTE`](@ref) prepended when the session has no Claude context

@@ -181,6 +181,13 @@ end
     @test r.success == true
     @test r.result_text == "done"
     @test r.session_id == "s1"
+
+    # A step-limit result has no `result` text: plain words, never "", id kept
+    json = """{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s9","num_turns":2}"""
+    r = pco(json, 100)
+    @test r.success == false
+    @test r.result_text == "Claude stopped at the step limit before finishing."
+    @test r.session_id == "s9"
 end
 
 # Non-zero exit: the reason posted to Slack comes from the CLI's result object on
@@ -227,6 +234,8 @@ end
         @test r.success == false
         @test r.result_text == "Claude exited non-zero (code 1): You've hit your weekly limit · resets 6am"
         @test !occursin("Warning", r.result_text)
+        # the failed run's session id is kept, so the thread can resume it
+        @test r.session_id == "s-a"
         # the journal carries the same reason as the Slack reply
         @test any(l -> l.level == Base.CoreLogging.Error &&
                        get(l.kwargs, :reason, "") == r.result_text, logger.logs)
@@ -241,6 +250,7 @@ end
         # (c) empty stdout: the stderr tail is the fallback, labelled as evidence
         r, _ = fake_claude_run("", "Failed to authenticate: token expired\n")
         @test r.result_text == "Claude exited non-zero (code 1), stderr: Failed to authenticate: token expired"
+        @test r.session_id == ""
 
         # (d) nothing on either stream: the bare exit code
         r, _ = fake_claude_run("", "")
@@ -249,6 +259,16 @@ end
         # (e) empty stdout is retried: one run per attempt, so 1 + max_retries
         _, n = fake_claude_run("", "Failed to authenticate: token expired\n"; max_retries=1)
         @test n == 2
+
+        # (f) a step-limit stop (the CLI's shape: exit 1, a result object with
+        # subtype error_max_turns and no `result` text): plain words instead of
+        # the bare exit code, and the session id is kept
+        steps = """{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s-steps","num_turns":2,"stop_reason":"tool_use","terminal_reason":"max_turns","errors":["Reached maximum number of turns (1)"]}"""
+        r, n = fake_claude_run(steps * "\n", ""; max_retries=2)
+        @test r.success == false
+        @test r.result_text == "Claude stopped at the step limit before finishing."
+        @test r.session_id == "s-steps"
+        @test n == 1
     end
 
     # exit_failure_message directly (no subprocess)
@@ -281,6 +301,10 @@ end
     # the stderr tail is capped at its last 500 characters, marked with "… "
     @test SlackClaw.exit_failure_message(2, "", "x"^600 * "END") ==
         "Claude exited non-zero (code 2), stderr: … " * "x"^497 * "END"
+    # a step-limit result in the array form gets the same plain words
+    @test SlackClaw.exit_failure_message(1,
+        """[{"type":"system"},{"type":"result","subtype":"error_max_turns","is_error":true}]""", "") ==
+        "Claude stopped at the step limit before finishing."
 end
 
 @testset "chunk_text" begin
@@ -869,24 +893,24 @@ end
     @test SlackClaw.slack_reactions_remove(cfg, "1.0", "eyes") === nothing
 end
 
-# KEEP LAST: overwrites SlackClaw methods (run_claude, post_response,
-# slack_post_message, slack_add_reaction, slack_reactions_remove) with stubs
-# for the rest of the process, then runs the real run_agent_loop! / dispatch
-# functions against them.
+# KEEP LAST: overwrites SlackClaw's Slack calls (slack_post_message,
+# post_response, slack_add_reaction, slack_reactions_remove, slack_get_replies)
+# with stubs for the rest of the process. The first testset below runs the REAL
+# run_claude against a stand-in `claude` on PATH; after it run_claude is a stub
+# too, and the rest run the real run_agent_loop! / dispatch functions against
+# the stubs.
 posted = String[]
 top_posted = String[]
 reacted = String[]
 unreacted = String[]
 prompts = String[]
 claude_reply = Ref("[SKIP]")
+thread_replies = Ref(Any[])  # replies the slack_get_replies stub serves, any thread
 Core.eval(SlackClaw, quote
     slack_post_message(config::SlackClawConfig, text::AbstractString;
                        thread_ts::AbstractString="",
                        channel_id::AbstractString=config.slack_channel_id) =
         (push!($top_posted, String(text)); "500.0")
-    run_claude(prompt::String, config::SlackClawConfig;
-               session_id::String="", thread_ts::String="", channel_id::String="") =
-        (push!($prompts, prompt); ClaudeResult(true, $claude_reply[], 1, 0.0, "sess-skip"))
     post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
                   channel_id::AbstractString=config.slack_channel_id) =
         push!($posted, String(text))
@@ -896,6 +920,10 @@ Core.eval(SlackClaw, quote
     slack_reactions_remove(config::SlackClawConfig, ts::AbstractString, emoji::AbstractString;
                            channel_id::AbstractString=config.slack_channel_id) =
         push!($unreacted, String(emoji))
+    # Same contract as the real call: the thread's replies newer than `oldest`
+    slack_get_replies(config::SlackClawConfig, thread_ts::AbstractString, oldest::AbstractString;
+                      channel_id::AbstractString=config.slack_channel_id) =
+        Any[m for m in $thread_replies[] if m["thread_ts"] == thread_ts && m["ts"] > oldest]
 end)
 
 mkstate(cfg) = SlackClaw.MonitorState(
@@ -903,6 +931,127 @@ mkstate(cfg) = SlackClaw.MonitorState(
     Dict{String,SlackClaw.ThreadSession}(), Dict{String,Float64}(),
     SlackClaw.ScheduledTask[], Dict{String,String}(),
     Dict{String,String}(), 0.0, ReentrantLock())
+
+# A failed run must not end its Slack thread: the thread stays tracked, so the
+# reconcile poll (poll_threads!, no socket event) reads a reply in it and starts
+# a new run, resuming the failed run's session when the CLI printed one. Real
+# run_claude and agent loop; the CLI is a stand-in that plays back simulated
+# output, one run at a time.
+@testset "failed run keeps its thread" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        f(name) = joinpath(dir, name)
+        # Stand-in `claude`: logs its argv one per line then `---`, prints the
+        # stdout/stderr fixtures, exits with the code in `code`.
+        write(f("claude"), """
+            #!/bin/sh
+            for a in "\$@"; do printf '%s\\n' "\$a" >> '$(f("args"))'; done
+            echo --- >> '$(f("args"))'
+            cat '$(f("stdout"))'
+            cat '$(f("stderr"))' >&2
+            exit \$(cat '$(f("code"))')
+            """)
+        chmod(f("claude"), 0o755)
+        function next_run(; stdout="", stderr="", code=0)
+            write(f("stdout"), stdout); write(f("stderr"), stderr); write(f("code"), string(code))
+        end
+        calls() = isfile(f("args")) ? split(read(f("args"), String), "---\n"; keepempty=false) : String[]
+        function resumed(call)
+            lines = split(call, '\n')
+            i = findfirst(==("--resume"), lines)
+            return i === nothing ? "" : String(lines[i + 1])
+        end
+        last_call(n0) = length(calls()) == n0 + 1 ? calls()[end] : ""
+        reply(ts, text, thread) = Dict{String,Any}(
+            "ts" => ts, "user" => "U9", "text" => text, "thread_ts" => thread)
+        function poll!(state, r)
+            thread_replies[] = Any[r]
+            SlackClaw.poll_threads!(state)
+            foreach(wait, state.active_tasks)
+            thread_replies[] = Any[]
+        end
+        ok_json(sid) = """{"type":"result","subtype":"success","is_error":false,"result":"all done","session_id":"$sid","num_turns":3}"""
+        steps_json = """{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s-steps","num_turns":31,"stop_reason":"tool_use","terminal_reason":"max_turns","errors":["Reached maximum number of turns (30)"]}"""
+        continue_line = "_Reply in this thread to continue; the next run resumes this one._"
+        retry_line = "_Reply in this thread to try again, with the request: this run kept no context._"
+
+        cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                              claude_max_retries=0, max_active_threads=10)
+        state = mkstate(cfg)
+        withenv("PATH" => dir * ":" * ENV["PATH"]) do
+            # 1. A step-limit stop on a top-level message: plain words and the
+            #    reply line are posted; the thread is tracked with the run's id
+            empty!(posted); empty!(reacted)
+            next_run(stdout=steps_json * "\n", code=1)
+            SlackClaw.dispatch_command!(state, SlackMessage("700.0", "U9", "refactor the parser", ""))
+            foreach(wait, state.active_tasks)
+            @test posted == ["Claude stopped at the step limit before finishing.\n\n" * continue_line]
+            @test reacted == ["eyes", "x"]
+            sess = get(state.threads, "700.0", nothing)
+            @test sess !== nothing && sess.session_id == "s-steps"
+
+            # 2. A reply in that thread, read by the poll with no socket event,
+            #    starts a run that resumes the failed run's session
+            empty!(posted)
+            next_run(stdout=ok_json("s-steps") * "\n")
+            n0 = length(calls())
+            poll!(state, reply("9999999999.000001", "please continue", "700.0"))
+            c = last_call(n0)
+            @test occursin("please continue", c)
+            @test resumed(c) == "s-steps"
+            @test !occursin("NOT available to you", c)
+            @test posted == ["all done"]
+
+            # 3. A failure that prints no result object: the thread is tracked
+            #    with an empty id, and the reply line asks for the request
+            empty!(posted)
+            next_run(stderr="Failed to authenticate: token expired\n", code=1)
+            SlackClaw.dispatch_command!(state, SlackMessage("710.0", "U9", "check the build", ""))
+            foreach(wait, state.active_tasks)
+            @test posted == ["Claude exited non-zero (code 1), stderr: Failed to authenticate: token expired\n\n" *
+                             retry_line]
+            sess = get(state.threads, "710.0", nothing)
+            @test sess !== nothing && sess.session_id == ""
+
+            # 4. A reply there, read by the poll, starts a fresh session whose
+            #    prompt carries the lost-context note
+            next_run(stdout=ok_json("s-new") * "\n")
+            n0 = length(calls())
+            poll!(state, reply("9999999999.000002", "check the build", "710.0"))
+            c = last_call(n0)
+            @test occursin("check the build", c)
+            @test resumed(c) == ""
+            @test occursin("NOT available to you", c)
+            sess = get(state.threads, "710.0", nothing)
+            @test sess !== nothing && sess.session_id == "s-new"
+
+            # 5. A resume of a session the CLI no longer has: the stale id is
+            #    dropped, so the next reply starts fresh instead of failing again
+            state.threads["720.0"] = SlackClaw.ThreadSession("720.0", "s-gone", "720.0", time(), "C0")
+            empty!(posted)
+            next_run(stderr="No conversation found with session ID: s-gone\n", code=1)
+            n0 = length(calls())
+            poll!(state, reply("9999999999.000003", "and the tests?", "720.0"))
+            @test resumed(last_call(n0)) == "s-gone"
+            @test length(posted) == 1 && endswith(posted[1], retry_line)
+            sess = get(state.threads, "720.0", nothing)
+            @test sess !== nothing && sess.session_id == ""
+            next_run(stdout=ok_json("s-fresh") * "\n")
+            n0 = length(calls())
+            poll!(state, reply("9999999999.000004", "and the tests?", "720.0"))
+            c = last_call(n0)
+            @test resumed(c) == ""
+            @test occursin("NOT available to you", c)
+        end
+    end
+end
+
+# From here on run_claude is a stub too.
+Core.eval(SlackClaw, quote
+    run_claude(prompt::String, config::SlackClawConfig;
+               session_id::String="", thread_ts::String="", channel_id::String="") =
+        (push!($prompts, prompt); ClaudeResult(true, $claude_reply[], 1, 0.0, "sess-skip"))
+end)
 
 # Pins the skip gate's placement: a skipped reply must post nothing and add no
 # checkmark — but MUST remove the dispatch-time eyes (eyes-as-intent) and MUST

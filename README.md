@@ -177,7 +177,7 @@ All options are fields on `SlackClawConfig`:
 2. **Dispatch** — each message spawns an async Claude invocation in the configured `repo_dir`; the prompt is prefixed with the authenticated sender (`[from <@U…>]`), so channel prompts can enforce per-user rules.
 3. **React** — emoji reactions track status: 👀 (seen/processing; on `allow_skip` channels removed again when the bot deliberately skips), ✅ (success), ❌ (error).
 4. **Thread** — all responses go to the message thread, preserving conversation context; long responses split across multiple messages.
-5. **Resume** — replies in a thread continue the same Claude session via `--resume`.
+5. **Resume** — replies in a thread continue the same Claude session via `--resume`. A failed run (step limit, usage limit, timeout, any non-zero exit) does not end its thread: a reply there starts a new run, resuming the failed run's session when the CLI printed one.
 6. **Listen** — messages from listen channels are relevance-filtered (irrelevant ones silently skipped) and posted to the primary channel.
 7. **Proactive** — periodically runs autonomous checks and posts only when something is noteworthy.
 8. **Persist** — sessions, scheduled tasks, and proactive timestamps survive restarts (`.slackclaw_state.json`).
