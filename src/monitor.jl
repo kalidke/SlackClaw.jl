@@ -793,19 +793,22 @@ function track_thread!(state::MonitorState, thread_ts::AbstractString, channel_i
     return sid
 end
 
-"""Line ending a failed run's reply when the next run resumes its session."""
+"""Line ending a failed run's reply when the next run resumes the failed run's own session."""
 const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
 
-"""Line ending a failed run's reply when there is no session to resume."""
-const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again; this run kept no context, so include the request._"
+"""Line ending a failed run's reply when the failed run left no session of its own."""
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, and include the request: this run left nothing to resume._"
 
 """
     failure_reply(reason, session_id) -> String
 
 Thread text for a failed run: the reason, then a line saying that a reply in the
-thread starts the next run. The line says the run continues only when there is a
-session to resume. A long reason (an error result's whole text) is cut to 3000
-characters, so the line is never lost to the post's chunk limit.
+thread starts the next run. `session_id` is the session the failed run itself
+printed: only then does the next run hold the request, and the line says the
+run continues; otherwise (a timeout, a start-up failure) the request never
+reached a session the thread can resume, so the line asks for it again. A long
+reason (an error result's whole text) is cut to 3000 characters, so the line is
+never lost to the post's chunk limit.
 """
 function failure_reply(reason::AbstractString, session_id::AbstractString)
     reason = length(reason) > 3000 ? first(reason, 3000) * " …" : reason
@@ -883,6 +886,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         current_session = session_id
         continue_count = 0
         reran_missing = false
+        # The session the latest Claude run printed ("" until it returns, or if
+        # it printed none): what a failure reply can promise to resume
+        printed_session = ""
         # A thread this run has to track (it was untracked) starts after the
         # message being answered, else after the run's own notice (set below):
         # both Slack timestamps. With neither, the run does not track it.
@@ -921,6 +927,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
                 # Run Claude (pass thread context for file upload support)
+                printed_session = ""
                 result = try
                     run_claude(current_prompt, config;
                         session_id=current_session,
@@ -937,12 +944,18 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # task fires with the id it was saved with), else starts fresh
                 # with REVIVED_THREAD_NOTE. Once per dispatched message, its
                 # [CONTINUE] steps included.
+                printed_session = result.session_id
                 if result.session_missing && !reran_missing
                     reran_missing = true
                     held = track_thread!(state, thread_ts, channel_id;
                         attempted=current_session, session_missing=true, cursor=new_cursor)
                     @info "SlackClaw: session not found, running again" thread_ts refused=current_session resume=held
-                    isempty(held) && (current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt)
+                    if isempty(held)
+                        current_prompt = REVIVED_THREAD_NOTE * "\n" * current_prompt
+                        # The thread starts over: a follow-up it has queued now
+                        # runs in a session that never saw what it refers to
+                        mark_followups_context_lost!(state, thread_ts)
+                    end
                     current_session = held
                     continue
                 end
@@ -966,7 +979,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     try
-                        post_response(config, failure_reply(result.result_text, current_session),
+                        post_response(config, failure_reply(result.result_text, result.session_id),
                                       thread_ts; channel_id)
                     catch e
                         @error "SlackClaw: failure reply not posted" thread_ts exception=(e, catch_backtrace())
@@ -1053,7 +1066,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     slack_post_message(config,
-                        failure_reply("Error: $err_msg (check server logs)", current_session);
+                        failure_reply("Error: $err_msg (check server logs)", printed_session);
                         thread_ts, channel_id)
                 catch e2
                     @error "SlackClaw: error reply not posted" thread_ts exception=(e2, catch_backtrace())
@@ -1129,14 +1142,38 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # thread was delivered and ran first, e.g. under a `me_message` the socket
     # skips): it resumes the thread's session rather than starting one, so the
     # thread keeps one conversation (a follow-up the reply scheduled resumes it).
-    # The prompt says the message is older than the replies already handled, so
-    # a later correction in a reply is not read as overridden by it.
+    # The prompt says replies were handled before it arrived and that it may
+    # have been edited since, so on a conflict Claude asks which one stands.
     tracked = get(state.threads, msg.ts, nothing)
     sid = tracked === nothing ? "" : tracked.session_id
     prompt = (isempty(sid) ? "" : LATE_PARENT_NOTE * "\n") * attribute_sender(msg.text, msg.user)
     run_agent_loop!(state, msg.ts, prompt, sid;
                     react_ts=msg.ts, channel_id,
                     before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id))
+end
+
+"""
+Prepended to a queued follow-up's prompt when the conversation that scheduled it
+is lost (the CLI refused the thread's session and the thread started over): the
+follow-up then runs in a session that never saw what it refers to.
+"""
+const FOLLOWUP_CONTEXT_LOST_NOTE = """
+[note from the dispatcher: this is a follow-up scheduled earlier in this Slack thread, in a \
+conversation that is no longer available to you. If it refers to something you do not \
+have, say so and ask the user; do not guess.]"""
+
+"""
+    mark_followups_context_lost!(state, thread_ts)
+
+Prepend [`FOLLOWUP_CONTEXT_LOST_NOTE`](@ref) (once) to every follow-up queued for
+the thread. Saved with the state at the run's next save.
+"""
+function mark_followups_context_lost!(state::MonitorState, thread_ts::AbstractString)
+    for s in state.scheduled
+        s.thread_ts == thread_ts && !startswith(s.prompt, FOLLOWUP_CONTEXT_LOST_NOTE) &&
+            (s.prompt = FOLLOWUP_CONTEXT_LOST_NOTE * "\n" * s.prompt)
+    end
+    return nothing
 end
 
 """

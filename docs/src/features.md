@@ -179,12 +179,14 @@ failed reaction is logged and never stops the post.
   session, with what the failed run already did. The reply ends with "Reply in
   this thread to continue; the next run resumes this one."
 - When it printed none (a timeout, or a failure with nothing on stdout), the
-  thread keeps the session it already had: a failed reply in a running
-  conversation still resumes that conversation, with the same line. Only a
-  thread with no session yet (its first run failed this way) starts the next
-  run fresh, told that the earlier context is not available; its reply ends
-  with "Reply in this thread to try again; this run kept no context, so
-  include the request."
+  thread keeps the session it already had, so the next reply resumes the
+  earlier conversation (a thread with no session yet starts fresh, told that
+  the earlier context is not available). The failed request never reached
+  that session, so the reply ends with "Reply in this thread to try again, and
+  include the request: this run left nothing to resume."
+- A follow-up queued in a conversation the CLI no longer has (see below) is
+  told so when it fires in the thread's new session, and asks rather than
+  guesses what it refers to.
 - A step-limit stop reads "Claude stopped at the step limit before finishing."
   Raise `max_turns` for a channel whose tasks need more steps.
 - A session the CLI no longer has (its transcripts were moved or removed, for
@@ -198,8 +200,9 @@ failed reaction is logged and never stops the post.
 - A thread has one run at a time: a reply in a thread that already has a run
   gets "Still working". A top-level message that reached SlackClaw late, after a
   reply in its thread, says it was not run while that thread is running, and
-  otherwise resumes the thread's conversation, told it came after replies
-  already handled (and may have been edited), so a conflict is asked about.
+  otherwise resumes the thread's conversation when it has one (else runs
+  fresh), told it came after replies already handled (and may have been
+  edited), so a conflict is asked about.
 
 A failed thread counts toward `max_active_threads` like any other. A thread
 with a run in flight or a follow-up scheduled is never expired, and sits beside
