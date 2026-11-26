@@ -160,7 +160,8 @@ All options are fields on `SlackClawConfig`:
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
 | `allow_skip` | `false` | Honor an exact `[SKIP]` reply on the primary/thread path (post nothing; also suppresses the dispatch-time 👀) |
 | `announce_startup` | `false` | Post start/stop banners to the primary channel |
-| `system_prompt` | *(brevity prompt)* | The channel's instructions, added after Claude Code's own system prompt on each run |
+| `system_prompt` | *(brevity prompt)* | The channel's instructions, added after Claude Code's own system prompt; a thread keeps the prompt its conversation started with |
+| `auto_memory` | `false` | Let runs read and save Claude Code's auto memory in the repo's memory folder (off: neither) |
 | `allowed_tools` | `String[]` | Restrict Claude to specific tools |
 | `child_env_passthrough` | `String[]` | Environment variables the Claude child gets beyond the allow list, by exact name; a value holding a Slack token or webhook URL never passes |
 | `listen_channel_ids` | `String[]` | Read-only channels (relevance-filtered; responses go to the primary channel) |
