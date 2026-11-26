@@ -21,20 +21,34 @@ Patch: a failed Claude run no longer ends its Slack thread.
 - **A failed exit keeps its session id.** With `--output-format json` the CLI
   prints its result object on a failed exit too, with `session_id`. It is
   now kept, so the next reply resumes the same session with what the failed
-  run already did. With no id (a timeout, nothing on stdout) the thread keeps
-  the session it had; a thread with none yet starts the next reply fresh, and
-  its prompt carries `REVIVED_THREAD_NOTE`, now worded for both an expired
-  thread and a failed run.
+  run already did. A timed-out run's session is the id of a result printed
+  before the overrun, else the session it resumed. With no id (nothing on
+  stdout, a fresh run's timeout) the thread keeps the session it had; a thread with none yet starts the next reply fresh, and
+  its prompt carries `REVIVED_THREAD_NOTE`, which now says only that the
+  earlier conversation is not available (it no longer names a cause, which
+  did not fit every case).
 - **A step-limit stop reads as one.** A run stopped at `max_turns` (result
   `subtype` `error_max_turns`) has no result text, so the reply was the bare
   exit code. It now reads "Claude stopped at the step limit before
   finishing."
-- **Every failed run's reply ends with a line about replying**: "Reply in
-  this thread to continue; the next run resumes this one." when there is a
-  session to resume, and "Reply in this thread to try again; this run kept
-  no context, so include the request." when there is not. The reason text
-  before it is unchanged from 0.7.2, cut to 3000 characters so the line always
-  fits.
+- **Every failed run's reply ends with a line about replying**: "Reply in this
+  thread to continue; the next run resumes this one." when the session the
+  thread resumes holds the failed run's work (a run in it printed its id, or a
+  resumed run timed out in it), and "Reply in this thread to try again, saying
+  what is still to be done: this run left nothing to resume, though some of
+  its work may have run." when it does not (a start-up failure, a fresh run
+  that timed out: the thread's earlier session, if any, is still resumed). A
+  timed-out run's session is the id of a result printed before the overrun,
+  else the session it resumed (the CLI writes the transcript as it goes, under
+  the same id). A lone stdout event of another type (`system` init) is not
+  read as a result. The reason text before it is unchanged from 0.7.2, cut to
+  3000 characters so the line always fits.
+- **A follow-up firing in another session is told so.** When a scheduled
+  follow-up resumes a session other than the one that scheduled it (the
+  thread started over since: a refused resume, or a late message an older
+  version ran fresh), its prompt carries `FOLLOWUP_OTHER_SESSION_NOTE`, so
+  Claude asks rather than guesses what it refers to. It is decided when the
+  follow-up fires, so a restart in between does not lose it.
 - **A stale session id is dropped, and the message runs again.** A
   `--resume` of a session the CLI no longer has ("No conversation found with
   session ID") failed every reply in that thread. The id is now cleared and
@@ -61,10 +75,11 @@ Patch: a failed Claude run no longer ends its Slack thread.
 - **One run per thread.** `run_agent_loop!` refuses a second run in a thread
   that already has one, whatever dispatched it (a reply, a late top-level
   message, a scheduled follow-up); a reply gets "Still working", as before.
-  The check and the busy mark are one step with no yield in between. The dispatcher's own Slack call (👀, the follow-up
-  notice) runs inside the run, before Claude starts, so it is never posted
-  after the run's reply. `run_agent_loop!` gains a `before_run` keyword for it
-  and returns whether the run started.
+  The check and the busy mark are one step with no yield in between. The
+  dispatcher's own Slack call (👀, the follow-up notice) runs inside the run,
+  before Claude starts, so it is never posted after the run's reply.
+  `run_agent_loop!` gains a `before_run` keyword for it and returns whether
+  the run started.
 - **A reply to a failure notice starts a run.** The ❌ reaction goes on
   first, then the run lets go of the thread (busy mark released, status file
   cleared), then the reason is posted, so a reply sent while the notice is
@@ -73,12 +88,21 @@ Patch: a failed Claude run no longer ends its Slack thread.
   failed post is logged, never sent back through the loop's error path. A
   failed reaction or status-file cleanup on that path is logged and never
   stops the release or the post.
-- **A late top-level message says it was not run.** When the socket missed a
-  top-level message but delivered a reply in its thread, the reply revives
-  the thread and runs (as before: a webhook post, whose event never moves the
-  cursor, has nothing else to read its replies). When reconciliation then
-  reads the message and finds its thread running, the message says it was not
-  run and asks for a reply with the request, instead of "Still working".
+- **A late top-level message keeps its thread's conversation.** When the
+  socket missed a top-level message but delivered a reply in its thread, the
+  reply revives the thread and runs (as before: a webhook post, whose event
+  never moves the cursor, has nothing else to read its replies). When
+  reconciliation then reads the message and finds its thread running, the
+  message is not run (one run per thread; 0.7.3 ran it beside the reply) and
+  says so, asking for a reply with the request. When it finds its thread
+  tracked and idle (the reply already ran), it resumes the thread's session
+  instead of starting a new one, so the thread keeps one conversation and a
+  follow-up the reply scheduled resumes the one that has its request. Its
+  prompt carries `LATE_PARENT_NOTE`: it is the thread's original post,
+  reaching Claude after replies already handled and possibly edited since, so
+  on a conflict with those replies Claude asks which one stands. This also
+  covers Slack's `me_message` status posts, which the socket skips and
+  reconciliation reads.
 - **Expiry spares threads with work to come.** A thread with a run in flight
   or a follow-up scheduled is not expired, and such threads sit beside
   `max_active_threads`, which counts the other threads only.
@@ -87,9 +111,11 @@ Patch: a failed Claude run no longer ends its Slack thread.
   with `REVIVED_THREAD_NOTE`). It waits while its thread is running or no task
   slot is free, instead of running beside it, and is saved as deferred
   (`ScheduledTask` gains `deferred::Bool`; the four-argument constructor
-  stays), so a restart keeps it though its time has passed.
+  stays), so a restart keeps it though its time has passed, for up to a day.
 - **A failed state save no longer hides the run's reply.** It is logged, and
-  the run's reason is still posted.
+  the run's reason is still posted. A failed ✅ after a posted answer is only
+  logged too, instead of an error reply inviting a retry of finished work, as
+  is a failed save or confirmation of a follow-up that is already queued.
 - The status-file watcher stops when `run_claude` throws, and no longer posts
   once more after its run has ended.
 

@@ -162,8 +162,9 @@ dispatch paths:
 
     <sanitized user text>
 
-The prefix is unconditional and always FIRST — only the first `[from …]` line
-of a prompt is authoritative. Users can type a forged `[from …]` line
+The prefix is unconditional and is the prompt's FIRST `[from …]` line (a
+dispatcher note may precede it) — only the first `[from …]` line of a prompt
+is authoritative. Users can type a forged `[from …]` line
 themselves, so leading look-alikes in the user text are neutralized by
 [`sanitize_from_lines`](@ref) before the real prefix is attached. An empty
 `user_id` (Slack events without a `user` field) yields `[from unknown]`, so

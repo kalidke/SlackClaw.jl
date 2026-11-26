@@ -180,14 +180,21 @@ captured output. `resumed` is the session id the run was given with `--resume`
 
 A non-zero exit keeps the `session_id` of the CLI's stdout result object when it
 printed one: with `--output-format json` it does on a failed exit too (a step
-limit, a usage limit), so the thread can resume that session. A timeout has no
-id: the run was killed before printing anything. A refused resume sets
-`session_missing` ([`resume_refused`](@ref)).
+limit, a usage limit), so the thread can resume that session. A timeout keeps
+the id of a result printed before the overrun, else the session it resumed (the
+CLI writes the transcript as it goes and keeps the id across `--resume`); a
+fresh run that timed out has none. A refused resume sets `session_missing`
+([`resume_refused`](@ref)).
 """
 function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::AbstractString="")
     if res.timed_out
         @warn "SlackClaw: claude timed out" timeout_s
-        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, "")
+        # A result printed before the overrun still names the run's session;
+        # else a resumed run worked in the session it resumed (the CLI writes
+        # the transcript as it goes, under the same id), so that is its session
+        sid = stdout_session_id(res.stdout)
+        isempty(sid) && (sid = String(resumed))
+        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, sid)
     end
 
     if res.exitcode != 0
@@ -307,6 +314,8 @@ function result_entry(data)
     entry = if data isa AbstractVector
         idx = findlast(d -> d isa AbstractDict && get(d, "type", "") == "result", data)
         idx === nothing ? nothing : data[idx]
+    elseif data isa AbstractDict && get(data, "type", "result") != "result"
+        nothing     # a lone event of another type (e.g. system init) is no result
     else
         data
     end

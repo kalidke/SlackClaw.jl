@@ -155,8 +155,9 @@ function load_state(config::SlackClawConfig)
             due = d["due_at"]
             deferred = get(d, "deferred", false) === true
             # Skip follow-ups whose time passed while the monitor was down; keep
-            # one that came due and was waiting for its thread
-            due > now || deferred || continue
+            # one that came due and was waiting for its thread, for up to a day
+            # (after a longer stop it would fire at once in a stale thread)
+            due > now || (deferred && now - due < 86400) || continue
             push!(scheduled, ScheduledTask(
                 d["thread_ts"], d["session_id"], d["prompt"], due, deferred))
         end
@@ -609,7 +610,17 @@ function check_scheduled!(state::MonitorState)
         # thread moved to a fresh session after the follow-up was scheduled).
         # The saved id is used only when the thread is no longer tracked.
         sid = tracked === nothing ? sched.session_id : tracked.session_id
-        prompt = isempty(sid) ? REVIVED_THREAD_NOTE * "\n" * sched.prompt : sched.prompt
+        # A follow-up resuming a session other than the one that scheduled it
+        # (the thread started over: a refused resume, a late message run fresh
+        # by an older version) is told so, decided here when it fires, so a
+        # restart in between cannot lose it
+        prompt = if isempty(sid)
+            REVIVED_THREAD_NOTE * "\n" * sched.prompt
+        elseif !isempty(sched.session_id) && sched.session_id != sid
+            FOLLOWUP_OTHER_SESSION_NOTE * "\n" * sched.prompt
+        else
+            sched.prompt
+        end
         # The notice is posted inside the run, before Claude starts; its Slack ts
         # is the cursor if the thread has to be tracked again
         started = run_agent_loop!(state, sched.thread_ts, prompt, sid; channel_id=ch,
@@ -792,19 +803,24 @@ function track_thread!(state::MonitorState, thread_ts::AbstractString, channel_i
     return sid
 end
 
-"""Line ending a failed run's reply when the next run resumes its session."""
+"""Line ending a failed run's reply when the session the thread resumes holds the failed run's work."""
 const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
 
-"""Line ending a failed run's reply when there is no session to resume."""
-const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again; this run kept no context, so include the request._"
+"""Line ending a failed run's reply when the failed run's work is in no session the thread resumes."""
+const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, saying what is still to be done: this run left nothing to resume, though some of its work may have run._"
 
 """
     failure_reply(reason, session_id) -> String
 
 Thread text for a failed run: the reason, then a line saying that a reply in the
-thread starts the next run. The line says the run continues only when there is a
-session to resume. A long reason (an error result's whole text) is cut to 3000
-characters, so the line is never lost to the post's chunk limit.
+thread starts the next run. `session_id` is the session the thread resumes when
+it holds the run's work (a run in this loop printed it, or a resumed run timed
+out in it: the CLI writes its transcript as it goes and keeps the id across
+`--resume`); then the line says the run continues. Pass "" otherwise (a start-up
+failure, a fresh run that timed out): the work is in no session the thread can
+resume, so the line asks what is still to be done. A long
+reason (an error result's whole text) is cut to 3000 characters, so the line is
+never lost to the post's chunk limit.
 """
 function failure_reply(reason::AbstractString, session_id::AbstractString)
     reason = length(reason) > 3000 ? first(reason, 3000) * " …" : reason
@@ -882,6 +898,10 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         current_session = session_id
         continue_count = 0
         reran_missing = false
+        # The latest session a run in this loop named (printed, or a timed-out
+        # resume): a failure reply promises "continue" only when the thread
+        # resumes that session, which then holds the run's work
+        printed_session = ""
         # A thread this run has to track (it was untracked) starts after the
         # message being answered, else after the run's own notice (set below):
         # both Slack timestamps. With neither, the run does not track it.
@@ -936,6 +956,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # task fires with the id it was saved with), else starts fresh
                 # with REVIVED_THREAD_NOTE. Once per dispatched message, its
                 # [CONTINUE] steps included.
+                isempty(result.session_id) || (printed_session = result.session_id)
                 if result.session_missing && !reran_missing
                     reran_missing = true
                     held = track_thread!(state, thread_ts, channel_id;
@@ -965,7 +986,8 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     try
-                        post_response(config, failure_reply(result.result_text, current_session),
+                        post_response(config, failure_reply(result.result_text,
+                                          current_session == printed_session ? current_session : ""),
                                       thread_ts; channel_id)
                     catch e
                         @error "SlackClaw: failure reply not posted" thread_ts exception=(e, catch_backtrace())
@@ -1013,18 +1035,30 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     due = time() + directive.delay_s
                     push!(state.scheduled, ScheduledTask(
                         thread_ts, current_session, directive.prompt, due))
-                    save_state!(state)
-                    mins = round(Int, directive.delay_s / 60)
-                    slack_post_message(config,
-                        "_Scheduled follow-up in $(mins)m._";
-                        thread_ts, channel_id)
+                    # The follow-up is queued: a failed save or confirmation is
+                    # logged, never an error reply inviting a retry (which would
+                    # queue it twice)
+                    try
+                        save_state!(state)
+                    catch e
+                        @error "SlackClaw: follow-up queued, but saving it failed" thread_ts exception=(e, catch_backtrace())
+                    end
+                    try
+                        mins = round(Int, directive.delay_s / 60)
+                        slack_post_message(config,
+                            "_Scheduled follow-up in $(mins)m._";
+                            thread_ts, channel_id)
+                    catch e
+                        @error "SlackClaw: follow-up queued, but its notice failed" thread_ts exception=(e, catch_backtrace())
+                    end
                     @info "SlackClaw: [SCHEDULE] $(directive.delay_s)s for thread $thread_ts"
                     break
 
                 else  # :done
                     # No checkmark on a deliberately skipped message — it would itself be noise
-                    !isempty(react_ts) && !skipped &&
-                        slack_add_reaction(config, react_ts, "white_check_mark"; channel_id)
+                    # Best effort: the answer is posted, so a failed reaction
+                    # must not turn into an error reply inviting a retry
+                    !skipped && react_quietly(config, react_ts, "white_check_mark"; channel_id)
                     break
                 end
             end
@@ -1040,7 +1074,8 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     slack_post_message(config,
-                        failure_reply("Error: $err_msg (check server logs)", current_session);
+                        failure_reply("Error: $err_msg (check server logs)",
+                                      current_session == printed_session ? current_session : "");
                         thread_ts, channel_id)
                 catch e2
                     @error "SlackClaw: error reply not posted" thread_ts exception=(e2, catch_backtrace())
@@ -1091,7 +1126,7 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # Checked before the slot limit, so the user gets the resend instruction.
     if haskey(state.busy_threads, msg.ts)
         slack_post_message(config,
-            "_A reply in this thread is already running, so this message was not run. " *
+            "_This thread already has a run going, so this message was not run. " *
             "Reply in this thread with the request when it finishes._";
             thread_ts=msg.ts, channel_id)
         return
@@ -1111,10 +1146,43 @@ function dispatch_command!(state::MonitorState, msg::SlackMessage;
     # Claude starts. The run tracks the thread when it ends, whatever the
     # outcome, with its cursor at this message, so a reply posted during the run
     # is read afterwards by the reconcile poll.
-    run_agent_loop!(state, msg.ts, attribute_sender(msg.text, msg.user), "";
+    #
+    # A message whose thread is already tracked reached us late (a reply in its
+    # thread was delivered and ran first, e.g. under a `me_message` the socket
+    # skips): it resumes the thread's session rather than starting one, so the
+    # thread keeps one conversation (a follow-up the reply scheduled resumes it).
+    # The prompt says replies were handled before it arrived and that it may
+    # have been edited since, so on a conflict Claude asks which one stands.
+    tracked = get(state.threads, msg.ts, nothing)
+    sid = tracked === nothing ? "" : tracked.session_id
+    prompt = (isempty(sid) ? "" : LATE_PARENT_NOTE * "\n") * attribute_sender(msg.text, msg.user)
+    run_agent_loop!(state, msg.ts, prompt, sid;
                     react_ts=msg.ts, channel_id,
                     before_run = () -> slack_add_reaction(config, msg.ts, "eyes"; channel_id))
 end
+
+"""
+Prepended to a scheduled follow-up's prompt when it fires in a session other
+than the one that scheduled it (the thread started over since): that session
+may not have what the follow-up refers to.
+"""
+const FOLLOWUP_OTHER_SESSION_NOTE = """
+[note from the dispatcher: this is a follow-up scheduled earlier in this Slack thread, in a \
+conversation that may not be this one. If it refers to something you do not have, say so \
+and ask the user; do not guess.]"""
+
+"""
+Prepended to a top-level message that reaches the monitor after a reply in its
+thread already ran, when it resumes that thread's session. The message was
+posted first but may have been edited since (Slack keeps its ts), so the note
+states no precedence: on a conflict with the replies Claude asks which stands.
+"""
+const LATE_PARENT_NOTE = """
+[note from the dispatcher: the message below is this Slack thread's original top-level \
+post. It reached the dispatcher late: replies in this thread were already handled before \
+it arrived, and it may have been edited since it was first posted, so which instruction is \
+newer is not known. If it conflicts with those replies, ask the user which one stands; do \
+not guess. Who sent each message is given by that message's own [from] line.]"""
 
 # --- Dispatch: thread replies ---
 
@@ -1129,10 +1197,9 @@ removed.
 """
 const REVIVED_THREAD_NOTE = """
 [note from the dispatcher: the earlier conversation in this Slack thread is NOT \
-available to you (the thread expired, or an earlier run in it failed before its \
-session could be resumed). If the message relies on that earlier content, say the \
-earlier context is not available and ask the user to restate what you need; do not \
-guess. If the message stands on its own, just answer it and do not mention this.]"""
+available to you. If the message relies on that earlier content, say the earlier \
+context is not available and ask the user to restate what you need; do not guess. \
+If the message stands on its own, just answer it and do not mention this.]"""
 
 """Prompt for a thread dispatch: sender-attributed text, with
 [`REVIVED_THREAD_NOTE`](@ref) prepended when the session has no Claude context

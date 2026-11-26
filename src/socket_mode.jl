@@ -93,8 +93,9 @@ function route_socket_event!(state::MonitorState, event::AbstractDict)
         should_process(msg, config, event) || return nothing
         # No guard on the thread's own top-level message being unread: a parent
         # that never moves the primary cursor here (a `bot_message` webhook post)
-        # or never runs (filtered) would leave the reply lost. A late parent is
-        # told it was not run instead (dispatch_command!).
+        # or never runs (filtered) would leave the reply lost. A late parent
+        # resumes the thread's session once the reply's run has ended, and is
+        # told it was not run while that run is going (dispatch_command!).
         session = claim_thread_revive!(state, msg, get(event, "channel", ""))
         session === nothing && return nothing
         save_state!(state)

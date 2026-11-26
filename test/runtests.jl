@@ -1013,7 +1013,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
         auth_reason = "Claude exited non-zero (code 1), stderr: Failed to authenticate: token expired"
         note = "NOT available to you"
         continue_line = "_Reply in this thread to continue; the next run resumes this one._"
-        retry_line = "_Reply in this thread to try again; this run kept no context, so include the request._"
+        retry_line = "_Reply in this thread to try again, saying what is still to be done: this run left nothing to resume, though some of its work may have run._"
 
         cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
                               claude_max_retries=0, max_active_threads=50)
@@ -1113,6 +1113,54 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test posted == ["all done"]
             @test held(state, T) == "s-fresh"
 
+            #    A follow-up queued in the lost conversation is told so when it
+            #    fires, in the thread's new session (decided when it fires, so
+            #    a restart in between cannot lose it)
+            T = "1700000721.000000"
+            track!(state, T, "s-A")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-A", "report the status of that job", time() + 600))
+            next_runs((stderr=refused("s-A"), code=1), (stdout=ok_json("s-B") * "\n",),
+                      (stdout=ok_json("s-B") * "\n",))
+            n0 = length(calls())
+            poll!(state, reply("1700000721.000100", "what about job B?", T))
+            foreach(sc -> sc.thread_ts == T && (sc.due_at = 0.0), state.scheduled)
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 3 && resumed(c[3]) == "s-B" &&
+                  occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE * "\nreport the status of that job", c[3])
+            @test count(cc -> occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, cc), c) == 1
+            #    State saved and loaded with the follow-up under A and the thread
+            #    under B (a restart, or a state an older version wrote): the
+            #    same note
+            T = "1700000722.000000"
+            track!(state, T, "s-B2")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-A2", "report the status of that job", time() + 600))
+            SlackClaw.save_state!(state)
+            loaded = SlackClaw.load_state(cfg)
+            @test any(sc -> sc.thread_ts == T && sc.session_id == "s-A2" &&
+                            sc.prompt == "report the status of that job", loaded[3])
+            foreach(sc -> sc.thread_ts == T && (sc.due_at = 0.0), state.scheduled)
+            next_run(stdout=ok_json("s-B2") * "\n")
+            n0 = length(calls())
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 1 && resumed(c[1]) == "s-B2" &&
+                  occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, c[1])
+            #    ... and a follow-up firing in the session that scheduled it gets
+            #    no note
+            T = "1700000723.000000"
+            track!(state, T, "s-C")
+            push!(state.scheduled, SlackClaw.ScheduledTask(T, "s-C", "check it", 0.0))
+            next_run(stdout=ok_json("s-C") * "\n")
+            n0 = length(calls())
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 1 && resumed(c[1]) == "s-C" &&
+                  !occursin(SlackClaw.FOLLOWUP_OTHER_SESSION_NOTE, c[1])
+
             # 6. A scheduled run fires with an older id than the thread now
             #    holds, and the CLI refuses it: the rerun resumes the thread's
             #    newer session (no note), which the thread keeps
@@ -1156,8 +1204,10 @@ mkstate(cfg) = SlackClaw.MonitorState(
             @test held(state, T) == "s-valid"
 
             # 9. A failure that prints no id on a resumed thread keeps the
-            #    thread's id and says so; the next reply resumes it. Both a
-            #    timeout and a stderr-only exit
+            #    thread's id, and the next reply resumes it. A timeout worked in
+            #    that session, so its reply says continue; a stderr-only exit
+            #    (a start-up failure) never reached it, so its reply asks what
+            #    is still to be done
             T = "1700000750.000000"
             track!(state, T, "s-long")
             cfg.claude_timeout_s = 1
@@ -1170,13 +1220,25 @@ mkstate(cfg) = SlackClaw.MonitorState(
             clear_logs!()
             next_run(stderr=auth_fail, code=1)
             poll!(state, reply("1700000750.000200", "again", T))
-            @test posted == [auth_reason * "\n\n" * continue_line]
+            @test posted == [auth_reason * "\n\n" * retry_line]
             @test held(state, T) == "s-long"
             next_run(stdout=ok_json("s-long") * "\n")
             n0 = length(calls())
             poll!(state, reply("1700000750.000300", "again", T))
             c = new_calls(n0)
             @test length(c) == 1 && resumed(c[1]) == "s-long"
+            #    A [CONTINUE] step that fails to start after an earlier step
+            #    printed its id: the thread resumes that session, which holds
+            #    the work, so the reply says continue
+            T = "1700000751.000000"
+            clear_logs!()
+            step1 = """{"type":"result","subtype":"success","is_error":false,"result":"Submitted job 42. [CONTINUE]","session_id":"s-K1"}"""
+            next_runs((stdout=step1 * "\n",), (stderr=auth_fail, code=1))
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "submit and check job 42", ""))
+            foreach(wait, state.active_tasks)
+            @test length(posted) == 2 && startswith(posted[1], "Submitted job 42") &&
+                  posted[2] == auth_reason * "\n\n" * continue_line
+            @test held(state, T) == "s-K1"
 
             # 10. A thread re-tracked while the poll waits on Slack: the read was
             #     against the old cursor, so it dispatches nothing
@@ -1338,7 +1400,7 @@ mkstate(cfg) = SlackClaw.MonitorState(
             foreach(wait, state.active_tasks)
             delete!(state.busy_threads, T)
             @test length(calls()) == n0
-            @test top_posted == ["_A reply in this thread is already running, so this message was not run. " *
+            @test top_posted == ["_This thread already has a run going, so this message was not run. " *
                                  "Reply in this thread with the request when it finishes._"]
 
             # 28. A follow-up held back by a busy thread survives a restart however
@@ -1352,6 +1414,26 @@ mkstate(cfg) = SlackClaw.MonitorState(
             reloaded_sched = SlackClaw.load_state(cfg)[3]
             @test any(s -> s.thread_ts == T && s.deferred, reloaded_sched)
             filter!(s -> s.thread_ts != T, state.scheduled)
+            #     ... for up to a day: after a longer stop it is dropped, as a
+            #     follow-up whose time passed while the monitor was down is
+            state.scheduled = [SlackClaw.ScheduledTask(T, "s-held", "check later", time() - 2 * 86400, true)]
+            SlackClaw.save_state!(state)
+            @test !any(s -> s.thread_ts == T, SlackClaw.load_state(cfg)[3])
+            empty!(state.scheduled)
+
+            #     A first save that fails does not leave the deferral unsaved: the
+            #     next poll saves it again
+            cfg_ds = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                     state_file="later-dir/state.json")
+            state_ds = mkstate(cfg_ds)
+            T = "1700000893.000000"
+            track!(state_ds, T, "s-held")
+            state_ds.busy_threads[T] = time()
+            push!(state_ds.scheduled, SlackClaw.ScheduledTask(T, "s-held", "check later", time() - 5))
+            SlackClaw.check_scheduled!(state_ds)          # save fails: no such directory
+            mkpath(f("later-dir"))
+            SlackClaw.check_scheduled!(state_ds)          # saved now
+            @test any(s -> s.thread_ts == T && s.deferred, SlackClaw.load_state(cfg_ds)[3])
 
             # 29. A due follow-up with no free task slot waits for the next poll
             cfg_full = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
@@ -1433,6 +1515,94 @@ mkstate(cfg) = SlackClaw.MonitorState(
             SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "status", ""))
             foreach(wait, state.active_tasks)
             @test !isfile(joinpath(dir, cfg.status_file))
+
+            # 34. A late top-level message whose thread is tracked and idle (a
+            #     reply under it ran first: Slack's me_message status posts are
+            #     skipped on the socket and read by reconciliation) resumes the
+            #     thread's session, so the follow-up the reply scheduled resumes
+            #     the conversation that has the request
+            T = "1700000994.000000"
+            state.last_ts = "1700000980.000000"
+            sched_json = """{"type":"result","subtype":"success","is_error":false,"result":"Watching job 42. [SCHEDULE: 10m: check job 42]","session_id":"s-R"}"""
+            next_runs((stdout=sched_json * "\n",), (stdout=ok_json("s-R") * "\n",),
+                      (stdout=ok_json("s-R") * "\n",))
+            n0 = length(calls())
+            ev = SlackClaw.JSON.parse("""{"type":"message","channel":"C0","user":"U9","text":"watch job 42, check again in ten minutes","ts":"1700000994.000100","thread_ts":"$T"}""")
+            SlackClaw.route_socket_event!(state, ev)
+            foreach(wait, state.active_tasks)
+            @test held(state, T) == "s-R"
+            @test SlackClaw.claim_primary!(state, T)     # reconciliation reads the status post
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "is debugging the pipeline", ""))
+            foreach(wait, state.active_tasks)
+            foreach(s -> s.thread_ts == T && (s.due_at = 0.0), state.scheduled)
+            SlackClaw.check_scheduled!(state)
+            foreach(wait, state.active_tasks)
+            c = new_calls(n0)
+            @test length(c) == 3
+            @test length(c) == 3 && resumed(c[2]) == "s-R" && resumed(c[3]) == "s-R"
+            #     The late message's prompt says replies were handled before it
+            #     arrived and asks on a conflict, and keeps its authenticated sender
+            @test length(c) == 3 && occursin("replies in this thread were already handled", c[2]) &&
+                  occursin("ask the user which one stands", c[2]) &&
+                  occursin("[from <@U9>]", c[2]) && occursin("is debugging the pipeline", c[2])
+            #     The note comes first, then the sender line, then the text
+            @test length(c) == 3 &&
+                  findfirst("replies in this thread were already handled", c[2]).start <
+                  findfirst("[from <@U9>]", c[2]).start <
+                  findfirst("is debugging the pipeline", c[2]).start
+            #     A late message whose thread holds no session (the reply's run
+            #     printed none) runs fresh, with no note
+            T2 = "1700000997.000000"
+            track!(state, T2, "")
+            @test SlackClaw.claim_primary!(state, T2)
+            next_run(stdout=ok_json("s-P2") * "\n")
+            n1 = length(calls())
+            SlackClaw.dispatch_command!(state, SlackMessage(T2, "U9", "first post", ""))
+            foreach(wait, state.active_tasks)
+            c2 = new_calls(n1)
+            @test length(c2) == 1 && resumed(c2[1]) == "" &&
+                  !occursin("replies in this thread were already handled", c2[1])
+            @test held(state, T2) == "s-P2"
+            @test held(state, T) == "s-R"
+            state.last_ts = "100.0"
+
+            # 35. A failed ✅ after the answer is posted is only logged: no error
+            #     reply inviting a retry of finished work
+            T = "1700000995.000000"
+            clear_logs!()
+            react_hook[] = e -> e == "white_check_mark" && error("simulated reactions.add failure")
+            next_run(stdout=ok_json("s-ok") * "\n")
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "quick one", ""))
+            foreach(wait, state.active_tasks)
+            react_hook[] = nothing
+            @test posted == ["all done"]
+            @test isempty(top_posted)
+
+            # 36. A follow-up that is queued but whose confirmation post fails is
+            #     only logged: no error reply inviting a retry (a second one)
+            T = "1700000996.000000"
+            clear_logs!()
+            top_hook[] = t -> startswith(t, "_Scheduled follow-up in") && error("simulated chat.postMessage failure")
+            next_run(stdout=replace(sched_json, "s-R" => "s-Q") * "\n")
+            SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "watch it", ""))
+            foreach(wait, state.active_tasks)
+            top_hook[] = nothing
+            @test !any(t -> startswith(t, "Error:"), top_posted)
+            @test count(sc -> sc.thread_ts == T, state.scheduled) == 1
+            filter!(sc -> sc.thread_ts != T, state.scheduled)
+            #     ... and one whose save fails still posts its confirmation, with
+            #     no error reply
+            cfg_sf = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                                     state_file="no-such-dir/state.json")
+            state_sf = mkstate(cfg_sf)
+            empty!(top_posted)
+            T = "1700000998.000000"
+            next_run(stdout=replace(sched_json, "s-R" => "s-S") * "\n")
+            SlackClaw.dispatch_command!(state_sf, SlackMessage(T, "U9", "watch it", ""))
+            foreach(wait, state_sf.active_tasks)
+            @test any(t -> startswith(t, "_Scheduled follow-up in"), top_posted)
+            @test !any(t -> startswith(t, "Error:"), top_posted)
+            @test count(sc -> sc.thread_ts == T, state_sf.scheduled) == 1
 
             # 14. A failed ❌ reaction does not cost the failure reply
             T = "1700000810.000000"
@@ -1552,6 +1722,17 @@ end
     @test !rr(fake(err="Failed to authenticate\n"), "s1")
     @test !rr(fake(code=0), "s1")
     @test !rr(fake(timed_out=true), "s1")
+    # a timeout keeps the id of a result printed before the overrun
+    @test SlackClaw.interpret_claude_run(fake(timed_out=true,
+              out="""{"type":"result","is_error":false,"result":"x","session_id":"s-T"}"""), 5, 60).session_id == "s-T"
+    @test SlackClaw.interpret_claude_run(fake(timed_out=true, out=""), 5, 60).session_id == ""
+    # ... and a resumed run that timed out worked in the session it resumed
+    @test SlackClaw.interpret_claude_run(fake(timed_out=true, out=""), 5, 60; resumed="s-R").session_id == "s-R"
+    # a lone event of another type is no result: its id promises nothing
+    @test SlackClaw.interpret_claude_run(fake(err="boom\n",
+              out="""{"type":"system","subtype":"init","session_id":"A"}"""), 5, 60).session_id == ""
+    @test SlackClaw.interpret_claude_run(fake(err="boom\n",
+              out="""{"is_error":true,"result":"x","session_id":"L"}"""), 5, 60).session_id == "L"   # legacy, no type
     r = SlackClaw.interpret_claude_run(fake(), 5, 60; resumed="s1")
     @test !r.success && r.session_missing && r.session_id == ""
     @test !SlackClaw.interpret_claude_run(fake(), 5, 60).session_missing
@@ -1588,6 +1769,28 @@ end)
     @test s !== nothing && s.session_id == ""
     @test top_posted == ["Error: ErrorException (check server logs)\n\n" * SlackClaw.FAILED_RUN_RETRY_LINE]
     @test slack_log == ["react:x", "top"]
+
+    # On a thread holding a session: run_claude throwing before it returned
+    # left nothing in it, so the reply asks what is still to be done; an error
+    # after a run returned (here posting its answer) says continue
+    T = "1700000803.000000"
+    state.threads[T] = SlackClaw.ThreadSession(T, "s-E", T, time(), "C0")
+    empty!(top_posted)
+    claude_throws[] = true
+    SlackClaw.run_agent_loop!(state, T, "check it", "s-E"; react_ts=T, channel_id="C0")
+    foreach(wait, state.active_tasks)
+    claude_throws[] = false
+    @test top_posted == ["Error: ErrorException (check server logs)\n\n" * SlackClaw.FAILED_RUN_RETRY_LINE]
+    @test state.threads[T].session_id == "s-E"
+    T = "1700000804.000000"
+    empty!(top_posted)
+    claude_reply[] = "the answer"
+    post_hook[] = ts -> ts == T && error("simulated chat.postMessage failure")
+    SlackClaw.run_agent_loop!(state, T, "check it", ""; react_ts=T, channel_id="C0")
+    foreach(wait, state.active_tasks)
+    post_hook[] = nothing; claude_reply[] = "[SKIP]"
+    @test top_posted == ["Error: ErrorException (check server logs)\n\n" * SlackClaw.FAILED_RUN_CONTINUE_LINE]
+    @test state.threads[T].session_id == "sess-skip"
 
     # The same with a failing ❌ reaction: the error is still posted, and the
     # thread is free by the time it is
