@@ -151,13 +151,15 @@ and the run follows prompts any channel member can write. It inherits only
 - what a shell, git, `gh`, the CLI and its HTTP client need: `PATH`, `HOME`,
   `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`,
   `TMPDIR`/`TMP`/`TEMP`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, the proxy
-  variables, certificate trust (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
-  `NODE_USE_SYSTEM_CA`, `GIT_SSL_CAINFO`, …), and git and `gh` identity and
-  configuration (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`,
-  `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`, `GH_CONFIG_DIR`);
+  variables, certificate trust and Node's options (`SSL_CERT_FILE`,
+  `NODE_EXTRA_CA_CERTS`, `NODE_USE_SYSTEM_CA`, `NODE_OPTIONS`, `GIT_SSL_CAINFO`,
+  …), and git and `gh` identity and configuration (`GIT_AUTHOR_*`,
+  `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`,
+  `GH_CONFIG_DIR`, `GH_REPO`, `GH_HOST`);
 - the child's own Anthropic credential, endpoint and models (`ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and the other
-  model and cloud-endpoint names), but not an admin key;
+  model and cloud-endpoint names, Bedrock, Vertex and Foundry included), but not
+  an admin key;
 - the names, not the secrets, of a cloud provider's profile, region and files
   (`AWS_PROFILE`, `AWS_REGION`, `AWS_CONFIG_FILE`, `CLOUD_ML_REGION`,
   `GOOGLE_APPLICATION_CREDENTIALS`, …);
@@ -165,15 +167,18 @@ and the run follows prompts any channel member can write. It inherits only
   the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`, except
   `CLAUDE_CODE_OAUTH_TOKEN`);
 - whatever the channel's `child_env_passthrough` lists: a name, or a prefix
-  ending in `*` (for example `["ZOTERO_*", "GH_TOKEN"]`).
+  ending in `*` (for example `["MYTOOL_*", "ZOTERO_API_KEY", "GH_TOKEN"]`). A
+  prefix never passes a name that looks like a secret (one containing `TOKEN`,
+  `SECRET`, `PASSW`, `KEY`, `CREDENTIAL` or `WEBHOOK`): a channel names such a
+  variable exactly.
 
-Three rules hold over all of it. A variable whose value holds a Slack credential
-anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other `xox` token, alone or in
-a header, or an incoming-webhook URL) never passes, even when
-`child_env_passthrough` names it. A URL with a user name or password, such as a
-proxy with its password, passes only when `child_env_passthrough` names the
-variable exactly. And the variables SlackClaw sets for each run are never
-inherited: `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN`
+Three more rules hold over all of it. A variable whose value holds a Slack
+credential anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other `xox` token,
+alone or in a header, or an incoming-webhook URL on `hooks.slack.com` or
+`hooks.slack-gov.com`) never passes, even when `child_env_passthrough` names it.
+A URL with a user name or password, such as a proxy with its password (with or
+without `http://`), passes only when `child_env_passthrough` names the variable
+exactly. And the variables SlackClaw sets for each run are never inherited: `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN`
 (the channel's bot token, for the upload helper), `SLACKCLAW_UPLOAD`, and
 `SLACKCLAW_STATUS` for a run in a thread. Other `SLACKCLAW_*` names, such as the
 upload helper's `SLACKCLAW_UPLOAD_COMMENT`, pass when the channel names them.

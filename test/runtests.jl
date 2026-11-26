@@ -323,13 +323,13 @@ end
             echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-env","num_turns":1}'
             """)
         chmod(joinpath(dir, "claude"), 0o755)
-        cfg = SlackClawConfig(slack_bot_token="xoxb-test-workspace-bot", slack_channel_id="C0ENV",
-                              app_token="xapp-test-workspace-app", repo_dir=dir, claude_max_retries=0)
+        cfg = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                              app_token="xapp-1-A111-2222-testworkspaceapp", repo_dir=dir, claude_max_retries=0)
         parent = ("PATH" => dir * ":" * ENV["PATH"],
-                  "SLACK_BOT_TOKEN" => "xoxb-test-workspace-bot",
-                  "SLACK_APP_TOKEN" => "xapp-test-workspace-app",
-                  "SLACK_BOT_TOKEN_OTHER" => "xoxb-test-other-workspace",
-                  "SLACKCLAW_BOT_TOKEN" => "xoxb-test-inherited",
+                  "SLACK_BOT_TOKEN" => "xoxb-1111-2222-testworkspacebot",
+                  "SLACK_APP_TOKEN" => "xapp-1-A111-2222-testworkspaceapp",
+                  "SLACK_BOT_TOKEN_OTHER" => "xoxb-3333-4444-testotherworkspace",
+                  "SLACKCLAW_BOT_TOKEN" => "xoxb-5555-6666-testinherited",
                   "ZOTERO_API_KEY" => "test-unrelated-key",
                   "ANTHROPIC_ADMIN_API_KEY" => "test-admin-key",
                   "JULIA_DEPOT_PATH" => "/test/depot")
@@ -345,7 +345,7 @@ end
         for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN_OTHER")
             @test !haskey(env, k)
         end
-        @test !any(v -> v in ("xapp-test-workspace-app", "xoxb-test-other-workspace", "xoxb-test-inherited"),
+        @test !any(v -> v in ("xapp-1-A111-2222-testworkspaceapp", "xoxb-3333-4444-testotherworkspace", "xoxb-5555-6666-testinherited"),
                    values(env))
         # nor anything else outside the allow list, an Anthropic admin key included
         @test !haskey(env, "ZOTERO_API_KEY")
@@ -354,7 +354,7 @@ end
         @test env["JULIA_DEPOT_PATH"] == "/test/depot"
         @test startswith(env["PATH"], dir)
         # the workspace bot token reaches it only as the upload helper's own variable
-        @test [k for (k, v) in env if v == "xoxb-test-workspace-bot"] == ["SLACKCLAW_BOT_TOKEN"]
+        @test [k for (k, v) in env if v == "xoxb-1111-2222-testworkspacebot"] == ["SLACKCLAW_BOT_TOKEN"]
         @test env["SLACKCLAW_THREAD_TS"] == "1700000001.000100"
         @test env["SLACKCLAW_CHANNEL_ID"] == "C0ENV"
         @test !haskey(env, "SLACKCLAW_STATUS")
@@ -364,7 +364,7 @@ end
         @test child_env(thread_ts="1700000001.000100", channel_id="C0ENV", status_path=st)["SLACKCLAW_STATUS"] == st
 
         # a channel can add a variable it needs, but never a Slack token
-        cfg.child_env_passthrough = ["ZOTERO_*", "SLACK_BOT_TOKEN"]
+        cfg.child_env_passthrough = ["ZOTERO_API_KEY", "SLACK_BOT_TOKEN"]
         env = child_env()
         @test env["ZOTERO_API_KEY"] == "test-unrelated-key"
         @test !haskey(env, "SLACK_BOT_TOKEN")
@@ -929,48 +929,66 @@ end
 
     # An allow list, not the monitor's whole environment
     monitor = Dict(
-        "PATH" => "/usr/bin:/opt/myxapp-1/bin", "HOME" => "/home/u", "LC_ALL" => "C.UTF-8",
-        "XDG_CACHE_HOME" => "/c", "JULIA_DEPOT_PATH" => "/d", "JULIAUP_DEPOT_PATH" => "/j",
+        "PATH" => "/usr/bin:/opt/myxapp-1/bin:/opt/xapp-tools/bin", "HOME" => "/home/xapp-build",
+        "LC_ALL" => "C.UTF-8", "XDG_CACHE_HOME" => "/c", "JULIA_DEPOT_PATH" => "/d", "JULIAUP_DEPOT_PATH" => "/j",
         "ANTHROPIC_API_KEY" => "dummy-anthropic-key", "TMPDIR" => "/t",
-        "ANTHROPIC_ADMIN_API_KEY" => "dummy-admin-key",
+        "ANTHROPIC_ADMIN_API_KEY" => "dummy-admin-key", "ANTHROPIC_FOUNDRY_RESOURCE" => "lab-res",
         "AWS_PROFILE" => "lab-bedrock", "AWS_REGION" => "us-west-2", "AWS_SECRET_ACCESS_KEY" => "s",
-        "NODE_USE_SYSTEM_CA" => "1", "GIT_AUTHOR_NAME" => "Lab Bot", "GH_CONFIG_DIR" => "/g",
+        "NODE_USE_SYSTEM_CA" => "1", "NODE_OPTIONS" => "--use-openssl-ca", "npm_config_cache" => "/n",
+        "GIT_AUTHOR_NAME" => "Lab Bot", "GIT_AUTHOR_EMAIL" => "bot@lab.example",
+        "GH_CONFIG_DIR" => "/g", "GH_REPO" => "lab/project",
         "HTTP_PROXY" => "http://proxy.lab:3128", "HTTPS_PROXY" => "http://svc:dummy-pass@proxy.lab:3128",
-        "SLACK_BOT_TOKEN_KAL" => "xoxb-1-2-abc", "SLACK_APP_TOKEN_KAL" => "xapp-1-A-2-abc",
+        "https_proxy" => "svc:dummy-pass@proxy.lab:3128",
+        "SLACK_BOT_TOKEN_KAL" => "xoxb-1111-2222-abc", "SLACK_APP_TOKEN_KAL" => "xapp-1-A111-2222-abc",
         "SLACK_CHANNEL_ID_X" => "C123", "SLACKCLAW_CH_GENERAL" => "C456",
+        "SLACK_SIGNING_SECRET" => "dummysigningsecret", "SLACK_CLIENT_SECRET" => "dummyclientsecret",
         "SLACKCLAW_UPLOAD_COMMENT" => "from the lab bot", "SLACKCLAW_STATUS" => "/inherited/status",
-        "SLACKCLAW_BOT_TOKEN" => "xoxb-inherited", "ZOTERO_API_KEY" => "z",
+        "SLACKCLAW_THREAD_TS" => "1700000000.000001",
+        "SLACKCLAW_BOT_TOKEN" => "xoxb-5555-6666-inherited", "ZOTERO_API_KEY" => "z",
         "GH_TOKEN" => "g", "MY_TOOL_HOME" => "/m", "MY_TOOL_MODE" => "x",
-        "OTHER_SLACK_TOKEN" => "xoxp-user-token",
+        "OTHER_SLACK_TOKEN" => "xoxp-1-2-3-usertoken",
         "SLACK_WEBHOOK_URL" => "https://hooks.slack.com/services/T0/B0/dummy",
+        "SLACK_GOV_HOOK" => "https://HOOKS.slack-gov.com:443/services/T0/B0/dummy",
         "SLACK_HELPER_AUTH" => "Authorization: Bearer xoxb-9-9-abc",
-        "SLACK_WORKFLOW_TOKEN" => "xwfp-1-abc",
+        "SLACK_WORKFLOW" => "xwfp-1-abc",
     )
     envnames(env) = Set(first(split(e, '='; limit=2)) for e in env)
     @test envnames(fce(monitor)) == Set(["PATH", "HOME", "LC_ALL", "XDG_CACHE_HOME", "JULIA_DEPOT_PATH",
                                       "JULIAUP_DEPOT_PATH", "ANTHROPIC_API_KEY", "TMPDIR",
-                                      "AWS_PROFILE", "AWS_REGION", "NODE_USE_SYSTEM_CA",
-                                      "GIT_AUTHOR_NAME", "GH_CONFIG_DIR", "HTTP_PROXY"])
-    # extras by name or by prefix
-    @test envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*"])) ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
-    # a proxy URL carrying a password passes only when the channel names it exactly
+                                      "ANTHROPIC_FOUNDRY_RESOURCE", "AWS_PROFILE", "AWS_REGION",
+                                      "NODE_USE_SYSTEM_CA", "NODE_OPTIONS", "npm_config_cache",
+                                      "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GH_CONFIG_DIR", "GH_REPO",
+                                      "HTTP_PROXY"])
+    # extras by name or by prefix; a prefix never passes a secret-looking name, a channel names it
+    extra = envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_*"]))
+    @test extra ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
+    @test !("ZOTERO_API_KEY" in extra)
+    @test "ZOTERO_API_KEY" in envnames(fce(monitor, ["ZOTERO_API_KEY"]))
+    # a proxy carrying a password, with or without a URL scheme, passes only when the
+    # channel names it exactly
     @test "HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_PROXY"]))
+    @test "https_proxy" in envnames(fce(monitor, ["https_proxy"]))
     @test !("HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_*"])))
     # a Slack credential never passes, whatever names it (a token alone, in a header, a
-    # workflow token, a webhook URL); the variables SlackClaw sets per run are never inherited
-    leaky = envnames(fce(monitor, ["SLACK_*", "OTHER_SLACK_TOKEN", "SLACK_HELPER_AUTH", "SLACKCLAW_*",
-                                   "SLACKCLAW_STATUS"]))
+    # workflow token, a webhook URL on either Slack domain); Slack's app secrets never
+    # pass through a prefix; the variables SlackClaw sets per run are never inherited
+    leaky = envnames(fce(monitor, ["SLACK_*", "OTHER_SLACK_TOKEN", "SLACK_HELPER_AUTH", "SLACK_GOV_HOOK",
+                                   "SLACK_WORKFLOW", "SLACKCLAW_*", "SLACKCLAW_STATUS"]))
     @test "SLACK_CHANNEL_ID_X" in leaky
     @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_KAL", "SLACK_APP_TOKEN_KAL", "OTHER_SLACK_TOKEN",
-                                        "SLACK_WEBHOOK_URL", "SLACK_HELPER_AUTH", "SLACK_WORKFLOW_TOKEN",
-                                        "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS"])))
+                                        "SLACK_WEBHOOK_URL", "SLACK_GOV_HOOK", "SLACK_HELPER_AUTH",
+                                        "SLACK_WORKFLOW", "SLACK_SIGNING_SECRET", "SLACK_CLIENT_SECRET",
+                                        "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS", "SLACKCLAW_THREAD_TS"])))
     # SlackClaw's other variables pass when the channel names them
     @test Set(["SLACKCLAW_CH_GENERAL", "SLACKCLAW_UPLOAD_COMMENT"]) ⊆ leaky
     hsc = SlackClaw.has_slack_credential
-    @test hsc("xoxe.xoxp-1-abc") && hsc("xoxr-abc") && hsc("Bearer xoxb-1-2") && hsc("xwfp-1")
-    @test hsc("https://hooks.slack.com/services/T0/B0/x")
-    @test !hsc("C0123") && !hsc("/usr/bin") && !hsc("/opt/myxapp-1/bin")
-    @test SlackClaw.has_url_credential("http://u:p@proxy:3128") && !SlackClaw.has_url_credential("http://proxy:3128")
+    @test hsc("xoxe.xoxp-1-abc") && hsc("xoxr-1-abc") && hsc("Bearer xoxb-1-2") && hsc("xwfp-1")
+    @test hsc("https://hooks.slack.com/services/T0/B0/x") && hsc("hooks.Slack-Gov.com:443/x")
+    @test !hsc("C0123") && !hsc("/usr/bin") && !hsc("/opt/myxapp-1/bin") && !hsc("/opt/xapp-tools/bin")
+    huc = SlackClaw.has_url_credential
+    @test huc("X", "http://u:p@proxy:3128") && !huc("X", "http://proxy:3128")
+    @test huc("https_proxy", "u:p@proxy:3128") && !huc("https_proxy", "proxy:3128")
+    @test !huc("GIT_AUTHOR_EMAIL", "bot@lab.example")
 end
 
 @testset "generate_manifest" begin
@@ -1915,19 +1933,25 @@ end
     @test isabspath(SlackClaw.run_status_path(cfg2, "C1", T))
     @test SlackClaw.run_status_path(cfg2, "C1", T) == joinpath(abspath("examples"), ".slackclaw_status.C1.$T")
 
-    # At start the monitor removes its channels' leftover status files (a run the
-    # monitor stopped mid-way), and only those: another channel's sharing the
-    # repo_dir and unrelated files stay
+    # When the monitor starts it removes its primary channel's leftover status files
+    # (a run the monitor stopped mid-way), and only those: another channel's sharing
+    # the repo_dir, a backup beside a leftover, and unrelated files stay. Checked
+    # through start_monitor (Slack's auth call stubbed), so the sweep's call is too.
     d = mktempdir()
     cfg3 = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=d)
     for (ch, ts) in (("C0", "1.000000"), ("C0", "2.000000"), ("C9", "3.000000"), ("C1", "4.000000"))
         write(SlackClaw.run_status_path(cfg3, ch, ts), "left")
     end
+    backup = SlackClaw.run_status_path(cfg3, "C0", "1.000000") * ".bak"
+    write(backup, "kept by hand")
     write(joinpath(d, ".slackclaw_status"), "old shared file")
     write(joinpath(d, "notes.txt"), "keep")
-    @test SlackClaw.sweep_status_files(cfg3, ["C0", "C9"]) == 3
-    @test sort(readdir(d)) == sort([".slackclaw_status", "notes.txt", basename(SlackClaw.run_status_path(cfg3, "C1", "4.000000"))])
-    @test SlackClaw.sweep_status_files(cfg3, ["C0"]) == 0
+    Core.eval(SlackClaw, :(slack_auth_test(config::SlackClawConfig) = "UBOT"))
+    SlackClaw.start_monitor(cfg3)
+    @test sort(readdir(d)) == sort([".slackclaw_status", "notes.txt", basename(backup),
+                                    basename(SlackClaw.run_status_path(cfg3, "C9", "3.000000")),
+                                    basename(SlackClaw.run_status_path(cfg3, "C1", "4.000000"))])
+    @test SlackClaw.sweep_status_files(cfg3) == 0
 end
 
 # From here on run_claude is a stub too.

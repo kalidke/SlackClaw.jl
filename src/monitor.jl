@@ -296,31 +296,31 @@ status_prefix(config::SlackClawConfig, channel_id::AbstractString) =
              string(config.status_file, ".", replace(channel_id, r"[^A-Za-z0-9]" => "_"), "."))
 
 """
-    sweep_status_files(config, channel_ids) -> Int
+    sweep_status_files(config) -> Int
 
-Remove the status files that runs in `channel_ids` left in `repo_dir` when the
-monitor stopped mid-run, so none lingers in a channel's repository (where a
-run's `git add -A` would commit it). Called at start, before any run; only
-these channels' files go, so fleet channels sharing a `repo_dir` keep theirs.
+Remove the status files that runs in the monitor's primary channel left in
+`repo_dir` when the monitor stopped mid-run, so none lingers in a channel's
+repository (where a run's `git add -A` would commit it). Called at start, before
+any run. Only names SlackClaw makes go: `<status_file>.<channel>.<thread ts>`
+for this channel, nothing else (a backup beside one stays), so fleet channels
+sharing a `repo_dir`, and a channel moved to another monitor, keep theirs.
 Returns how many were removed; an error is logged.
 """
-function sweep_status_files(config::SlackClawConfig, channel_ids)
+function sweep_status_files(config::SlackClawConfig)
+    prefix = status_prefix(config, config.slack_channel_id)
+    dir, base = dirname(prefix), basename(prefix)
     n = 0
-    for ch in channel_ids
-        prefix = status_prefix(config, ch)
-        dir, base = dirname(prefix), basename(prefix)
-        try
-            isdir(dir) || continue
-            for f in readdir(dir)
-                p = joinpath(dir, f)
-                if startswith(f, base) && isfile(p)
-                    rm(p; force=true)
-                    n += 1
-                end
+    try
+        isdir(dir) || return 0
+        for f in readdir(dir)
+            p = joinpath(dir, f)
+            if startswith(f, base) && occursin(r"^[0-9]+\.[0-9]+$", f[ncodeunits(base)+1:end]) && isfile(p)
+                rm(p; force=true)
+                n += 1
             end
-        catch e
-            @error "SlackClaw: status file sweep failed" channel=ch exception=(e, catch_backtrace())
         end
+    catch e
+        @error "SlackClaw: status file sweep failed" exception=(e, catch_backtrace())
     end
     n > 0 && @info "SlackClaw: removed $n status file(s) left by earlier runs"
     return n
@@ -368,8 +368,7 @@ function start_monitor(config::SlackClawConfig)
     last_ts = isempty(persisted_ts) ? slack_ts_now() : persisted_ts
 
     # No run is going yet: any status file of this channel's threads is left over
-    sweep_status_files(config, unique(vcat(config.slack_channel_id,
-        String[s.channel_id for s in values(threads) if !isempty(s.channel_id)])))
+    sweep_status_files(config)
 
     # Resolve channel names for listen channels
     channel_names = Dict{String,String}()

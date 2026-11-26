@@ -19,7 +19,8 @@ Notable changes to SlackClaw.jl. Format follows
   starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (the
   nested-session variables still dropped), and what the new
   `child_env_passthrough` config field lists (a name, or a prefix ending in
-  `*`). A value holding a Slack credential anywhere (a token alone or in a
+  `*`; a prefix never passes a secret-looking name, which a channel names
+  exactly). A value holding a Slack credential anywhere (a token alone or in a
   header, a webhook URL) never passes, under any name; a URL carrying a user
   name or password, such as a proxy's, passes only when the channel names the
   variable. The variables SlackClaw sets per run are never inherited. The
@@ -42,7 +43,8 @@ Notable changes to SlackClaw.jl. Format follows
   everything outside the allow list (see the Features page), for example a
   tool's API key (`ZOTERO_API_KEY`), `GH_TOKEN`/`GITHUB_TOKEN`, cloud secret
   keys, `npm_config_*` other than the cache location, and `SLACKCLAW_*` names
-  other than those SlackClaw sets per run. A launcher that builds
+  other than those SlackClaw sets per run. A secret-looking name must be
+  listed exactly (`"ZOTERO_API_KEY"`, not `"ZOTERO_*"`). A launcher that builds
   `SlackClawConfig` for a fleet needs a way to set `child_env_passthrough` per
   channel.
 
@@ -53,8 +55,9 @@ Notable changes to SlackClaw.jl. Format follows
   in the other's thread, and the first to finish deleted the other's file. A
   run's status file is now `<status_file>.<channel>.<thread ts>` in
   `repo_dir` (as an absolute path), given to the child as `SLACKCLAW_STATUS`;
-  it is removed when the run ends and when the next run in the thread starts.
-  A prompt that tells Claude to write `.slackclaw_status` must name
+  it is removed when the run ends and when the next run in the thread starts,
+  and the monitor removes its channel's leftovers when it starts (a run it
+  stopped mid-way). A prompt that tells Claude to write `.slackclaw_status` must name
   `$SLACKCLAW_STATUS` instead, when that variable is set (listen and proactive
   runs have none). `validate_fleet` no longer warns about a shared
   `status_file`.

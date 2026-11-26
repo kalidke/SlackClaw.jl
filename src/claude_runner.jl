@@ -57,20 +57,20 @@ const CHILD_ENV_NAMES = (
     # proxies (one whose URL carries a user name or password: see filtered_child_env)
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "no_proxy", "all_proxy",
-    # certificate trust
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA",
+    # certificate trust, and Node's runtime options (e.g. --use-openssl-ca)
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_OPTIONS",
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
     # the Anthropic client: the child's own credential, endpoint and models
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
     # cloud provider selectors (profile, region, file locations; not secret keys)
     "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
     "CLOUD_ML_REGION", "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS",
     # git and gh identity and configuration
     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
-    "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GH_CONFIG_DIR",
+    "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GH_CONFIG_DIR", "GH_REPO", "GH_HOST",
     # Claude Code settings it reads from the environment
     "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "BASH_DEFAULT_TIMEOUT_MS",
     "BASH_MAX_TIMEOUT_MS", "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT", "MAX_THINKING_TOKENS",
@@ -95,17 +95,34 @@ from the monitor, even when `child_env_passthrough` names them.
 const SLACKCLAW_RUN_VARS = ("SLACKCLAW_THREAD_TS", "SLACKCLAW_CHANNEL_ID", "SLACKCLAW_BOT_TOKEN",
                             "SLACKCLAW_UPLOAD", "SLACKCLAW_STATUS")
 
+"""The proxy variables: a user name or password in one counts with or without a URL scheme (`user:pass@host:port`)."""
+const PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
 """
 True when `v` holds a Slack credential anywhere in it (alone, in an
 `Authorization` header, in a URL): a token (`xoxb-` bot, `xoxp-` user, the other
-`xox?-` kinds, a rotating `xoxe`, an app-level `xapp-`, a workflow `xwfp-`) or an
-incoming-webhook URL (`hooks.slack.com/`).
+`xox?-` kinds, a rotating `xoxe.`, an app-level `xapp-`, a workflow `xwfp-`, each
+followed by the digit Slack's tokens carry there, so a path such as
+`/opt/xapp-tools` is not one) or an incoming-webhook URL (`hooks.slack.com` or
+GovSlack's `hooks.slack-gov.com`, any letter case, any port).
 """
 has_slack_credential(v::AbstractString) =
-    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-|xoxe[.-]|xapp-|xwfp-)|hooks\.slack\.com/", v)
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]|xoxe\.xox|xapp-[0-9]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
 
-"""True when `v` holds a URL with a user name or password (`scheme://user:pass@host`)."""
-has_url_credential(v::AbstractString) = occursin(r"://[^/\s@]+@", v)
+"""
+True when `v`, the value of variable `k`, holds a URL with a user name or
+password (`scheme://user:pass@host`; for a proxy variable also `user:pass@host`
+with no scheme).
+"""
+has_url_credential(k::AbstractString, v::AbstractString) =
+    occursin(r"://[^/\s@]+@", v) || (k in PROXY_NAMES && occursin(r"^\s*[^/\s@]+@", v))
+
+"""
+True for a name that looks like it holds a secret (`TOKEN`, `SECRET`, `PASSW`,
+`KEY`, `CREDENTIAL`, `WEBHOOK`, any case). A channel's prefix entry in
+`child_env_passthrough` never passes such a name; the channel names it exactly.
+"""
+secret_name(k::AbstractString) = occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK"i, k)
 
 """
     filtered_child_env(env, passthrough=()) -> Vector{String}
@@ -130,6 +147,8 @@ Exceptions:
 - **A URL with a user name or password** ([`has_url_credential`](@ref)), such
   as a proxy with its password, passes only when `passthrough` names the
   variable exactly, not through the allow list or a prefix.
+- **A secret-looking name** ([`secret_name`](@ref)) never passes through a
+  prefix entry of `passthrough`; a channel names it exactly.
 - **[`SLACKCLAW_RUN_VARS`](@ref)** are never inherited: [`run_claude`](@ref) sets
   them for each run. Other `SLACKCLAW_*` names pass only through `passthrough`.
 """
@@ -137,10 +156,10 @@ function filtered_child_env(env, passthrough=())
     names = String[p for p in passthrough if !endswith(p, "*")]
     prefixes = String[chop(p) for p in passthrough if endswith(p, "*")]
     listed(k) = k in CHILD_ENV_NAMES || any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
-                any(p -> startswith(k, p), prefixes)
+                (any(p -> startswith(k, p), prefixes) && !secret_name(k))
     nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
     keep(k, v) = !(k in SLACKCLAW_RUN_VARS) && !nested(k) && !has_slack_credential(v) &&
-                 (k in names || (listed(k) && !has_url_credential(v)))
+                 (k in names || (listed(k) && !has_url_credential(k, v)))
     return String["$(k)=$(v)" for (k, v) in env if keep(k, v)]
 end
 
