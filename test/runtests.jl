@@ -406,6 +406,47 @@ end
     end
 end
 
+# A run keeps Claude Code's own system prompt: SlackClaw's instructions go in
+# --append-system-prompt, never --system-prompt, which would replace it. The
+# stand-in `claude` records its arguments exactly (NUL-separated: the prompt
+# text holds newlines).
+@testset "run_claude keeps Claude Code's system prompt" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        argf = joinpath(dir, "args")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            printf '%s\\0' "\$@" > '$argf'
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-args","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        function argv(cfg; kw...)
+            withenv("PATH" => dir * ":" * ENV["PATH"]) do
+                @test SlackClaw.run_claude("hi", cfg; kw...).success
+            end
+            return split(read(argf, String), '\0'; keepempty=false)
+        end
+        # default settings: the channel text and the directive instructions
+        cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir, claude_max_retries=0)
+        args = argv(cfg)
+        @test "--append-system-prompt" in args
+        @test !("--system-prompt" in args)
+        text = args[findfirst(==("--append-system-prompt"), args) + 1]
+        @test text == cfg.system_prompt * "\n\n" * SlackClaw.DIRECTIVE_INSTRUCTIONS
+        # with the upload helper's thread, its instructions are added to the same text
+        if isfile(normpath(joinpath(pkgdir(SlackClaw), "bin", "slack-upload")))
+            args = argv(cfg; thread_ts="1700000001.000100", channel_id="C0")
+            @test count(==("--append-system-prompt"), args) == 1 && !("--system-prompt" in args)
+            @test endswith(args[findfirst(==("--append-system-prompt"), args) + 1], SlackClaw.UPLOAD_INSTRUCTIONS)
+        end
+        # nothing to add: neither flag
+        bare = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir, claude_max_retries=0,
+                               system_prompt="", agent_directives=false)
+        args = argv(bare)
+        @test !("--append-system-prompt" in args) && !("--system-prompt" in args)
+    end
+end
+
 @testset "chunk_text" begin
     ct = SlackClaw.chunk_text
 

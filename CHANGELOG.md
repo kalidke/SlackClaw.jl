@@ -43,6 +43,17 @@ Notable changes to SlackClaw.jl. Format follows
   token and the Anthropic key into Slack and the log carried all of it. The
   reason is now the error and the folder only.
 
+### Changed
+
+- **Runs keep Claude Code's own system prompt.** SlackClaw's instructions (the
+  channel's `system_prompt`, the directive instructions and the upload
+  instructions) were passed with `--system-prompt`, which replaces Claude
+  Code's built-in system prompt, so runs started from Slack lacked its
+  instructions on using its tools, on confirming before hard-to-reverse or
+  outward-facing actions, and on citing code. They are now passed with
+  `--append-system-prompt` and follow the built-in prompt. The text SlackClaw
+  sends is unchanged; each run reads a few thousand more input tokens.
+
 ### Upgrading
 
 - Variables runs no longer inherit unless listed in `child_env_passthrough`:

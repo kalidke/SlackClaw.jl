@@ -245,13 +245,15 @@ function run_claude(prompt::String, config::SlackClawConfig;
     can_upload = isfile(upload_bin) && !isempty(thread_ts) &&
                  !isempty(channel_id) && !isempty(config.slack_bot_token)
 
-    # Build system prompt: user config + directives + upload helper
+    # SlackClaw's instructions (user config + directives + upload helper), added
+    # after Claude Code's own system prompt: --system-prompt would replace it, and
+    # runs would lose its instructions (confirm before outward-facing actions, ...)
     sys_parts = String[]
     !isempty(config.system_prompt) && push!(sys_parts, config.system_prompt)
     config.agent_directives && push!(sys_parts, DIRECTIVE_INSTRUCTIONS)
     can_upload && push!(sys_parts, UPLOAD_INSTRUCTIONS)
     if !isempty(sys_parts)
-        push!(args, "--system-prompt", join(sys_parts, "\n\n"))
+        push!(args, "--append-system-prompt", join(sys_parts, "\n\n"))
     end
 
     if config.max_budget_usd > 0
