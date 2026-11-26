@@ -44,23 +44,63 @@ resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
 const CHILD_ENV_PASSTHROUGH = ("CLAUDE_CODE_OAUTH_TOKEN",)
 
 """
-    filtered_child_env(env) -> Vector{String}
-
-Build the child environment for the `claude` subprocess, dropping only the
-nested-session detection vars (`CLAUDECODE`, `CLAUDE_CODE_*`). Other `CLAUDE_*`
-vars are user configuration and must pass through — in particular
-`CLAUDE_CONFIG_DIR`, which redirects child transcripts off the default
-`~/.claude`; stripping it silently reverts every child to the default path.
-Credentials under the `CLAUDE_CODE_` prefix are exempted via
-[`CHILD_ENV_PASSTHROUGH`](@ref): `CLAUDE_CODE_OAUTH_TOKEN` is the child's only
-auth path when authenticated via `claude setup-token` (which prints the token
-without storing it), so stripping it leaves every child unauthenticated.
-(Issue #11: when the env allowlist lands, it must include both
-`CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`.)
+Variables the `claude` child inherits by exact name (see [`filtered_child_env`](@ref)):
+what a shell, git, the CLI and its HTTP client need, and nothing that carries a
+credential of the monitor's.
 """
-filtered_child_env(env) =
-    String["$(k)=$(v)" for (k, v) in env if
-           !(k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH)))]
+const CHILD_ENV_NAMES = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ",
+    "TMPDIR", "TMP", "TEMP", "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+)
+
+"""
+Variables the `claude` child inherits by prefix (see [`filtered_child_env`](@ref)):
+locale, XDG base directories, Julia and juliaup (the depot), the Anthropic
+client's own settings and credential, and Claude Code configuration such as
+`CLAUDE_CONFIG_DIR` (less the nested-session vars).
+"""
+const CHILD_ENV_PREFIXES = ("LC_", "XDG_", "JULIA_", "JULIAUP_", "ANTHROPIC_", "CLAUDE_")
+
+"""True for a Slack token: bot `xoxb-`, user `xoxp-`, the other `xox?-` kinds, a rotating `xoxe`, an app-level `xapp-`."""
+is_slack_token(v::AbstractString) = occursin(r"^\s*(xox[a-z]-|xoxe[.-]|xapp-)", v)
+
+"""
+    filtered_child_env(env, passthrough=()) -> Vector{String}
+
+Build the environment the `claude` subprocess inherits from the monitor: an
+allow list, not the monitor's whole environment, since the child runs prompts
+any channel member can write and a fleet's environment holds every workspace's
+Slack tokens and other credentials (issue #11). A variable passes when its name
+is in [`CHILD_ENV_NAMES`](@ref), starts with one of
+[`CHILD_ENV_PREFIXES`](@ref), or matches an entry of `passthrough`
+(`config.child_env_passthrough`: a name, or a prefix ending in `*`).
+
+Two exceptions:
+- **Nested-session detection vars.** `CLAUDECODE` and `CLAUDE_CODE_*` are
+  dropped, except the credentials in [`CHILD_ENV_PASSTHROUGH`](@ref):
+  `CLAUDE_CODE_OAUTH_TOKEN` is the child's only auth path after
+  `claude setup-token`, which prints the token without storing it. Other
+  `CLAUDE_*` vars are user configuration and pass: stripping
+  `CLAUDE_CONFIG_DIR` sends every child's transcripts back to `~/.claude`.
+- **Slack tokens.** A variable whose value is a Slack token
+  ([`is_slack_token`](@ref)) never passes, even when `passthrough` names it.
+
+SlackClaw's own `SLACKCLAW_*` variables are not inherited: [`run_claude`](@ref)
+sets them for each run.
+"""
+function filtered_child_env(env, passthrough=())
+    names = String[p for p in passthrough if !endswith(p, "*")]
+    prefixes = String[chop(p) for p in passthrough if endswith(p, "*")]
+    allowed(k) = k in CHILD_ENV_NAMES || k in names ||
+                 any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
+                 any(p -> startswith(k, p), prefixes)
+    nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
+    return String["$(k)=$(v)" for (k, v) in env
+                  if allowed(k) && !nested(k) && !startswith(k, "SLACKCLAW_") && !is_slack_token(v)]
+end
 
 """
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
@@ -70,11 +110,17 @@ Permissions are governed by `--permission-mode \$(config.permission_mode)` (defa
 `"auto"`, the classifier mode); a denial returns promptly as an `is_error` result
 rather than hanging the dispatch. Mentions of the bot itself in the prompt are
 rewritten to `@you` ([`resolve_self_mentions`](@ref)).
+
+The child inherits only the allow-listed environment ([`filtered_child_env`](@ref)),
+plus `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN` and
+`SLACKCLAW_UPLOAD` for the upload helper, and `SLACKCLAW_STATUS` when
+`status_path` is given: the run's own status file ([`run_status_path`](@ref)).
 """
 function run_claude(prompt::String, config::SlackClawConfig;
                     session_id::String="",
                     thread_ts::String="",
-                    channel_id::String="")
+                    channel_id::String="",
+                    status_path::String="")
     prompt = resolve_self_mentions(prompt, config.bot_user_id)
     args = String[
         "claude", "-p", prompt,
@@ -114,14 +160,17 @@ function run_claude(prompt::String, config::SlackClawConfig;
         push!(args, "--allowedTools", tool)
     end
 
-    # Build clean environment without Claude session vars
-    filtered_env = filtered_child_env(ENV)
+    # The allow-listed environment: no Slack token or other credential of the
+    # monitor's reaches the child (filtered_child_env)
+    filtered_env = filtered_child_env(ENV, config.child_env_passthrough)
 
-    # Inject SlackClaw context so the upload helper can post into this thread.
+    # Inject SlackClaw context so the upload helper can post into this thread,
+    # and this run's own status file
     !isempty(thread_ts) && push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")
     !isempty(channel_id) && push!(filtered_env, "SLACKCLAW_CHANNEL_ID=$channel_id")
     !isempty(config.slack_bot_token) && push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
     isfile(upload_bin) && push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
+    !isempty(status_path) && push!(filtered_env, "SLACKCLAW_STATUS=$status_path")
 
     cmd = setenv(`$args`, filtered_env; dir=config.repo_dir)
 

@@ -124,8 +124,8 @@ channels it doesn't serve. Startup validation requires: identical bot and app
 tokens across the fleet (one fleet = one workspace), unique primary channels,
 and unique state-file paths — fleet startup **errors** if two channels resolve
 to the same `state_file`, so channels sharing a `repo_dir` must each set a
-distinct one (a shared `status_file` is allowed but warns, since status updates
-could cross-post). (`run_monitor` for a single channel is just a fleet of one.)
+distinct one (a shared `status_file` is fine: each run's status file names its
+channel and thread). (`run_monitor` for a single channel is just a fleet of one.)
 
 ## Configuration reference
 

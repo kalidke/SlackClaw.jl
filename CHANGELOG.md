@@ -4,6 +4,35 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [Unreleased] — 0.7.5-DEV
+
+### Security
+
+- **The Claude child gets an allow-listed environment** (issue #11). It
+  inherited the monitor's whole environment except the nested-session
+  variables, so every run, following prompts any channel member can write,
+  held the workspace's app-level token, every other workspace's bot token in
+  a fleet's environment, and any other credential the monitor had. It now
+  inherits only the variables a shell, git, the CLI and its HTTP client need,
+  those starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_`, `ANTHROPIC_` or
+  `CLAUDE_` (the nested-session variables still dropped), and what the new
+  `child_env_passthrough` config field lists (a name, or a prefix ending in
+  `*`). A variable whose value is a Slack token never passes, under any name.
+  `SLACKCLAW_*` variables are set per run, never inherited. The channel's own
+  bot token still reaches the run as `SLACKCLAW_BOT_TOKEN`, for the upload
+  helper.
+
+### Fixed
+
+- **Each run has its own status file.** All runs in a `repo_dir` watched one
+  `.slackclaw_status`, so with two runs at once one run's progress was posted
+  in the other's thread, and the first to finish deleted the other's file. A
+  run's status file is now `<status_file>.<channel>.<thread ts>` in
+  `repo_dir`, given to the child as `SLACKCLAW_STATUS`; it is removed when the
+  run ends and when the next run in the thread starts. A prompt that tells
+  Claude to write `.slackclaw_status` must name `$SLACKCLAW_STATUS` instead.
+  `validate_fleet` no longer warns about a shared `status_file`.
+
 ## [0.7.4] — 2026-11-25
 
 Patch: a failed Claude run no longer ends its Slack thread.

@@ -86,6 +86,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `claude_timeout_s::Int = 3600`
 - `max_turns::Int = 30`
 - `allowed_tools::Vector{String} = String[]`
+- `child_env_passthrough::Vector{String} = String[]` — environment variables the `claude` child gets beyond the allow list (`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`): a name, or a prefix ending in `*`. A Slack-token value never passes (`filtered_child_env`)
 - `max_concurrent_tasks::Int = 5`
 - `max_active_threads::Int = 3`
 - `max_thread_idle_s::Int = 604800` — 7 d; `0` = never
@@ -95,7 +96,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no checkmark; thread session still tracked). Eyes-as-intent: the dispatch-time `:eyes` ack is added on `allow_skip` channels too, then REMOVED when the reply is `[SKIP]` — lingering eyes mean a reply is coming, vanished eyes mean "seen, deliberately staying out". Mechanism only — tell Claude about the convention via `system_prompt`
 - `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
 - `state_file::String = ".slackclaw_state.json"`
-- `status_file::String = ".slackclaw_status"`
+- `status_file::String = ".slackclaw_status"` — each run's status file is `<status_file>.<channel>.<thread ts>` in `repo_dir` (`run_status_path`), named to the child as `SLACKCLAW_STATUS`
 - `status_poll_s::Int = 30`
 - `bot_user_id::String = ""` — auto-filled at startup
 - `listen_channel_ids::Vector{String} = String[]`

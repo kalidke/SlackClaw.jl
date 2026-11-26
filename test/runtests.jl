@@ -307,6 +307,69 @@ end
         "Claude stopped at the step limit before finishing."
 end
 
+# The child holds none of the monitor's Slack tokens or other credentials: a run
+# started by the real run_claude, with a stand-in `claude` on PATH that records
+# the environment it was given. The monitor's environment here holds the
+# workspace's bot and app tokens, another workspace's bot token and an unrelated
+# key, as a fleet's does.
+@testset "run_claude child environment" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        envf = joinpath(dir, "child-env")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            env > '$envf'
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-env","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        cfg = SlackClawConfig(slack_bot_token="xoxb-test-workspace-bot", slack_channel_id="C0ENV",
+                              app_token="xapp-test-workspace-app", repo_dir=dir, claude_max_retries=0)
+        parent = ("PATH" => dir * ":" * ENV["PATH"],
+                  "SLACK_BOT_TOKEN" => "xoxb-test-workspace-bot",
+                  "SLACK_APP_TOKEN" => "xapp-test-workspace-app",
+                  "SLACK_BOT_TOKEN_OTHER" => "xoxb-test-other-workspace",
+                  "SLACKCLAW_BOT_TOKEN" => "xoxb-test-inherited",
+                  "ZOTERO_API_KEY" => "test-unrelated-key",
+                  "JULIA_DEPOT_PATH" => "/test/depot")
+        child_env(; kw...) = withenv(parent...) do
+            r = SlackClaw.run_claude("hi", cfg; kw...)
+            @test r.success
+            Dict(String(first(split(l, '='; limit=2))) => String(last(split(l, '='; limit=2)))
+                 for l in eachline(envf) if occursin('=', l))
+        end
+
+        env = child_env(thread_ts="1700000001.000100", channel_id="C0ENV")
+        # no Slack token from the monitor's environment, under any name
+        for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN_OTHER")
+            @test !haskey(env, k)
+        end
+        @test !any(v -> v in ("xapp-test-workspace-app", "xoxb-test-other-workspace", "xoxb-test-inherited"),
+                   values(env))
+        # nor anything else outside the allow list
+        @test !haskey(env, "ZOTERO_API_KEY")
+        # the child keeps what it needs to run
+        @test env["JULIA_DEPOT_PATH"] == "/test/depot"
+        @test startswith(env["PATH"], dir)
+        # the workspace bot token reaches it only as the upload helper's own variable
+        @test [k for (k, v) in env if v == "xoxb-test-workspace-bot"] == ["SLACKCLAW_BOT_TOKEN"]
+        @test env["SLACKCLAW_THREAD_TS"] == "1700000001.000100"
+        @test env["SLACKCLAW_CHANNEL_ID"] == "C0ENV"
+        @test !haskey(env, "SLACKCLAW_STATUS")
+
+        # a run given a status file names it
+        st = SlackClaw.run_status_path(cfg, "C0ENV", "1700000001.000100")
+        @test child_env(thread_ts="1700000001.000100", channel_id="C0ENV", status_path=st)["SLACKCLAW_STATUS"] == st
+
+        # a channel can add a variable it needs, but never a Slack token
+        cfg.child_env_passthrough = ["ZOTERO_*", "SLACK_BOT_TOKEN"]
+        env = child_env()
+        @test env["ZOTERO_API_KEY"] == "test-unrelated-key"
+        @test !haskey(env, "SLACK_BOT_TOKEN")
+        # with no thread there is no upload context
+        @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
+    end
+end
+
 @testset "chunk_text" begin
     ct = SlackClaw.chunk_text
 
@@ -860,6 +923,30 @@ end
     # The setup-token credential survives the CLAUDE_CODE_ prefix strip —
     # it is the child's only auth path (stripping it broke every child's auth)
     @test "CLAUDE_CODE_OAUTH_TOKEN=dummy-token-for-test" in child
+
+    # An allow list, not the monitor's whole environment
+    monitor = Dict(
+        "PATH" => "/usr/bin", "HOME" => "/home/u", "LC_ALL" => "C.UTF-8",
+        "XDG_CACHE_HOME" => "/c", "JULIA_DEPOT_PATH" => "/d", "JULIAUP_DEPOT_PATH" => "/j",
+        "ANTHROPIC_API_KEY" => "dummy-anthropic-key", "TMPDIR" => "/t",
+        "SLACK_BOT_TOKEN_KAL" => "xoxb-1-2-abc", "SLACK_APP_TOKEN_KAL" => "xapp-1-A-2-abc",
+        "SLACK_CHANNEL_ID_X" => "C123", "SLACKCLAW_CH_GENERAL" => "C456",
+        "SLACKCLAW_BOT_TOKEN" => "xoxb-inherited", "ZOTERO_API_KEY" => "z",
+        "GH_TOKEN" => "g", "MY_TOOL_HOME" => "/m", "MY_TOOL_MODE" => "x",
+        "OTHER_SLACK_TOKEN" => "xoxp-user-token",
+    )
+    envnames(env) = Set(first(split(e, '='; limit=2)) for e in env)
+    @test envnames(fce(monitor)) == Set(["PATH", "HOME", "LC_ALL", "XDG_CACHE_HOME", "JULIA_DEPOT_PATH",
+                                      "JULIAUP_DEPOT_PATH", "ANTHROPIC_API_KEY", "TMPDIR"])
+    # extras by name or by prefix
+    @test envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*"])) ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
+    # a Slack token never passes, whatever names it; SlackClaw's own vars are set per run, never inherited
+    leaky = envnames(fce(monitor, ["SLACK_*", "OTHER_SLACK_TOKEN", "SLACKCLAW_*"]))
+    @test "SLACK_CHANNEL_ID_X" in leaky
+    @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_KAL", "SLACK_APP_TOKEN_KAL", "OTHER_SLACK_TOKEN",
+                                        "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_CH_GENERAL"])))
+    @test SlackClaw.is_slack_token("xoxe.xoxp-1-abc") && SlackClaw.is_slack_token("xoxr-abc")
+    @test !SlackClaw.is_slack_token("C0123") && !SlackClaw.is_slack_token("/usr/bin")
 end
 
 @testset "generate_manifest" begin
@@ -904,6 +991,7 @@ posted = String[]
 posted_to = Tuple{String,String}[]  # (thread_ts, channel_id) of each post_response
 slack_log = String[]                # post_response and reaction calls, in order
 top_posted = String[]
+top_posted_to = String[]            # thread_ts of each slack_post_message, beside top_posted
 reacted = String[]
 unreacted = String[]
 prompts = String[]
@@ -919,7 +1007,8 @@ Core.eval(SlackClaw, quote
                        thread_ts::AbstractString="",
                        channel_id::AbstractString=config.slack_channel_id) =
         ($top_hook[] === nothing || $top_hook[](text);
-         push!($slack_log, "top"); push!($top_posted, String(text)); $post_ts[])
+         push!($slack_log, "top"); push!($top_posted, String(text));
+         push!($top_posted_to, String(thread_ts)); $post_ts[])
     post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
                   channel_id::AbstractString=config.slack_channel_id) =
         ($post_hook[] === nothing || $post_hook[](thread_ts);
@@ -1377,9 +1466,9 @@ mkstate(cfg) = SlackClaw.MonitorState(
                                          claude_max_retries=0, status_file="ro/status",
                                          state_file="ro-state.json")
                 state_ro = mkstate(cfg_ro)
-                mkpath(f("ro")); write(f("ro/status"), "working")
-                chmod(f("ro"), 0o555)
                 T = "1700000890.000000"
+                mkpath(f("ro")); write(SlackClaw.run_status_path(cfg_ro, "C0", T), "working")
+                chmod(f("ro"), 0o555)
                 clear_logs!()
                 next_run(stderr=auth_fail, code=1)
                 SlackClaw.dispatch_command!(state_ro, SlackMessage(T, "U9", "deploy", ""))
@@ -1510,11 +1599,11 @@ mkstate(cfg) = SlackClaw.MonitorState(
 
             # 33. A run clears the status file it may have left
             T = "1700000992.000000"
-            write(joinpath(dir, cfg.status_file), "halfway")
+            write(SlackClaw.run_status_path(cfg, cfg.slack_channel_id, T), "halfway")
             next_run(stdout=ok_json("s-status") * "\n")
             SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "status", ""))
             foreach(wait, state.active_tasks)
-            @test !isfile(joinpath(dir, cfg.status_file))
+            @test !isfile(SlackClaw.run_status_path(cfg, cfg.slack_channel_id, T))
 
             # 34. A late top-level message whose thread is tracked and idle (a
             #     reply under it ran first: Slack's me_message status posts are
@@ -1743,11 +1832,57 @@ end
     @test !ClaudeResult(true, "ok", 1, 0.0, "s").session_missing
 end
 
+# Two runs at once in one channel never share a status file: each child writes
+# progress to the file it is given (SLACKCLAW_STATUS; a child given none writes
+# the documented .slackclaw_status in its working directory, as a prompt naming
+# it would), and each thread's status posts carry only its own run's progress.
+# Real run_claude and agent loop, Slack stubbed.
+@testset "status file per run" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        log = joinpath(dir, "status-paths")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            p="\${SLACKCLAW_STATUS:-.slackclaw_status}"
+            echo "\$SLACKCLAW_THREAD_TS \$p" >> '$log'
+            echo "working on \$SLACKCLAW_THREAD_TS" > "\$p"
+            sleep 3
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-st","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                              claude_max_retries=0, status_poll_s=1)
+        state = mkstate(cfg)
+        empty!(top_posted); empty!(top_posted_to); empty!(posted)
+        TA, TB = "1700002001.000000", "1700002002.000000"
+        withenv("PATH" => dir * ":" * ENV["PATH"]) do
+            SlackClaw.dispatch_command!(state, SlackMessage(TA, "U9", "job a", ""))
+            SlackClaw.dispatch_command!(state, SlackMessage(TB, "U9", "job b", ""))
+            foreach(wait, state.active_tasks)
+        end
+        paths = Dict(String(first(split(l))) => String(last(split(l))) for l in eachline(log))
+        @test length(paths) == 2
+        @test paths[TA] != paths[TB]
+        @test paths[TA] == SlackClaw.run_status_path(cfg, "C0", TA)
+        # each thread got its own run's progress, and only that
+        status = [(t, x) for (t, x) in zip(top_posted_to, top_posted) if startswith(x, "_Status:")]
+        for T in (TA, TB)
+            mine = [x for (t, x) in status if t == T]
+            @test !isempty(mine)
+            @test all(==("_Status: working on $(T)_"), mine)
+        end
+        # each run removes its own file when it ends
+        @test !isfile(paths[TA]) && !isfile(paths[TB])
+        @test length(posted) == 2
+    end
+end
+
 # From here on run_claude is a stub too.
 claude_throws = Ref(false)  # the stub throws, as if run_claude itself failed
 Core.eval(SlackClaw, quote
     function run_claude(prompt::String, config::SlackClawConfig;
-                        session_id::String="", thread_ts::String="", channel_id::String="")
+                        session_id::String="", thread_ts::String="", channel_id::String="",
+                        status_path::String="")
         push!($prompts, prompt)
         $claude_throws[] && error("simulated failure inside run_claude")
         return ClaudeResult(true, $claude_reply[], 1, 0.0, "sess-skip")
@@ -1817,7 +1952,7 @@ end)
     SlackClaw.run_agent_loop!(state_w, "1700000802.000000", "scheduled check", ""; channel_id="C0")
     foreach(wait, state_w.active_tasks)
     claude_throws[] = false
-    write(joinpath(cfg_w.repo_dir, cfg_w.status_file), "still here")
+    write(SlackClaw.run_status_path(cfg_w, "C0", "1700000802.000000"), "still here")
     sleep(2.5)
     @test !any(t -> occursin("Status:", t), top_posted)
 end

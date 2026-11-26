@@ -31,6 +31,9 @@ Base.@kwdef mutable struct SlackClawConfig
                                         # `claude auto-mode defaults`. Set "bypassPermissions" to restore
                                         # the pre-0.7 unrestricted behavior for a channel that needs it.
     allowed_tools::Vector{String} = String[]
+    child_env_passthrough::Vector{String} = String[]  # environment variables the claude child gets on top of
+                                        # the allow list (CHILD_ENV_NAMES, CHILD_ENV_PREFIXES): a name, or a
+                                        # prefix ending in `*`. A Slack token never passes (filtered_child_env).
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 3
     max_thread_idle_s::Int = 604800     # drop tracked threads idle this long (7d; 0 = never)
@@ -42,7 +45,8 @@ Base.@kwdef mutable struct SlackClawConfig
     announce_startup::Bool = false      # post the start/stop banners to the primary channel. Off by default:
                                         # under supervised restarts (systemd Restart=) a crash-loop spams the channel.
     state_file::String = ".slackclaw_state.json"  # persistence file in repo_dir (override when channels share a repo_dir)
-    status_file::String = ".slackclaw_status"
+    status_file::String = ".slackclaw_status"  # each run's status file is <status_file>.<channel>.<thread ts>
+                                        # in repo_dir, named to the child as SLACKCLAW_STATUS (run_status_path)
     status_poll_s::Int = 30             # how often to check status file during execution
     bot_user_id::String = ""
     listen_channel_ids::Vector{String} = String[]  # channels to poll (listen-only, respond in primary)

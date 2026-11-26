@@ -129,11 +129,38 @@ The `proactive_prompt` field can carry inline suggestions, but prefer
 
 ## Progress updates during long tasks
 
-While Claude runs, SlackClaw watches `status_file` (`.slackclaw_status` in
-`repo_dir`, polled every `status_poll_s`). Any non-empty content present when it
-polls is posted to the thread as a progress update (a value overwritten between
-polls can be missed), and the file is cleared when the task finishes — letting a
-long task narrate itself rather than going silent.
+Each run in a thread has its own status file, named to Claude as
+`SLACKCLAW_STATUS`: `<status_file>.<channel>.<thread ts>` in `repo_dir`
+(`status_file` defaults to `.slackclaw_status`). While the run goes, SlackClaw
+polls it every `status_poll_s`; any non-empty content present when it polls is
+posted to the thread as a progress update (a value overwritten between polls can
+be missed). The file is removed when the run ends, and one left by an earlier
+run in the thread is removed when the next run starts. A thread has one run at a
+time, so two runs never share a status file and one run's progress never shows
+in another thread. To use it, tell Claude in `system_prompt` to write progress
+to the file named by `$SLACKCLAW_STATUS`.
+
+## What the Claude child receives
+
+Every run of `claude` gets an allow-listed environment, not the monitor's: a
+fleet's environment holds every workspace's Slack tokens and other credentials,
+and the run follows prompts any channel member can write. It inherits only:
+
+- what a shell, git, the CLI and its HTTP client need: `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`, `TMPDIR`/`TMP`/`TEMP`,
+  `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, the proxy variables and the
+  certificate-bundle variables (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …);
+- variables starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_`, `ANTHROPIC_` or
+  `CLAUDE_` (less the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`,
+  except `CLAUDE_CODE_OAUTH_TOKEN`);
+- whatever the channel's `child_env_passthrough` lists: a name, or a prefix
+  ending in `*` (for example `["ZOTERO_*", "HARDWARE_RECORDS"]`).
+
+A variable whose value is a Slack token (`xoxb-`, `xoxp-`, `xapp-` and the other
+`xox` kinds) never passes, even when `child_env_passthrough` names it. SlackClaw
+then sets the run's own variables: `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`,
+`SLACKCLAW_BOT_TOKEN` (the channel's bot token, for the upload helper) and
+`SLACKCLAW_UPLOAD`, and `SLACKCLAW_STATUS` for a run in a thread.
 
 ## Sending files and images
 
