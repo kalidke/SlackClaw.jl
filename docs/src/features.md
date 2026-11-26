@@ -178,14 +178,16 @@ failed reaction is logged and never stops the post.
   any failure that prints its result object), the next run resumes that
   session, with what the failed run already did. The reply ends with "Reply in
   this thread to continue; the next run resumes this one."
-- When it printed none (a timeout, or a failure with nothing on stdout), the
-  thread keeps the session it already had, so the next reply resumes the
-  earlier conversation (a thread with no session yet starts fresh, told that
-  the earlier context is not available). The failed run's work is not in that
-  session, so the reply ends with "Reply in this thread to try again, saying
-  what is still to be done: this run left nothing to resume, though some of
-  its work may have run." A timeout keeps the id of a result printed before
-  it ran over.
+- A run that timed out while resuming a session worked in that session (the
+  CLI writes the transcript as it goes, under the same id), so the next run
+  resumes it, with the same line.
+- When it printed none and did not get that far (a start-up failure, or a
+  fresh run that timed out), the thread keeps the session it already had, so
+  the next reply resumes the earlier conversation (a thread with no session
+  yet starts fresh, told that the earlier context is not available). The
+  failed run's work is not in that session, so the reply ends with "Reply in
+  this thread to try again, saying what is still to be done: this run left
+  nothing to resume, though some of its work may have run."
 - A scheduled follow-up that fires in a session other than the one that
   scheduled it (the thread started over since) is told so, and asks rather
   than guesses what it refers to.

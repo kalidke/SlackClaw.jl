@@ -813,11 +813,12 @@ const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, saying what i
     failure_reply(reason, session_id) -> String
 
 Thread text for a failed run: the reason, then a line saying that a reply in the
-thread starts the next run. `session_id` is the session the failed run itself
-printed: only then does the next run hold the request, and the line says the
-run continues; otherwise (a timeout, a start-up failure) the run's work is in no
-session the thread can resume, so the line asks what is still to be done (some
-of it may have run: a job submitted, an earlier step posted). A long
+thread starts the next run. `session_id` is the session the thread resumes when
+it holds the run's work (a run in this loop printed it, or a resumed run timed
+out in it: the CLI writes its transcript as it goes and keeps the id across
+`--resume`); then the line says the run continues. Pass "" otherwise (a start-up
+failure, a fresh run that timed out): the work is in no session the thread can
+resume, so the line asks what is still to be done. A long
 reason (an error result's whole text) is cut to 3000 characters, so the line is
 never lost to the post's chunk limit.
 """
@@ -897,8 +898,9 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         current_session = session_id
         continue_count = 0
         reran_missing = false
-        # The session the latest Claude run printed ("" until it returns, or if
-        # it printed none): what a failure reply can promise to resume
+        # The latest session a run in this loop named (printed, or a timed-out
+        # resume): a failure reply promises "continue" only when the thread
+        # resumes that session, which then holds the run's work
         printed_session = ""
         # A thread this run has to track (it was untracked) starts after the
         # message being answered, else after the run's own notice (set below):
@@ -938,7 +940,6 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
 
                 # Run Claude (pass thread context for file upload support)
-                printed_session = ""
                 result = try
                     run_claude(current_prompt, config;
                         session_id=current_session,
@@ -955,7 +956,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                 # task fires with the id it was saved with), else starts fresh
                 # with REVIVED_THREAD_NOTE. Once per dispatched message, its
                 # [CONTINUE] steps included.
-                printed_session = result.session_id
+                isempty(result.session_id) || (printed_session = result.session_id)
                 if result.session_missing && !reran_missing
                     reran_missing = true
                     held = track_thread!(state, thread_ts, channel_id;
@@ -985,7 +986,8 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     try
-                        post_response(config, failure_reply(result.result_text, result.session_id),
+                        post_response(config, failure_reply(result.result_text,
+                                          current_session == printed_session ? current_session : ""),
                                       thread_ts; channel_id)
                     catch e
                         @error "SlackClaw: failure reply not posted" thread_ts exception=(e, catch_backtrace())
@@ -1072,7 +1074,8 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
                     react_quietly(config, react_ts, "x"; channel_id)
                     finish_run!()
                     slack_post_message(config,
-                        failure_reply("Error: $err_msg (check server logs)", printed_session);
+                        failure_reply("Error: $err_msg (check server logs)",
+                                      current_session == printed_session ? current_session : "");
                         thread_ts, channel_id)
                 catch e2
                     @error "SlackClaw: error reply not posted" thread_ts exception=(e2, catch_backtrace())

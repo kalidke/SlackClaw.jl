@@ -31,15 +31,17 @@ Patch: a failed Claude run no longer ends its Slack thread.
   exit code. It now reads "Claude stopped at the step limit before
   finishing."
 - **Every failed run's reply ends with a line about replying**: "Reply in this
-  thread to continue; the next run resumes this one." when the failed run
-  printed a session id of its own, and "Reply in this thread to try again,
-  saying what is still to be done: this run left nothing to resume, though
-  some of its work may have run." when it did not (the thread's earlier
-  session, if any, is still resumed, but the failed run's work is not in it).
-  A timeout keeps the id of a result printed before the overrun, and a lone
-  stdout event of another type (`system` init) is not read as a result. The
-  reason text before it is unchanged from 0.7.2, cut to 3000 characters so
-  the line always fits.
+  thread to continue; the next run resumes this one." when the session the
+  thread resumes holds the failed run's work (a run in it printed its id, or a
+  resumed run timed out in it), and "Reply in this thread to try again, saying
+  what is still to be done: this run left nothing to resume, though some of
+  its work may have run." when it does not (a start-up failure, a fresh run
+  that timed out: the thread's earlier session, if any, is still resumed). A
+  timed-out run's session is the id of a result printed before the overrun,
+  else the session it resumed (the CLI writes the transcript as it goes, under
+  the same id). A lone stdout event of another type (`system` init) is not
+  read as a result. The reason text before it is unchanged from 0.7.2, cut to
+  3000 characters so the line always fits.
 - **A follow-up firing in another session is told so.** When a scheduled
   follow-up resumes a session other than the one that scheduled it (the
   thread started over since: a refused resume, or a late message an older

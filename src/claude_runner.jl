@@ -187,9 +187,12 @@ id: the run was killed before printing anything. A refused resume sets
 function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::AbstractString="")
     if res.timed_out
         @warn "SlackClaw: claude timed out" timeout_s
-        # A result printed before the overrun still names the run's session
-        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0,
-                            stdout_session_id(res.stdout))
+        # A result printed before the overrun still names the run's session;
+        # else a resumed run worked in the session it resumed (the CLI writes
+        # the transcript as it goes, under the same id), so that is its session
+        sid = stdout_session_id(res.stdout)
+        isempty(sid) && (sid = String(resumed))
+        return ClaudeResult(false, "Timed out after $(timeout_s)s", duration_ms, 0.0, sid)
     end
 
     if res.exitcode != 0
