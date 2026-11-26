@@ -213,11 +213,16 @@ Code's built-in instructions, such as confirming before hard-to-reverse or
 outward-facing actions. Claude Code records a conversation's prompt at its first
 request, so a thread keeps the prompt it started with until its conversation is
 compacted; an edited `system_prompt` reaches new threads. Claude Code's auto
-memory is off in runs (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`): a run neither reads
-the repository's memory index nor saves to it, so one member's message cannot
-become a memory that later threads, or a person's own Claude sessions in that
-repository, load and act on. Set `auto_memory = true` for a channel whose runs
-should read and write it.
+memory is off in runs (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`): Claude Code does
+not load the repository's memory index into a run, and does not tell it to save
+memories there, so a member's message does not turn into a memory that later
+threads, or a person's own Claude sessions in that repository, load and act on.
+This is the built-in behavior only: a run can still read and write files in that
+folder with its ordinary tools when a prompt asks it to. Set `auto_memory = true`
+for a channel whose runs should load the index and be told to save to it (a
+launcher that builds the configs must pass the field). Either way the setting
+applies to new threads: a thread keeps the instructions its conversation started
+with until it is compacted.
 
 **What this does not do.** The allow list governs the environment a run
 inherits. A run is the monitor's own OS user, so it can still read any file the

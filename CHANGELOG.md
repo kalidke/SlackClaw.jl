@@ -58,10 +58,11 @@ Notable changes to SlackClaw.jl. Format follows
   repository's memory index and save memories to it; with it a channel
   member's message could become a memory that later threads, and a person's
   own Claude sessions in that repository, load and act on. Runs now get
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so they neither read nor write that
-  folder. Before, runs read the memory index but were never told to save to
-  it; a channel that relies on the index sets `auto_memory = true`, which
-  also lets its runs save memories.
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so Claude Code neither loads that
+  index into a run nor tells it to save memories (a run can still use the
+  folder's files when a prompt asks). Before, runs read the memory index but
+  were never told to save to it; a channel that relies on the index sets
+  `auto_memory = true`, which also tells its runs to save memories.
 
 ### Upgrading
 
@@ -82,7 +83,10 @@ Notable changes to SlackClaw.jl. Format follows
   a thread open at the upgrade keeps the replacing prompt until its
   conversation is compacted; new threads get the built-in prompt.
 - Runs no longer see the repository's Claude Code memory index (see Changed);
-  set `auto_memory = true` for a channel whose runs need it.
+  set `auto_memory = true` for a channel whose runs need it (a launcher that
+  builds `SlackClawConfig` for a fleet needs a way to pass it). The setting
+  applies to new threads: a thread keeps the instructions its conversation
+  recorded, so a thread started with it on keeps them after it is turned off.
 
 ### Fixed
 

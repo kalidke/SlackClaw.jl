@@ -320,6 +320,7 @@ end
         write(joinpath(dir, "claude"), """
             #!/bin/sh
             env > '$envf'
+            [ -r /proc/\$\$/environ ] && tr '\\0' '\\n' < /proc/\$\$/environ > '$envf.raw'
             echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-env","num_turns":1}'
             """)
         chmod(joinpath(dir, "claude"), 0o755)
@@ -362,18 +363,24 @@ end
         # Claude Code's auto memory is off in runs (the built-in prompt would have a
         # run save memories in the repo's memory folder); the monitor's own setting
         # of the variable never reaches the child, so it is set exactly once
+        # (counted in the environment the child was started with, on Linux: the
+        # shell collapses a duplicated variable before `env` prints it)
         @test env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
-        @test count(l -> startswith(l, "CLAUDE_CODE_DISABLE_AUTO_MEMORY="), eachline(envf)) == 1
+        once(f) = count(l -> startswith(l, "CLAUDE_CODE_DISABLE_AUTO_MEMORY="), eachline(f)) == 1
+        Sys.islinux() && @test once(envf * ".raw")
 
         # a run given a status file names it
         st = SlackClaw.run_status_path(cfg, "C0ENV", "1700000001.000100")
         @test child_env(thread_ts="1700000001.000100", channel_id="C0ENV", status_path=st)["SLACKCLAW_STATUS"] == st
 
-        # a channel can add a variable it needs, but never a Slack token
-        cfg.child_env_passthrough = ["ZOTERO_API_KEY", "SLACK_BOT_TOKEN"]
+        # a channel can add a variable it needs, but never a Slack token, nor the
+        # monitor's own auto-memory setting
+        cfg.child_env_passthrough = ["ZOTERO_API_KEY", "SLACK_BOT_TOKEN", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"]
         env = child_env()
         @test env["ZOTERO_API_KEY"] == "test-unrelated-key"
         @test !haskey(env, "SLACK_BOT_TOKEN")
+        @test env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+        Sys.islinux() && @test once(envf * ".raw")
         # with no thread there is no upload context
         @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
         # a channel that turns auto memory on gets Claude Code's default
@@ -416,6 +423,16 @@ end
         # the user name itself holds an @
         @test occursin("://…@", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u:MARK7@host/x"), 5).stderr)
         @test !occursin("MARK7", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u@x.org:MARK7@host/x"), 5).stderr)
+        # a folder that exists under a URL-shaped name is checked as it is, and only
+        # shown masked
+        urldir = joinpath(dir, "https://u:MARK7@host", "x")
+        mkpath(urldir)
+        r = withenv("PATH" => joinpath(dir, "no-bin")) do
+            SlackClaw.run_claude("hi", SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=urldir,
+                                                       claude_max_retries=0))
+        end
+        @test occursin("failed to start claude in $(replace(urldir, "u:MARK7@" => "…@")): ", r.result_text)
+        @test occursin("is claude on the run's PATH?", r.result_text) && !occursin("MARK7", r.result_text)
         # a repo_dir that is a file is said so
         @test SlackClaw._run_claude_once(setenv(`claude`, String[]; dir=envf), 5).stderr ==
               "failed to start claude: $envf is not a folder"
@@ -429,6 +446,7 @@ end
             if (try isdir(joinpath(locked, "repo")); false; catch; true; end)
                 res = SlackClaw._run_claude_once(setenv(`claude`, String[]; dir=joinpath(locked, "repo")), 5)
                 @test res.exitcode == -1 && startswith(res.stderr, "failed to start claude in $(joinpath(locked, "repo")): ")
+                @test occursin("(EACCES)", res.stderr) && !occursin("PATH", res.stderr)
             end
         finally
             chmod(locked, 0o700)

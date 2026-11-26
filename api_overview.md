@@ -92,7 +92,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `max_thread_idle_s::Int = 604800` — 7 d; `0` = never
 - `max_continue::Int = 10` — max consecutive `[CONTINUE]`
 - `system_prompt::String` — a Slack-formatting brevity prompt (full literal below); passed with the directive and upload instructions as `--append-system-prompt`, after Claude Code's own system prompt, which it never replaces
-- `auto_memory::Bool = false` — Claude Code's auto memory in runs; off sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the child, so a run neither reads nor writes the repo's memory folder
+- `auto_memory::Bool = false` — Claude Code's auto memory in runs; off sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the child, so Claude Code neither loads the repo's memory index into a run nor tells it to save there (file tools can still reach the folder); applies to new threads
 - `agent_directives::Bool = true` — enable `[CONTINUE]`/`[SCHEDULE]`
 - `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no checkmark; thread session still tracked). Eyes-as-intent: the dispatch-time `:eyes` ack is added on `allow_skip` channels too, then REMOVED when the reply is `[SKIP]` — lingering eyes mean a reply is coming, vanished eyes mean "seen, deliberately staying out". Mechanism only — tell Claude about the convention via `system_prompt`
 - `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
