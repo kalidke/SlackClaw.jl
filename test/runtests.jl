@@ -371,20 +371,38 @@ end
         # with no thread there is no upload context
         @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
 
-        # A run that cannot start (its repo_dir is gone) reports the error and the
-        # folder only: the spawn error's own text holds the whole environment, and
-        # this reason is posted to Slack
+        # A run that cannot start reports the error and the folder only: the spawn
+        # error's own text holds the whole environment, and this reason is posted to
+        # Slack. Neither the reason nor any log record holds a value from the run's
+        # environment. (a) its repo_dir is gone; (b) claude is not on PATH.
+        leaked(logs) = any(l -> occursin("MARK7", string(l.message)) ||
+                                any(kv -> occursin("MARK7", string(kv)) || occursin("xoxb-", string(kv)), l.kwargs),
+                           logs)
         gone = joinpath(dir, "moved-away")
         cfg_gone = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
                                    app_token="xapp-1-A111-2222-testworkspaceapp", repo_dir=gone,
-                                   claude_max_retries=0)
-        r = withenv(parent..., "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
-            SlackClaw.run_claude("hi", cfg_gone; thread_ts="1700000001.000100", channel_id="C0ENV")
+                                   claude_max_retries=1, claude_retry_backoff_s=0.01)
+        logs, r = Test.collect_test_logs() do
+            withenv(parent..., "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
+                SlackClaw.run_claude("hi", cfg_gone; thread_ts="1700000001.000100", channel_id="C0ENV")
+            end
         end
         @test !r.success
-        @test occursin("failed to start claude in $gone", r.result_text)
+        @test occursin("failed to start claude: its folder $gone does not exist", r.result_text)
         @test !occursin("xoxb-", r.result_text) && !occursin("MARK7", r.result_text) &&
               !occursin("PATH=", r.result_text)
+        @test !isempty(logs) && !leaked(logs)
+        cfg_nopath = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                                     repo_dir=dir, claude_max_retries=0)
+        logs, r = Test.collect_test_logs() do
+            withenv(parent..., "PATH" => joinpath(dir, "no-bin"), "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
+                SlackClaw.run_claude("hi", cfg_nopath; thread_ts="1700000001.000100", channel_id="C0ENV")
+            end
+        end
+        @test occursin("failed to start claude in $dir: no such file or directory (ENOENT)", r.result_text)
+        @test !occursin("MARK7", r.result_text) && !leaked(logs)
+        # a folder written with a user name and password is shown masked
+        @test occursin("://…@", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u:MARK7@host/x"), 5).stderr)
     end
 end
 
@@ -989,35 +1007,43 @@ end
     for k in ("GH_HOST", "ANTHROPIC_FOUNDRY_BASE_URL", "GIT_SSL_CAINFO", "CLAUDE_CODE_OAUTH_TOKEN")
         @test envnames(fce(Dict(k => "v"))) == Set([k])
     end
-    for k in SlackClaw.SLACKCLAW_RUN_VARS
+    # the five names SlackClaw sets per run, listed here on their own: never inherited,
+    # even when a channel names one
+    for k in ("SLACKCLAW_THREAD_TS", "SLACKCLAW_CHANNEL_ID", "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_UPLOAD",
+              "SLACKCLAW_STATUS")
         @test isempty(fce(Dict(k => "v"), [k]))
     end
     @test isempty(fce(Dict("MY_APP_VALUE" => "xapp-1-A111-2222-abc"), ["MY_APP_VALUE"]))
     # no built-in prefix passes a secret-looking name: a usage monitor's session key
-    # under CLAUDE_, a token under JULIA_, git's numbered settings would need GIT_ (not
-    # a prefix here); a versioned directory keeps PATH
+    # under CLAUDE_, a token under JULIA_; a versioned directory keeps PATH
     odd = Dict("CLAUDE_SESSION_KEY" => "sk-dummy", "CLAUDE_CONFIG_DIR" => "/cc",
                "JULIA_PKG_TOKEN" => "dummy", "JULIA_NUM_THREADS" => "4",
-               "PATH" => "/usr/bin:/opt/xapp-1.2/bin")
+               "PATH" => "/usr/bin:/opt/xapp-1.2/bin:/opt/xoxb-1.2/bin:/opt/xoxe.xox-tools/bin")
     @test envnames(fce(odd)) == Set(["CLAUDE_CONFIG_DIR", "JULIA_NUM_THREADS", "PATH"])
     sn = SlackClaw.secret_name
     @test all(sn, ("A_TOKEN", "A_SECRET", "A_PASSWORD", "A_PASSWD", "API_KEY", "A_CREDENTIALS",
-                   "SLACK_WEBHOOK", "SLACK_COOKIE", "GITHUB_PAT", "x_token", "GIT_CONFIG_COUNT",
-                   "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_12", "GIT_CONFIG_PARAMETERS"))
-    @test !any(sn, ("PATH", "JULIA_NUM_THREADS", "GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME"))
+                   "SLACK_WEBHOOK", "SLACK_COOKIE", "GITHUB_PAT", "x_token", "a_Key"))
+    @test !any(sn, ("PATH", "JULIA_NUM_THREADS", "GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME", "PATTERN_DIR"))
     @test isempty(fce(Dict("SLACK_COOKIE" => "xoxd-abc%2Fdummy"), ["SLACK_COOKIE"]))
-    # child_env_passthrough takes exact names: an entry ending in * is logged once and ignored
+    # child_env_passthrough takes exact names: an entry ending in * is logged once (across
+    # runs) and ignored; an entry that is not a name and a * is never echoed
     logs, extra = Test.collect_test_logs() do
         envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_API_KEY"]))
     end
     @test extra ⊇ Set(["GH_TOKEN", "ZOTERO_API_KEY"])
     @test !("MY_TOOL_HOME" in extra)
-    @test any(l -> occursin("ignoring the entry MY_TOOL_*", string(l.message)), logs)
+    @test count(l -> occursin("ignoring the entry MY_TOOL_*", string(l.message)), logs) == 1
+    logs, _ = Test.collect_test_logs(() -> fce(monitor, ["MY_TOOL_*"]))
+    @test isempty(logs)
+    logs, _ = Test.collect_test_logs(() -> fce(monitor, ["MY_SECRET=MARK5abc*"]))
+    @test length(logs) == 1 && !occursin("MARK5", string(logs[1].message))
     # a proxy carrying a password, with or without a URL scheme, passes only when the
-    # channel names it, and its drop is named in the log
+    # channel names it, and its drop is named in the log without its value
     @test "HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_PROXY"]))
     @test "https_proxy" in envnames(fce(monitor, ["https_proxy"]))
-    @test_logs (:warn, r"not passing ALL_PROXY") fce(Dict("ALL_PROXY" => "socks5://u:p@proxy:1080"))
+    logs, _ = Test.collect_test_logs(() -> fce(Dict("ALL_PROXY" => "socks5://u:MARK6@proxy:1080")))
+    @test length(logs) == 1 && occursin("not passing ALL_PROXY", string(logs[1].message))
+    @test !occursin("MARK6", string(logs[1].message)) && !any(kv -> occursin("MARK6", string(kv)), logs[1].kwargs)
     # a Slack credential never passes, whatever names it (a token alone, in a header, a
     # workflow token, a webhook URL on either Slack domain); the variables SlackClaw sets
     # per run are never inherited
@@ -1037,6 +1063,8 @@ end
     @test hsc("https://hooks.slack.com/services/T0/B0/x") && hsc("hooks.Slack-Gov.com:443/x")
     @test !hsc("C0123") && !hsc("/usr/bin") && !hsc("/opt/myxapp-1/bin") && !hsc("/opt/xapp-tools/bin")
     @test !hsc("/opt/xapp-1.2/bin") && hsc("xoxd-abc%2Fdef") && hsc("d=xoxd-1abc")
+    @test hsc("xoxd-%2Fabc") && hsc("xoxd-+abc") && hsc("xoxd-/abc")
+    @test !hsc("/opt/xoxb-1.2/bin") && !hsc("/opt/xoxe.xox-tools/bin")
     huc = SlackClaw.has_url_credential
     @test huc("X", "http://u:p@proxy:3128") && !huc("X", "http://proxy:3128")
     @test huc("https_proxy", "u:p@proxy:3128") && !huc("https_proxy", "proxy:3128")
@@ -2096,10 +2124,13 @@ end)
 
     # Naming the run's status file can fail (a relative repo_dir after the working
     # folder was removed): the thread is still released, with one failure reply
-    Core.eval(SlackClaw, :(run_status_path(config::SlackClawConfig, channel_id::AbstractString,
-                                           thread_ts::AbstractString) = error("simulated: no working folder")))
+    here = pwd()
+    cwd_gone = mktempdir()
+    cd(cwd_gone)
+    rm(cwd_gone)
     try
-        cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=mktempdir())
+        cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir="relative-repo")
+        @test_throws Base.IOError SlackClaw.run_status_path(cfg_p, "C0", "1700000803.000000")
         state_p = mkstate(cfg_p)
         empty!(top_posted)
         SlackClaw.run_agent_loop!(state_p, "1700000803.000000", "check", ""; channel_id="C0")
@@ -2107,9 +2138,7 @@ end)
         @test !haskey(state_p.busy_threads, "1700000803.000000")
         @test length(top_posted) == 1 && endswith(top_posted[1], SlackClaw.FAILED_RUN_RETRY_LINE)
     finally
-        Core.eval(SlackClaw, :(run_status_path(config::SlackClawConfig, channel_id::AbstractString,
-                                               thread_ts::AbstractString) =
-                                   status_prefix(config, channel_id) * replace(thread_ts, r"[^0-9.]" => "_")))
+        cd(here)
     end
 end
 

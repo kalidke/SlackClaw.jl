@@ -112,7 +112,7 @@ True when `v` holds a Slack credential anywhere in it (alone, in an
   `hooks.slack-gov.com`, any letter case, any port).
 """
 has_slack_credential(v::AbstractString) =
-    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%]|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%+/]|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
 
 """
 True when `v`, the value of variable `k`, holds a URL with a user name or
@@ -123,17 +123,13 @@ has_url_credential(k::AbstractString, v::AbstractString) =
     occursin(r"://[^/\s@]+@", v) || (k in PROXY_NAMES && occursin(r"^\s*[^/\s@]+@", v))
 
 """
-True for a name that passes only when listed exactly: one that looks like it
-holds a secret (containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`,
-`WEBHOOK`, `COOKIE`, or the word `PAT`, any case), and git's numbered settings
-(`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`,
-`GIT_CONFIG_PARAMETERS`), which work only as a whole and can carry an
-`http.extraHeader`. No prefix in [`CHILD_ENV_PREFIXES`](@ref) passes such a
-name; it passes only by exact name.
+True for a name that looks like it holds a secret (containing `TOKEN`,
+`SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`, `COOKIE`, or the word `PAT`,
+any case). No prefix in [`CHILD_ENV_PREFIXES`](@ref) passes such a name (a
+usage monitor's `CLAUDE_SESSION_KEY`, say); it passes only by exact name.
 """
 secret_name(k::AbstractString) =
-    occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK|COOKIE|(^|_)PAT($|_)"i, k) ||
-    occursin(r"^GIT_CONFIG_(COUNT|PARAMETERS|KEY_[0-9]+|VALUE_[0-9]+)$", k)
+    occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK|COOKIE|(^|_)PAT($|_)"i, k)
 
 """
     filtered_child_env(env, passthrough=()) -> Vector{String}
@@ -197,9 +193,14 @@ const WARNED_DROPPED = Set{String}()
 warn_dropped(k::AbstractString, why::AbstractString) =
     warn_once(k, "SlackClaw: not passing $k to Claude runs: its value $why")
 
-"""Log once per process that a `child_env_passthrough` entry ending in `*` is ignored."""
+"""
+Log once per process that a `child_env_passthrough` entry ending in `*` is
+ignored. The entry is echoed only when it is a variable name and a `*`, so a
+value pasted into the list never reaches the log.
+"""
 warn_prefix_entry(p::AbstractString) =
-    warn_once("entry " * p, "SlackClaw: child_env_passthrough takes exact names; ignoring the entry $p")
+    warn_once("entry " * p, "SlackClaw: child_env_passthrough takes exact names; ignoring " *
+              (occursin(r"^[A-Za-z_][A-Za-z0-9_]*\*$", p) ? "the entry $p" : "an entry ending in *"))
 
 function warn_once(key::AbstractString, msg::AbstractString)
     key in WARNED_DROPPED && return
@@ -381,13 +382,15 @@ function _run_claude_once(cmd::Base.AbstractCmd, timeout_s::Real)
         # Couldn't even spawn (`claude` not on PATH, a missing repo_dir). The
         # error's own text spells out the whole command with its environment,
         # which holds the run's credentials, and this text is posted to Slack:
-        # report only the error's code and the folder.
+        # report only the error's code and the folder (any user name or
+        # password in it masked), and say so when the folder is what is missing.
         why = e isa Base.IOError ? "$(Base.struverror(e.code)) ($(Base.uverrorname(e.code)))" :
                                    string(nameof(typeof(e)))
-        dir = cmd isa Cmd ? cmd.dir : ""
-        return (exitcode = -1, stdout = "",
-                stderr = "failed to start claude" * (isempty(dir) ? "" : " in $dir") * ": $why",
-                timed_out = false)
+        dir = replace(cmd isa Cmd ? cmd.dir : "", r"://[^/\s@]+@" => "://…@")
+        msg = isempty(dir) ? "failed to start claude: $why" :
+              !isdir(dir) ? "failed to start claude: its folder $dir does not exist" :
+                            "failed to start claude in $dir: $why"
+        return (exitcode = -1, stdout = "", stderr = msg, timed_out = false)
     end
     close(out.in)
     close(err.in)
