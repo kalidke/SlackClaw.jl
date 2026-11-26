@@ -33,7 +33,8 @@ Base.@kwdef mutable struct SlackClawConfig
     allowed_tools::Vector{String} = String[]
     child_env_passthrough::Vector{String} = String[]  # environment variables the claude child gets on top of
                                         # the allow list (CHILD_ENV_NAMES, CHILD_ENV_PREFIXES): a name, or a
-                                        # prefix ending in `*`. A Slack credential never passes (filtered_child_env).
+                                        # prefix ending in `*`. A Slack token or webhook URL never passes; a
+                                        # prefix skips secret-looking names (filtered_child_env).
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 3
     max_thread_idle_s::Int = 604800     # drop tracked threads idle this long (7d; 0 = never)

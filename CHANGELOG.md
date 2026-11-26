@@ -46,7 +46,10 @@ Notable changes to SlackClaw.jl. Format follows
   other than those SlackClaw sets per run. A secret-looking name must be
   listed exactly (`"ZOTERO_API_KEY"`, not `"ZOTERO_*"`). A launcher that builds
   `SlackClawConfig` for a fleet needs a way to set `child_env_passthrough` per
-  channel.
+  channel. SlackClaw logs the name of a variable it drops for its value.
+- Status files are now `.slackclaw_status.<channel>.<thread ts>`: a repository
+  that ignores them needs `.slackclaw_status*`, and a `.slackclaw_status` left
+  by 0.7.4 or earlier is no longer read or removed (delete it by hand).
 
 ### Fixed
 

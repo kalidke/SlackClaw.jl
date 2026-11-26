@@ -158,9 +158,32 @@ function filtered_child_env(env, passthrough=())
     listed(k) = k in CHILD_ENV_NAMES || any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
                 (any(p -> startswith(k, p), prefixes) && !secret_name(k))
     nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
-    keep(k, v) = !(k in SLACKCLAW_RUN_VARS) && !nested(k) && !has_slack_credential(v) &&
-                 (k in names || (listed(k) && !has_url_credential(k, v)))
-    return String["$(k)=$(v)" for (k, v) in env if keep(k, v)]
+    out = String[]
+    for (k, v) in env
+        (k in SLACKCLAW_RUN_VARS || nested(k)) && continue
+        named = k in names
+        (named || listed(k)) || continue
+        # A variable dropped for its value alone is named in the log once, so a
+        # dropped PATH or proxy is visible; its value never is
+        if has_slack_credential(v)
+            warn_dropped(k, "holds a Slack token or webhook URL, which never passes")
+        elseif !named && has_url_credential(k, v)
+            warn_dropped(k, "is a URL with a user name or password; name it exactly in child_env_passthrough to pass it")
+        else
+            push!(out, "$(k)=$(v)")
+        end
+    end
+    return out
+end
+
+"""Names of the variables [`warn_dropped`](@ref) has logged, so each is logged once per process."""
+const WARNED_DROPPED = Set{String}()
+
+"""Log once per process that variable `k` is not passed to Claude runs, and why (never its value)."""
+function warn_dropped(k::AbstractString, why::AbstractString)
+    k in WARNED_DROPPED && return
+    push!(WARNED_DROPPED, String(k))
+    @warn "SlackClaw: not passing $k to Claude runs: its value $why"
 end
 
 """

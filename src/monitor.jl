@@ -959,11 +959,13 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         # both Slack timestamps. With neither, the run does not track it.
         new_cursor = react_ts
 
-        # This run's own status file (no other run shares it); a cleanup error is logged
-        status_path = run_status_path(config, channel_id, thread_ts)
+        # This run's own status file (no other run shares it), named inside the
+        # try below, so an error naming it cannot skip the busy mark's release;
+        # "" means none. A cleanup error is logged.
+        status_path = ""
         function clear_status!()
             try
-                isfile(status_path) && rm(status_path; force=true)
+                !isempty(status_path) && isfile(status_path) && rm(status_path; force=true)
             catch e
                 @error "SlackClaw: status file cleanup failed" thread_ts exception=(e, catch_backtrace())
             end
@@ -985,6 +987,7 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             # Inside the try: nothing after the busy mark can skip its release.
             # A status file left by an earlier run in this thread (the monitor
             # stopped mid-run) is not this run's progress.
+            status_path = run_status_path(config, channel_id, thread_ts)
             clear_status!()
             if before_run !== nothing
                 try

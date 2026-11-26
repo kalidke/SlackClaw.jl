@@ -936,11 +936,12 @@ end
         "AWS_PROFILE" => "lab-bedrock", "AWS_REGION" => "us-west-2", "AWS_SECRET_ACCESS_KEY" => "s",
         "NODE_USE_SYSTEM_CA" => "1", "NODE_OPTIONS" => "--use-openssl-ca", "npm_config_cache" => "/n",
         "GIT_AUTHOR_NAME" => "Lab Bot", "GIT_AUTHOR_EMAIL" => "bot@lab.example",
-        "GH_CONFIG_DIR" => "/g", "GH_REPO" => "lab/project",
+        "GH_CONFIG_DIR" => "/g", "GH_REPO" => "lab/project", "GIT_SSL_CAINFO" => "/ca.pem",
+        "DISABLE_AUTOUPDATER" => "1", "CUDA_VISIBLE_DEVICES" => "0",
         "HTTP_PROXY" => "http://proxy.lab:3128", "HTTPS_PROXY" => "http://svc:dummy-pass@proxy.lab:3128",
         "https_proxy" => "svc:dummy-pass@proxy.lab:3128",
-        "SLACK_BOT_TOKEN_KAL" => "xoxb-1111-2222-abc", "SLACK_APP_TOKEN_KAL" => "xapp-1-A111-2222-abc",
-        "SLACK_CHANNEL_ID_X" => "C123", "SLACKCLAW_CH_GENERAL" => "C456",
+        "SLACK_BOT_TOKEN_WS1" => "xoxb-1111-2222-abc", "SLACK_APP_TOKEN_WS1" => "xapp-1-A111-2222-abc",
+        "SLACK_CHANNEL_ID_X" => "C123", "SLACKCLAW_CH_ONE" => "C456",
         "SLACK_SIGNING_SECRET" => "dummysigningsecret", "SLACK_CLIENT_SECRET" => "dummyclientsecret",
         "SLACKCLAW_UPLOAD_COMMENT" => "from the lab bot", "SLACKCLAW_STATUS" => "/inherited/status",
         "SLACKCLAW_THREAD_TS" => "1700000000.000001",
@@ -958,7 +959,11 @@ end
                                       "ANTHROPIC_FOUNDRY_RESOURCE", "AWS_PROFILE", "AWS_REGION",
                                       "NODE_USE_SYSTEM_CA", "NODE_OPTIONS", "npm_config_cache",
                                       "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GH_CONFIG_DIR", "GH_REPO",
+                                      "GIT_SSL_CAINFO", "DISABLE_AUTOUPDATER", "CUDA_VISIBLE_DEVICES",
                                       "HTTP_PROXY"])
+    # a variable dropped for its value alone is named in the log, once, never its value
+    @test_logs (:warn, r"not passing SSL_CERT_DIR to Claude runs") fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-x"))
+    @test_logs fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-x"))
     # extras by name or by prefix; a prefix never passes a secret-looking name, a channel names it
     extra = envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_*"]))
     @test extra ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
@@ -975,12 +980,12 @@ end
     leaky = envnames(fce(monitor, ["SLACK_*", "OTHER_SLACK_TOKEN", "SLACK_HELPER_AUTH", "SLACK_GOV_HOOK",
                                    "SLACK_WORKFLOW", "SLACKCLAW_*", "SLACKCLAW_STATUS"]))
     @test "SLACK_CHANNEL_ID_X" in leaky
-    @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_KAL", "SLACK_APP_TOKEN_KAL", "OTHER_SLACK_TOKEN",
+    @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_WS1", "SLACK_APP_TOKEN_WS1", "OTHER_SLACK_TOKEN",
                                         "SLACK_WEBHOOK_URL", "SLACK_GOV_HOOK", "SLACK_HELPER_AUTH",
                                         "SLACK_WORKFLOW", "SLACK_SIGNING_SECRET", "SLACK_CLIENT_SECRET",
                                         "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS", "SLACKCLAW_THREAD_TS"])))
     # SlackClaw's other variables pass when the channel names them
-    @test Set(["SLACKCLAW_CH_GENERAL", "SLACKCLAW_UPLOAD_COMMENT"]) ⊆ leaky
+    @test Set(["SLACKCLAW_CH_ONE", "SLACKCLAW_UPLOAD_COMMENT"]) ⊆ leaky
     hsc = SlackClaw.has_slack_credential
     @test hsc("xoxe.xoxp-1-abc") && hsc("xoxr-1-abc") && hsc("Bearer xoxb-1-2") && hsc("xwfp-1")
     @test hsc("https://hooks.slack.com/services/T0/B0/x") && hsc("hooks.Slack-Gov.com:443/x")
