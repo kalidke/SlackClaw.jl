@@ -142,8 +142,10 @@ never shows in another thread. To use it, tell Claude in `system_prompt` to writ
 progress to the file named by `$SLACKCLAW_STATUS` when that variable is set:
 listen and proactive runs have no thread to post progress in, so they get no
 status file. A repository that ignores the file needs the pattern
-`.slackclaw_status*` (with the star). A `.slackclaw_status` left by 0.7.4 or
-earlier is no longer read or removed; delete it by hand.
+`.slackclaw_status*` (with the star; or `<status_file>*` for a channel that sets
+`status_file`). The single status file 0.7.4 and earlier used (`.slackclaw_status`,
+or the `status_file` a channel set) is no longer read or removed; delete one left
+behind by hand.
 
 ## What the Claude child receives
 
@@ -171,21 +173,22 @@ and the run follows prompts any channel member can write. It inherits only
   the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`, except
   `CLAUDE_CODE_OAUTH_TOKEN`; those never pass, not even through
   `child_env_passthrough`, so set such options in Claude Code's `settings.json`);
-- whatever the channel's `child_env_passthrough` lists: a name, or a prefix
-  ending in `*` (for example `["MYTOOL_*", "ZOTERO_API_KEY", "GH_TOKEN"]`). No
-  prefix, built in or the channel's, passes a name that looks like a secret (one
-  containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`,
-  `COOKIE` or the word `PAT`) or git's numbered settings (`GIT_CONFIG_COUNT`,
-  `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, which work only together): a
-  channel names such a variable exactly.
+- the variables the channel names in `child_env_passthrough`, by exact name
+  (for example `["ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID", "GH_TOKEN"]`; an entry
+  ending in `*` is not a prefix, and is logged once and ignored).
+
+None of the built-in prefixes passes a name that looks like a secret (one
+containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`, `COOKIE`
+or the word `PAT`, such as a `CLAUDE_SESSION_KEY`): such a variable passes only
+by exact name.
 
 Three more rules hold over all of it. A variable whose value holds a Slack
 token or webhook URL anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other
-`xox` token, alone or in a header, or an incoming-webhook URL on
-`hooks.slack.com` or `hooks.slack-gov.com`) never passes, even when
-`child_env_passthrough` names it. This recognizes tokens by their shape: a
-Slack app's signing or client secret has none, so keep such a variable out of
-`child_env_passthrough` (a prefix entry already skips it by its name). A URL
+`xox` token, a session cookie `xoxd-`, alone or in a header, or an
+incoming-webhook URL on `hooks.slack.com` or `hooks.slack-gov.com`) never
+passes, even when `child_env_passthrough` names it. This recognizes tokens by
+their shape: a Slack app's signing or client secret has none, so keep such a
+variable out of `child_env_passthrough`. A URL
 with a user name or password, such as a proxy with its password (with or without
 `http://`), passes only when `child_env_passthrough` names the variable exactly.
 And the variables SlackClaw sets for each run are never inherited:

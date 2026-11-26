@@ -370,6 +370,21 @@ end
         @test !haskey(env, "SLACK_BOT_TOKEN")
         # with no thread there is no upload context
         @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
+
+        # A run that cannot start (its repo_dir is gone) reports the error and the
+        # folder only: the spawn error's own text holds the whole environment, and
+        # this reason is posted to Slack
+        gone = joinpath(dir, "moved-away")
+        cfg_gone = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                                   app_token="xapp-1-A111-2222-testworkspaceapp", repo_dir=gone,
+                                   claude_max_retries=0)
+        r = withenv(parent..., "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
+            SlackClaw.run_claude("hi", cfg_gone; thread_ts="1700000001.000100", channel_id="C0ENV")
+        end
+        @test !r.success
+        @test occursin("failed to start claude in $gone", r.result_text)
+        @test !occursin("xoxb-", r.result_text) && !occursin("MARK7", r.result_text) &&
+              !occursin("PATH=", r.result_text)
     end
 end
 
@@ -975,34 +990,41 @@ end
         @test envnames(fce(Dict(k => "v"))) == Set([k])
     end
     for k in SlackClaw.SLACKCLAW_RUN_VARS
-        @test isempty(fce(Dict(k => "v"), [k, "SLACKCLAW_*"]))
+        @test isempty(fce(Dict(k => "v"), [k]))
     end
     @test isempty(fce(Dict("MY_APP_VALUE" => "xapp-1-A111-2222-abc"), ["MY_APP_VALUE"]))
-    # no prefix, built in or the channel's, passes a secret-looking name: a usage
-    # monitor's session key under CLAUDE_, a Slack cookie, a GitHub PAT, git's
-    # numbered settings (which work only together)
+    # no built-in prefix passes a secret-looking name: a usage monitor's session key
+    # under CLAUDE_, a token under JULIA_, git's numbered settings would need GIT_ (not
+    # a prefix here); a versioned directory keeps PATH
     odd = Dict("CLAUDE_SESSION_KEY" => "sk-dummy", "CLAUDE_CONFIG_DIR" => "/cc",
-               "SLACK_COOKIE" => "xoxd-abc%2Fdummy", "GITHUB_PAT" => "ghp_dummy",
-               "GITHUB_REPOSITORY" => "lab/project", "GIT_CONFIG_COUNT" => "1",
-               "GIT_CONFIG_KEY_0" => "http.extraHeader", "GIT_CONFIG_VALUE_0" => "Authorization: dummy",
+               "JULIA_PKG_TOKEN" => "dummy", "JULIA_NUM_THREADS" => "4",
                "PATH" => "/usr/bin:/opt/xapp-1.2/bin")
-    @test envnames(fce(odd, ["SLACK_*", "GITHUB_*", "GIT_*"])) == Set(["CLAUDE_CONFIG_DIR", "GITHUB_REPOSITORY", "PATH"])
+    @test envnames(fce(odd)) == Set(["CLAUDE_CONFIG_DIR", "JULIA_NUM_THREADS", "PATH"])
+    sn = SlackClaw.secret_name
+    @test all(sn, ("A_TOKEN", "A_SECRET", "A_PASSWORD", "A_PASSWD", "API_KEY", "A_CREDENTIALS",
+                   "SLACK_WEBHOOK", "SLACK_COOKIE", "GITHUB_PAT", "x_token", "GIT_CONFIG_COUNT",
+                   "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_12", "GIT_CONFIG_PARAMETERS"))
+    @test !any(sn, ("PATH", "JULIA_NUM_THREADS", "GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME"))
     @test isempty(fce(Dict("SLACK_COOKIE" => "xoxd-abc%2Fdummy"), ["SLACK_COOKIE"]))
-    # extras by name or by prefix; a prefix never passes a secret-looking name, a channel names it
-    extra = envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_*"]))
-    @test extra ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
-    @test !("ZOTERO_API_KEY" in extra)
-    @test "ZOTERO_API_KEY" in envnames(fce(monitor, ["ZOTERO_API_KEY"]))
+    # child_env_passthrough takes exact names: an entry ending in * is logged once and ignored
+    logs, extra = Test.collect_test_logs() do
+        envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_API_KEY"]))
+    end
+    @test extra ⊇ Set(["GH_TOKEN", "ZOTERO_API_KEY"])
+    @test !("MY_TOOL_HOME" in extra)
+    @test any(l -> occursin("ignoring the entry MY_TOOL_*", string(l.message)), logs)
     # a proxy carrying a password, with or without a URL scheme, passes only when the
-    # channel names it exactly
+    # channel names it, and its drop is named in the log
     @test "HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_PROXY"]))
     @test "https_proxy" in envnames(fce(monitor, ["https_proxy"]))
-    @test !("HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_*"])))
+    @test_logs (:warn, r"not passing ALL_PROXY") fce(Dict("ALL_PROXY" => "socks5://u:p@proxy:1080"))
     # a Slack credential never passes, whatever names it (a token alone, in a header, a
-    # workflow token, a webhook URL on either Slack domain); Slack's app secrets never
-    # pass through a prefix; the variables SlackClaw sets per run are never inherited
-    leaky = envnames(fce(monitor, ["SLACK_*", "OTHER_SLACK_TOKEN", "SLACK_HELPER_AUTH", "SLACK_GOV_HOOK",
-                                   "SLACK_WORKFLOW", "SLACKCLAW_*", "SLACKCLAW_STATUS"]))
+    # workflow token, a webhook URL on either Slack domain); the variables SlackClaw sets
+    # per run are never inherited
+    leaky = envnames(fce(monitor, ["SLACK_CHANNEL_ID_X", "SLACK_BOT_TOKEN_WS1", "SLACK_APP_TOKEN_WS1",
+                                   "OTHER_SLACK_TOKEN", "SLACK_WEBHOOK_URL", "SLACK_HELPER_AUTH",
+                                   "SLACK_GOV_HOOK", "SLACK_WORKFLOW", "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS",
+                                   "SLACKCLAW_THREAD_TS", "SLACKCLAW_CH_ONE", "SLACKCLAW_UPLOAD_COMMENT"]))
     @test "SLACK_CHANNEL_ID_X" in leaky
     @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_WS1", "SLACK_APP_TOKEN_WS1", "OTHER_SLACK_TOKEN",
                                         "SLACK_WEBHOOK_URL", "SLACK_GOV_HOOK", "SLACK_HELPER_AUTH",

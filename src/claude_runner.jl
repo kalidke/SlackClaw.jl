@@ -105,14 +105,14 @@ True when `v` holds a Slack credential anywhere in it (alone, in an
 `Authorization` header, in a URL), recognized by its shape:
 - a token: `xoxb-` bot, `xoxp-` user and the other `xox?-` kinds, and `xapp-`
   app-level, each as `<kind>-<digits>-<letter or digit>`, so a path such as
-  `/opt/xapp-tools` or `/opt/xapp-1.2` is not one; a rotating `xoxe.xox…`; a
-  workflow `xwfp-<digit>`;
+  `/opt/xapp-tools` or `/opt/xapp-1.2` is not one (a rotating `xoxe.xoxp-…`
+  holds one); a workflow `xwfp-<digit>`;
 - a session cookie `xoxd-…`, which may go on with a letter;
 - an incoming-webhook URL (`hooks.slack.com` or GovSlack's
   `hooks.slack-gov.com`, any letter case, any port).
 """
 has_slack_credential(v::AbstractString) =
-    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%]|xoxe\.xox|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%]|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
 
 """
 True when `v`, the value of variable `k`, holds a URL with a user name or
@@ -128,8 +128,8 @@ holds a secret (containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`,
 `WEBHOOK`, `COOKIE`, or the word `PAT`, any case), and git's numbered settings
 (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`,
 `GIT_CONFIG_PARAMETERS`), which work only as a whole and can carry an
-`http.extraHeader`. No prefix, built in or in `child_env_passthrough`, passes
-such a name.
+`http.extraHeader`. No prefix in [`CHILD_ENV_PREFIXES`](@ref) passes such a
+name; it passes only by exact name.
 """
 secret_name(k::AbstractString) =
     occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK|COOKIE|(^|_)PAT($|_)"i, k) ||
@@ -143,8 +143,9 @@ allow list, not the monitor's whole environment, since the child runs prompts
 any channel member can write and a fleet's environment holds every workspace's
 Slack tokens and other credentials (issue #11). A variable passes when its name
 is in [`CHILD_ENV_NAMES`](@ref), starts with one of
-[`CHILD_ENV_PREFIXES`](@ref), or matches an entry of `passthrough`
-(`config.child_env_passthrough`: a name, or a prefix ending in `*`).
+[`CHILD_ENV_PREFIXES`](@ref), or is named in `passthrough`
+(`config.child_env_passthrough`: exact names; an entry ending in `*` is not a
+prefix, and is logged once and ignored).
 
 Exceptions:
 - **Nested-session detection vars.** `CLAUDECODE` and `CLAUDE_CODE_*` are
@@ -157,19 +158,19 @@ Exceptions:
   ([`has_slack_credential`](@ref)) never passes, even when `passthrough` names it.
 - **A URL with a user name or password** ([`has_url_credential`](@ref)), such
   as a proxy with its password, passes only when `passthrough` names the
-  variable exactly, not through the allow list or a prefix.
-- **A secret-looking name** ([`secret_name`](@ref)) never passes through a
-  prefix, one of [`CHILD_ENV_PREFIXES`](@ref) or a prefix entry of
-  `passthrough`; it passes only by exact name (`CLAUDE_CODE_OAUTH_TOKEN` is in
-  [`CHILD_ENV_NAMES`](@ref) for that reason).
+  variable, not through the allow list or a prefix.
+- **A secret-looking name** ([`secret_name`](@ref)) never passes through one of
+  [`CHILD_ENV_PREFIXES`](@ref); it passes only by exact name
+  (`CLAUDE_CODE_OAUTH_TOKEN` is in [`CHILD_ENV_NAMES`](@ref) for that reason).
 - **[`SLACKCLAW_RUN_VARS`](@ref)** are never inherited: [`run_claude`](@ref) sets
   them for each run. Other `SLACKCLAW_*` names pass only through `passthrough`.
 """
 function filtered_child_env(env, passthrough=())
     names = String[p for p in passthrough if !endswith(p, "*")]
-    prefixes = String[chop(p) for p in passthrough if endswith(p, "*")]
-    listed(k) = k in CHILD_ENV_NAMES ||
-                (any(p -> startswith(k, p), (CHILD_ENV_PREFIXES..., prefixes...)) && !secret_name(k))
+    for p in passthrough
+        endswith(p, "*") && warn_prefix_entry(p)
+    end
+    listed(k) = k in CHILD_ENV_NAMES || (any(p -> startswith(k, p), CHILD_ENV_PREFIXES) && !secret_name(k))
     nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
     out = String[]
     for (k, v) in env
@@ -189,14 +190,21 @@ function filtered_child_env(env, passthrough=())
     return out
 end
 
-"""Names of the variables [`warn_dropped`](@ref) has logged, so each is logged once per process."""
+"""What [`warn_dropped`](@ref) has logged, so each is logged once per process."""
 const WARNED_DROPPED = Set{String}()
 
 """Log once per process that variable `k` is not passed to Claude runs, and why (never its value)."""
-function warn_dropped(k::AbstractString, why::AbstractString)
-    k in WARNED_DROPPED && return
-    push!(WARNED_DROPPED, String(k))
-    @warn "SlackClaw: not passing $k to Claude runs: its value $why"
+warn_dropped(k::AbstractString, why::AbstractString) =
+    warn_once(k, "SlackClaw: not passing $k to Claude runs: its value $why")
+
+"""Log once per process that a `child_env_passthrough` entry ending in `*` is ignored."""
+warn_prefix_entry(p::AbstractString) =
+    warn_once("entry " * p, "SlackClaw: child_env_passthrough takes exact names; ignoring the entry $p")
+
+function warn_once(key::AbstractString, msg::AbstractString)
+    key in WARNED_DROPPED && return
+    push!(WARNED_DROPPED, String(key))
+    @warn msg
 end
 
 """
@@ -370,9 +378,16 @@ function _run_claude_once(cmd::Base.AbstractCmd, timeout_s::Real)
     proc = try
         run(pipeline(ignorestatus(cmd), stdout=out, stderr=err); wait=false)
     catch e
-        # Couldn't even spawn (e.g. `claude` not on PATH)
+        # Couldn't even spawn (`claude` not on PATH, a missing repo_dir). The
+        # error's own text spells out the whole command with its environment,
+        # which holds the run's credentials, and this text is posted to Slack:
+        # report only the error's code and the folder.
+        why = e isa Base.IOError ? "$(Base.struverror(e.code)) ($(Base.uverrorname(e.code)))" :
+                                   string(nameof(typeof(e)))
+        dir = cmd isa Cmd ? cmd.dir : ""
         return (exitcode = -1, stdout = "",
-                stderr = "failed to spawn claude: $(sprint(showerror, e))", timed_out = false)
+                stderr = "failed to start claude" * (isempty(dir) ? "" : " in $dir") * ": $why",
+                timed_out = false)
     end
     close(out.in)
     close(err.in)

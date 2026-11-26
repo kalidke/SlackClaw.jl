@@ -17,13 +17,12 @@ Notable changes to SlackClaw.jl. Format follows
   need, the child's own Anthropic credential, endpoint and models (by exact
   name, so not an admin key), cloud provider profile and region names, those
   starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (the
-  nested-session variables still dropped), and what the new
-  `child_env_passthrough` config field lists (a name, or a prefix ending in
-  `*`; no prefix, built in or the channel's, passes a secret-looking name or
-  git's numbered settings, which a channel names exactly). A value holding a
-  Slack token, session cookie or webhook URL anywhere (a token alone or in a
-  header, a webhook URL) never passes, under any name; a URL carrying a user
-  name or password, such as a proxy's, passes only when the channel names the
+  nested-session variables still dropped; none of these prefixes passes a
+  secret-looking name), and the variables the new `child_env_passthrough`
+  config field names, by exact name. A value holding a Slack token, session
+  cookie or webhook URL anywhere (recognized by its shape, alone or in a
+  header) never passes, under any name; a URL carrying a user name or
+  password, such as a proxy's, passes only when the channel names the
   variable. The variables SlackClaw sets per run are never inherited. The
   channel's own bot token still reaches the run as `SLACKCLAW_BOT_TOKEN`, for
   the upload helper and channel helper scripts. A channel whose runs need a
@@ -37,6 +36,12 @@ Notable changes to SlackClaw.jl. Format follows
   run through 0.7.4 held the app-level token and any other workspace's token
   in the monitor's environment, rotating those tokens after upgrading is the
   safe course.
+- **A run that cannot start no longer posts its environment.** When `claude`
+  could not be started (a moved `repo_dir`, `claude` missing from `PATH`), the
+  failure reason posted to the thread was the spawn error's text, which spells
+  out the whole command with its environment, so its tail could carry the bot
+  token and the Anthropic key into Slack and the log carried all of it. The
+  reason is now the error and the folder only.
 
 ### Upgrading
 
@@ -44,13 +49,15 @@ Notable changes to SlackClaw.jl. Format follows
   everything outside the allow list (see the Features page), for example a
   tool's API key (`ZOTERO_API_KEY`), `GH_TOKEN`/`GITHUB_TOKEN`, cloud secret
   keys, `npm_config_*` other than the cache location, and `SLACKCLAW_*` names
-  other than those SlackClaw sets per run. A secret-looking name must be
-  listed exactly (`"ZOTERO_API_KEY"`, not `"ZOTERO_*"`). A launcher that builds
-  `SlackClawConfig` for a fleet needs a way to set `child_env_passthrough` per
-  channel. SlackClaw logs the name of a variable it drops for its value.
-- Status files are now `.slackclaw_status.<channel>.<thread ts>`: a repository
-  that ignores them needs `.slackclaw_status*`, and a `.slackclaw_status` left
-  by 0.7.4 or earlier is no longer read or removed (delete it by hand).
+  other than those SlackClaw sets per run. Entries are exact names
+  (`"ZOTERO_API_KEY"`; an entry ending in `*` is logged and ignored). A
+  launcher that builds `SlackClawConfig` for a fleet needs a way to set
+  `child_env_passthrough` per channel. SlackClaw logs the name of a variable it
+  drops for its value.
+- Status files are now `<status_file>.<channel>.<thread ts>`: a repository
+  that ignores them needs `.slackclaw_status*` (or `<status_file>*`), and the
+  single status file 0.7.4 and earlier used is no longer read or removed
+  (delete one left behind by hand).
 
 ### Fixed
 
