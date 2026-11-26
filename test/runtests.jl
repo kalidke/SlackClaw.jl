@@ -307,6 +307,146 @@ end
         "Claude stopped at the step limit before finishing."
 end
 
+# The child's inherited environment holds none of the monitor's Slack tokens or
+# other credentials: a run
+# started by the real run_claude, with a stand-in `claude` on PATH that records
+# the environment it was given. The monitor's environment here holds the
+# workspace's bot and app tokens, another workspace's bot token and an unrelated
+# key, as a fleet's does.
+@testset "run_claude child environment" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        envf = joinpath(dir, "child-env")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            env > '$envf'
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-env","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        cfg = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                              app_token="xapp-1-A111-2222-testworkspaceapp", repo_dir=dir, claude_max_retries=0)
+        parent = ("PATH" => dir * ":" * ENV["PATH"],
+                  "SLACK_BOT_TOKEN" => "xoxb-1111-2222-testworkspacebot",
+                  "SLACK_APP_TOKEN" => "xapp-1-A111-2222-testworkspaceapp",
+                  "SLACK_BOT_TOKEN_OTHER" => "xoxb-3333-4444-testotherworkspace",
+                  "SLACKCLAW_BOT_TOKEN" => "xoxb-5555-6666-testinherited",
+                  "ZOTERO_API_KEY" => "test-unrelated-key",
+                  "ANTHROPIC_ADMIN_API_KEY" => "test-admin-key",
+                  "JULIA_DEPOT_PATH" => "/test/depot")
+        child_env(; kw...) = withenv(parent...) do
+            r = SlackClaw.run_claude("hi", cfg; kw...)
+            @test r.success
+            Dict(String(first(split(l, '='; limit=2))) => String(last(split(l, '='; limit=2)))
+                 for l in eachline(envf) if occursin('=', l))
+        end
+
+        env = child_env(thread_ts="1700000001.000100", channel_id="C0ENV")
+        # no Slack token from the monitor's environment, under any name
+        for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN_OTHER")
+            @test !haskey(env, k)
+        end
+        @test !any(v -> v in ("xapp-1-A111-2222-testworkspaceapp", "xoxb-3333-4444-testotherworkspace", "xoxb-5555-6666-testinherited"),
+                   values(env))
+        # nor anything else outside the allow list, an Anthropic admin key included
+        @test !haskey(env, "ZOTERO_API_KEY")
+        @test !haskey(env, "ANTHROPIC_ADMIN_API_KEY")
+        # the child keeps what it needs to run
+        @test env["JULIA_DEPOT_PATH"] == "/test/depot"
+        @test startswith(env["PATH"], dir)
+        # the workspace bot token reaches it only as the upload helper's own variable
+        @test [k for (k, v) in env if v == "xoxb-1111-2222-testworkspacebot"] == ["SLACKCLAW_BOT_TOKEN"]
+        @test env["SLACKCLAW_THREAD_TS"] == "1700000001.000100"
+        @test env["SLACKCLAW_CHANNEL_ID"] == "C0ENV"
+        @test !haskey(env, "SLACKCLAW_STATUS")
+
+        # a run given a status file names it
+        st = SlackClaw.run_status_path(cfg, "C0ENV", "1700000001.000100")
+        @test child_env(thread_ts="1700000001.000100", channel_id="C0ENV", status_path=st)["SLACKCLAW_STATUS"] == st
+
+        # a channel can add a variable it needs, but never a Slack token
+        cfg.child_env_passthrough = ["ZOTERO_API_KEY", "SLACK_BOT_TOKEN"]
+        env = child_env()
+        @test env["ZOTERO_API_KEY"] == "test-unrelated-key"
+        @test !haskey(env, "SLACK_BOT_TOKEN")
+        # with no thread there is no upload context
+        @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
+
+        # A run that cannot start reports the error and the folder only: the spawn
+        # error's own text holds the whole environment, and this reason is posted to
+        # Slack. Neither the reason nor any log record holds a value from the run's
+        # environment. (a) its repo_dir is gone; (b) claude is not on PATH.
+        leaked(logs) = any(l -> occursin("MARK7", string(l.message)) ||
+                                any(kv -> occursin("MARK7", string(kv)) || occursin("xoxb-", string(kv)), l.kwargs),
+                           logs)
+        gone = joinpath(dir, "moved-away")
+        cfg_gone = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                                   app_token="xapp-1-A111-2222-testworkspaceapp", repo_dir=gone,
+                                   claude_max_retries=1, claude_retry_backoff_s=0.01)
+        logs, r = Test.collect_test_logs() do
+            withenv(parent..., "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
+                SlackClaw.run_claude("hi", cfg_gone; thread_ts="1700000001.000100", channel_id="C0ENV")
+            end
+        end
+        @test !r.success
+        @test occursin("failed to start claude: its folder $gone does not exist", r.result_text)
+        @test !occursin("xoxb-", r.result_text) && !occursin("MARK7", r.result_text) &&
+              !occursin("PATH=", r.result_text)
+        @test !isempty(logs) && !leaked(logs)
+        cfg_nopath = SlackClawConfig(slack_bot_token="xoxb-1111-2222-testworkspacebot", slack_channel_id="C0ENV",
+                                     repo_dir=dir, claude_max_retries=0)
+        logs, r = Test.collect_test_logs() do
+            withenv(parent..., "PATH" => joinpath(dir, "no-bin"), "ANTHROPIC_API_KEY" => "test-anthropic-key-MARK7") do
+                SlackClaw.run_claude("hi", cfg_nopath; thread_ts="1700000001.000100", channel_id="C0ENV")
+            end
+        end
+        @test occursin("failed to start claude in $dir: no such file or directory (ENOENT)", r.result_text)
+        @test !occursin("MARK7", r.result_text) && !leaked(logs)
+        # a folder written with a user name and password is shown masked
+        @test occursin("://…@", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u:MARK7@host/x"), 5).stderr)
+    end
+end
+
+# A run keeps Claude Code's own system prompt: SlackClaw's instructions go in
+# --append-system-prompt, never --system-prompt, which would replace it. The
+# stand-in `claude` records its arguments exactly (NUL-separated: the prompt
+# text holds newlines).
+@testset "run_claude keeps Claude Code's system prompt" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        argf = joinpath(dir, "args")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            printf '%s\\0' "\$@" > '$argf'
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-args","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        function argv(cfg; kw...)
+            withenv("PATH" => dir * ":" * ENV["PATH"]) do
+                @test SlackClaw.run_claude("hi", cfg; kw...).success
+            end
+            return split(read(argf, String), '\0'; keepempty=false)
+        end
+        # default settings: the channel text and the directive instructions
+        cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir, claude_max_retries=0)
+        args = argv(cfg)
+        @test "--append-system-prompt" in args
+        @test !("--system-prompt" in args)
+        text = args[findfirst(==("--append-system-prompt"), args) + 1]
+        @test text == cfg.system_prompt * "\n\n" * SlackClaw.DIRECTIVE_INSTRUCTIONS
+        # with the upload helper's thread, its instructions are added to the same text
+        if isfile(normpath(joinpath(pkgdir(SlackClaw), "bin", "slack-upload")))
+            args = argv(cfg; thread_ts="1700000001.000100", channel_id="C0")
+            @test count(==("--append-system-prompt"), args) == 1 && !("--system-prompt" in args)
+            @test endswith(args[findfirst(==("--append-system-prompt"), args) + 1], SlackClaw.UPLOAD_INSTRUCTIONS)
+        end
+        # nothing to add: neither flag
+        bare = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir, claude_max_retries=0,
+                               system_prompt="", agent_directives=false)
+        args = argv(bare)
+        @test !("--append-system-prompt" in args) && !("--system-prompt" in args)
+    end
+end
+
 @testset "chunk_text" begin
     ct = SlackClaw.chunk_text
 
@@ -860,6 +1000,116 @@ end
     # The setup-token credential survives the CLAUDE_CODE_ prefix strip —
     # it is the child's only auth path (stripping it broke every child's auth)
     @test "CLAUDE_CODE_OAUTH_TOKEN=dummy-token-for-test" in child
+
+    # An allow list, not the monitor's whole environment
+    monitor = Dict(
+        "PATH" => "/usr/bin:/opt/myxapp-1/bin:/opt/xapp-tools/bin", "HOME" => "/home/xapp-build",
+        "LC_ALL" => "C.UTF-8", "XDG_CACHE_HOME" => "/c", "JULIA_DEPOT_PATH" => "/d", "JULIAUP_DEPOT_PATH" => "/j",
+        "ANTHROPIC_API_KEY" => "dummy-anthropic-key", "TMPDIR" => "/t",
+        "ANTHROPIC_ADMIN_API_KEY" => "dummy-admin-key", "ANTHROPIC_FOUNDRY_RESOURCE" => "lab-res",
+        "AWS_PROFILE" => "lab-bedrock", "AWS_REGION" => "us-west-2", "AWS_SECRET_ACCESS_KEY" => "s",
+        "NODE_USE_SYSTEM_CA" => "1", "NODE_OPTIONS" => "--use-openssl-ca", "npm_config_cache" => "/n",
+        "GIT_AUTHOR_NAME" => "Lab Bot", "GIT_AUTHOR_EMAIL" => "bot@lab.example",
+        "GH_CONFIG_DIR" => "/g", "GH_REPO" => "lab/project", "GIT_SSL_CAINFO" => "/ca.pem",
+        "DISABLE_AUTOUPDATER" => "1", "CUDA_VISIBLE_DEVICES" => "0",
+        "HTTP_PROXY" => "http://proxy.lab:3128", "HTTPS_PROXY" => "http://svc:dummy-pass@proxy.lab:3128",
+        "https_proxy" => "svc:dummy-pass@proxy.lab:3128",
+        "SLACK_BOT_TOKEN_WS1" => "xoxb-1111-2222-abc", "SLACK_APP_TOKEN_WS1" => "xapp-1-A111-2222-abc",
+        "SLACK_CHANNEL_ID_X" => "C123", "SLACKCLAW_CH_ONE" => "C456",
+        "SLACK_SIGNING_SECRET" => "dummysigningsecret", "SLACK_CLIENT_SECRET" => "dummyclientsecret",
+        "SLACKCLAW_UPLOAD_COMMENT" => "from the lab bot", "SLACKCLAW_STATUS" => "/inherited/status",
+        "SLACKCLAW_THREAD_TS" => "1700000000.000001",
+        "SLACKCLAW_BOT_TOKEN" => "xoxb-5555-6666-inherited", "ZOTERO_API_KEY" => "z",
+        "GH_TOKEN" => "g", "MY_TOOL_HOME" => "/m", "MY_TOOL_MODE" => "x",
+        "OTHER_SLACK_TOKEN" => "xoxp-1-2-3-usertoken",
+        "SLACK_WEBHOOK_URL" => "https://hooks.slack.com/services/T0/B0/dummy",
+        "SLACK_GOV_HOOK" => "https://HOOKS.slack-gov.com:443/services/T0/B0/dummy",
+        "SLACK_HELPER_AUTH" => "Authorization: Bearer xoxb-9-9-abc",
+        "SLACK_WORKFLOW" => "xwfp-1-abc",
+    )
+    envnames(env) = Set(first(split(e, '='; limit=2)) for e in env)
+    @test envnames(fce(monitor)) == Set(["PATH", "HOME", "LC_ALL", "XDG_CACHE_HOME", "JULIA_DEPOT_PATH",
+                                      "JULIAUP_DEPOT_PATH", "ANTHROPIC_API_KEY", "TMPDIR",
+                                      "ANTHROPIC_FOUNDRY_RESOURCE", "AWS_PROFILE", "AWS_REGION",
+                                      "NODE_USE_SYSTEM_CA", "NODE_OPTIONS", "npm_config_cache",
+                                      "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GH_CONFIG_DIR", "GH_REPO",
+                                      "GIT_SSL_CAINFO", "DISABLE_AUTOUPDATER", "CUDA_VISIBLE_DEVICES",
+                                      "HTTP_PROXY"])
+    # a variable dropped for its value alone is named in the log, once, and no part of
+    # the log record holds its value
+    logs, _ = Test.collect_test_logs() do
+        fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-MARKER9x"))
+    end
+    @test length(logs) == 1 && occursin("not passing SSL_CERT_DIR to Claude runs", string(logs[1].message))
+    @test !occursin("MARKER9", string(logs[1].message)) && !any(kv -> occursin("MARKER9", string(kv)), logs[1].kwargs)
+    @test_logs fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-x"))
+    # each exact selector passes on its own, each reserved name is dropped on its own,
+    # and an app token under a name the channel lists exactly is still dropped
+    for k in ("GH_HOST", "ANTHROPIC_FOUNDRY_BASE_URL", "GIT_SSL_CAINFO", "CLAUDE_CODE_OAUTH_TOKEN")
+        @test envnames(fce(Dict(k => "v"))) == Set([k])
+    end
+    # the five names SlackClaw sets per run, listed here on their own: never inherited,
+    # even when a channel names one
+    for k in ("SLACKCLAW_THREAD_TS", "SLACKCLAW_CHANNEL_ID", "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_UPLOAD",
+              "SLACKCLAW_STATUS")
+        @test isempty(fce(Dict(k => "v"), [k]))
+    end
+    @test isempty(fce(Dict("MY_APP_VALUE" => "xapp-1-A111-2222-abc"), ["MY_APP_VALUE"]))
+    # no built-in prefix passes a secret-looking name: a usage monitor's session key
+    # under CLAUDE_, a token under JULIA_; a versioned directory keeps PATH
+    odd = Dict("CLAUDE_SESSION_KEY" => "sk-dummy", "CLAUDE_CONFIG_DIR" => "/cc",
+               "JULIA_PKG_TOKEN" => "dummy", "JULIA_NUM_THREADS" => "4",
+               "PATH" => "/usr/bin:/opt/xapp-1.2/bin:/opt/xoxb-1.2/bin:/opt/xoxe.xox-tools/bin")
+    @test envnames(fce(odd)) == Set(["CLAUDE_CONFIG_DIR", "JULIA_NUM_THREADS", "PATH"])
+    sn = SlackClaw.secret_name
+    @test all(sn, ("A_TOKEN", "A_SECRET", "A_PASSWORD", "A_PASSWD", "API_KEY", "A_CREDENTIALS",
+                   "SLACK_WEBHOOK", "SLACK_COOKIE", "GITHUB_PAT", "x_token", "a_Key"))
+    @test !any(sn, ("PATH", "JULIA_NUM_THREADS", "GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME", "PATTERN_DIR"))
+    @test isempty(fce(Dict("SLACK_COOKIE" => "xoxd-abc%2Fdummy"), ["SLACK_COOKIE"]))
+    # child_env_passthrough takes exact names: an entry ending in * is logged once (across
+    # runs) and ignored; an entry that is not a name and a * is never echoed
+    logs, extra = Test.collect_test_logs() do
+        envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_API_KEY"]))
+    end
+    @test extra ⊇ Set(["GH_TOKEN", "ZOTERO_API_KEY"])
+    @test !("MY_TOOL_HOME" in extra)
+    @test count(l -> occursin("ignoring the entry MY_TOOL_*", string(l.message)), logs) == 1
+    logs, _ = Test.collect_test_logs(() -> fce(monitor, ["MY_TOOL_*"]))
+    @test isempty(logs)
+    logs, _ = Test.collect_test_logs(() -> fce(monitor, ["MY_SECRET=MARK5abc*"]))
+    @test length(logs) == 1 && !occursin("MARK5", string(logs[1].message))
+    # a proxy carrying a password, with or without a URL scheme, passes only when the
+    # channel names it, and its drop is named in the log without its value
+    @test "HTTPS_PROXY" in envnames(fce(monitor, ["HTTPS_PROXY"]))
+    @test "https_proxy" in envnames(fce(monitor, ["https_proxy"]))
+    logs, _ = Test.collect_test_logs(() -> fce(Dict("ALL_PROXY" => "socks5://u:MARK6@proxy:1080")))
+    @test length(logs) == 1 && occursin("not passing ALL_PROXY", string(logs[1].message))
+    @test !occursin("MARK6", string(logs[1].message)) && !any(kv -> occursin("MARK6", string(kv)), logs[1].kwargs)
+    # a Slack credential never passes, whatever names it (a token alone, in a header, a
+    # workflow token, a webhook URL on either Slack domain); the variables SlackClaw sets
+    # per run are never inherited
+    leaky = envnames(fce(monitor, ["SLACK_CHANNEL_ID_X", "SLACK_BOT_TOKEN_WS1", "SLACK_APP_TOKEN_WS1",
+                                   "OTHER_SLACK_TOKEN", "SLACK_WEBHOOK_URL", "SLACK_HELPER_AUTH",
+                                   "SLACK_GOV_HOOK", "SLACK_WORKFLOW", "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS",
+                                   "SLACKCLAW_THREAD_TS", "SLACKCLAW_CH_ONE", "SLACKCLAW_UPLOAD_COMMENT"]))
+    @test "SLACK_CHANNEL_ID_X" in leaky
+    @test isempty(intersect(leaky, Set(["SLACK_BOT_TOKEN_WS1", "SLACK_APP_TOKEN_WS1", "OTHER_SLACK_TOKEN",
+                                        "SLACK_WEBHOOK_URL", "SLACK_GOV_HOOK", "SLACK_HELPER_AUTH",
+                                        "SLACK_WORKFLOW", "SLACK_SIGNING_SECRET", "SLACK_CLIENT_SECRET",
+                                        "SLACKCLAW_BOT_TOKEN", "SLACKCLAW_STATUS", "SLACKCLAW_THREAD_TS"])))
+    # SlackClaw's other variables pass when the channel names them
+    @test Set(["SLACKCLAW_CH_ONE", "SLACKCLAW_UPLOAD_COMMENT"]) ⊆ leaky
+    hsc = SlackClaw.has_slack_credential
+    @test hsc("xoxe.xoxp-1-abc") && hsc("xoxr-1-abc") && hsc("Bearer xoxb-1-2") && hsc("xwfp-1")
+    @test hsc("https://hooks.slack.com/services/T0/B0/x") && hsc("hooks.Slack-Gov.com:443/x")
+    @test !hsc("C0123") && !hsc("/usr/bin") && !hsc("/opt/myxapp-1/bin") && !hsc("/opt/xapp-tools/bin")
+    @test !hsc("/opt/xapp-1.2/bin") && hsc("xoxd-abc%2Fdef") && hsc("d=xoxd-1abc")
+    @test hsc("xoxd-%2Fabc") && hsc("xoxd-+abc") && hsc("xoxd-/abc")
+    @test !hsc("/opt/xoxb-1.2/bin") && !hsc("/opt/xoxe.xox-tools/bin")
+    huc = SlackClaw.has_url_credential
+    @test huc("X", "http://u:p@proxy:3128") && !huc("X", "http://proxy:3128")
+    @test huc("https_proxy", "u:p@proxy:3128") && !huc("https_proxy", "proxy:3128")
+    @test !huc("GIT_AUTHOR_EMAIL", "bot@lab.example")
 end
 
 @testset "generate_manifest" begin
@@ -904,6 +1154,7 @@ posted = String[]
 posted_to = Tuple{String,String}[]  # (thread_ts, channel_id) of each post_response
 slack_log = String[]                # post_response and reaction calls, in order
 top_posted = String[]
+top_posted_to = String[]            # thread_ts of each slack_post_message, beside top_posted
 reacted = String[]
 unreacted = String[]
 prompts = String[]
@@ -919,7 +1170,8 @@ Core.eval(SlackClaw, quote
                        thread_ts::AbstractString="",
                        channel_id::AbstractString=config.slack_channel_id) =
         ($top_hook[] === nothing || $top_hook[](text);
-         push!($slack_log, "top"); push!($top_posted, String(text)); $post_ts[])
+         push!($slack_log, "top"); push!($top_posted, String(text));
+         push!($top_posted_to, String(thread_ts)); $post_ts[])
     post_response(config::SlackClawConfig, text::AbstractString, thread_ts::AbstractString;
                   channel_id::AbstractString=config.slack_channel_id) =
         ($post_hook[] === nothing || $post_hook[](thread_ts);
@@ -1377,9 +1629,9 @@ mkstate(cfg) = SlackClaw.MonitorState(
                                          claude_max_retries=0, status_file="ro/status",
                                          state_file="ro-state.json")
                 state_ro = mkstate(cfg_ro)
-                mkpath(f("ro")); write(f("ro/status"), "working")
-                chmod(f("ro"), 0o555)
                 T = "1700000890.000000"
+                mkpath(f("ro")); write(SlackClaw.run_status_path(cfg_ro, "C0", T), "working")
+                chmod(f("ro"), 0o555)
                 clear_logs!()
                 next_run(stderr=auth_fail, code=1)
                 SlackClaw.dispatch_command!(state_ro, SlackMessage(T, "U9", "deploy", ""))
@@ -1510,11 +1762,11 @@ mkstate(cfg) = SlackClaw.MonitorState(
 
             # 33. A run clears the status file it may have left
             T = "1700000992.000000"
-            write(joinpath(dir, cfg.status_file), "halfway")
+            write(SlackClaw.run_status_path(cfg, cfg.slack_channel_id, T), "halfway")
             next_run(stdout=ok_json("s-status") * "\n")
             SlackClaw.dispatch_command!(state, SlackMessage(T, "U9", "status", ""))
             foreach(wait, state.active_tasks)
-            @test !isfile(joinpath(dir, cfg.status_file))
+            @test !isfile(SlackClaw.run_status_path(cfg, cfg.slack_channel_id, T))
 
             # 34. A late top-level message whose thread is tracked and idle (a
             #     reply under it ran first: Slack's me_message status posts are
@@ -1743,11 +1995,101 @@ end
     @test !ClaudeResult(true, "ok", 1, 0.0, "s").session_missing
 end
 
+# Two runs at once in one channel never share a status file: each child writes
+# progress to the file it is given (SLACKCLAW_STATUS; a child given none writes
+# the documented .slackclaw_status in its working directory, as a prompt naming
+# it would), and each thread's status posts carry only its own run's progress.
+# Real run_claude and agent loop, Slack stubbed.
+@testset "status file per run" begin
+    if Sys.isunix()
+        dir = mktempdir()
+        log = joinpath(dir, "status-paths")
+        stale = joinpath(dir, "stale-at-start")
+        write(joinpath(dir, "claude"), """
+            #!/bin/sh
+            p="\${SLACKCLAW_STATUS:-.slackclaw_status}"
+            echo "\$SLACKCLAW_THREAD_TS \$p" >> '$log'
+            [ -e "\$p" ] && echo "\$SLACKCLAW_THREAD_TS" >> '$stale'
+            echo "working on \$SLACKCLAW_THREAD_TS" > "\$p"
+            sleep 3
+            echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-st","num_turns":1}'
+            """)
+        chmod(joinpath(dir, "claude"), 0o755)
+        cfg = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir,
+                              claude_max_retries=0, status_poll_s=1)
+        state = mkstate(cfg)
+        empty!(top_posted); empty!(top_posted_to); empty!(posted)
+        TA, TB = "1700002001.000000", "1700002002.000000"
+        # a file an earlier run in thread A left behind (the monitor stopped mid-run)
+        write(SlackClaw.run_status_path(cfg, "C0", TA), "left by an earlier run")
+        withenv("PATH" => dir * ":" * ENV["PATH"]) do
+            SlackClaw.dispatch_command!(state, SlackMessage(TA, "U9", "job a", ""))
+            SlackClaw.dispatch_command!(state, SlackMessage(TB, "U9", "job b", ""))
+            foreach(wait, state.active_tasks)
+        end
+        paths = Dict(String(first(split(l))) => String(last(split(l))) for l in eachline(log))
+        @test length(paths) == 2
+        @test paths[TA] != paths[TB]
+        @test paths[TA] == SlackClaw.run_status_path(cfg, "C0", TA)
+        # each thread got its own run's progress, and only that
+        status = [(t, x) for (t, x) in zip(top_posted_to, top_posted) if startswith(x, "_Status:")]
+        for T in (TA, TB)
+            mine = [x for (t, x) in status if t == T]
+            @test !isempty(mine)
+            @test all(==("_Status: working on $(T)_"), mine)
+        end
+        # each run removes its own file when it ends, and the earlier run's file was
+        # gone before the child started, so its content was never posted
+        @test !isfile(paths[TA]) && !isfile(paths[TB])
+        @test !isfile(stale)
+        @test !any(x -> occursin("earlier run", x), top_posted)
+        @test length(posted) == 2
+    end
+    # the path names the channel too: the same thread ts in two channels (fleet
+    # channels sharing a repo_dir) gives two files; and it is absolute, since the
+    # child starts in repo_dir and would resolve a relative path from there
+    cfg2 = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir="examples")
+    T = "1700002003.000000"
+    @test SlackClaw.run_status_path(cfg2, "C1", T) != SlackClaw.run_status_path(cfg2, "C2", T)
+    @test isabspath(SlackClaw.run_status_path(cfg2, "C1", T))
+    @test SlackClaw.run_status_path(cfg2, "C1", T) == joinpath(abspath("examples"), ".slackclaw_status.C1.$T")
+
+    # When the monitor starts it removes its primary channel's leftover status files
+    # (a run the monitor stopped mid-way), and only those: another channel's sharing
+    # the repo_dir, a backup beside a leftover, and unrelated files stay. Checked
+    # through start_monitor (Slack's auth call stubbed), so the sweep's call is too.
+    # The saved state still holds a thread of channel C9 (moved to another
+    # monitor): its file stays too.
+    d = mktempdir()
+    cfg3 = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=d)
+    t1, t2, t3, t4 = "1700000001.000000", "1700000002.000000", "1700000003.000000", "1700000004.000000"
+    for (ch, ts) in (("C0", t1), ("C0", t2), ("C9", t3), ("C1", t4))
+        write(SlackClaw.run_status_path(cfg3, ch, ts), "left")
+    end
+    backup = SlackClaw.run_status_path(cfg3, "C0", t1) * ".bak"
+    write(backup, "kept by hand")
+    versioned = SlackClaw.status_prefix(cfg3, "C0") * "1.2"
+    write(versioned, "kept by hand")
+    write(joinpath(d, ".slackclaw_status"), "old shared file")
+    write(joinpath(d, "notes.txt"), "keep")
+    saved = mkstate(cfg3)
+    saved.threads[t3] = SlackClaw.ThreadSession(t3, "s-c9", t3, time(), "C9")
+    SlackClaw.save_state!(saved)
+    Core.eval(SlackClaw, :(slack_auth_test(config::SlackClawConfig) = "UBOT"))
+    SlackClaw.start_monitor(cfg3)
+    @test sort(readdir(d)) == sort([".slackclaw_status", "notes.txt", basename(backup), basename(versioned),
+                                    basename(cfg3.state_file),
+                                    basename(SlackClaw.run_status_path(cfg3, "C9", t3)),
+                                    basename(SlackClaw.run_status_path(cfg3, "C1", t4))])
+    @test SlackClaw.sweep_status_files(cfg3) == 0
+end
+
 # From here on run_claude is a stub too.
 claude_throws = Ref(false)  # the stub throws, as if run_claude itself failed
 Core.eval(SlackClaw, quote
     function run_claude(prompt::String, config::SlackClawConfig;
-                        session_id::String="", thread_ts::String="", channel_id::String="")
+                        session_id::String="", thread_ts::String="", channel_id::String="",
+                        status_path::String="")
         push!($prompts, prompt)
         $claude_throws[] && error("simulated failure inside run_claude")
         return ClaudeResult(true, $claude_reply[], 1, 0.0, "sess-skip")
@@ -1817,9 +2159,28 @@ end)
     SlackClaw.run_agent_loop!(state_w, "1700000802.000000", "scheduled check", ""; channel_id="C0")
     foreach(wait, state_w.active_tasks)
     claude_throws[] = false
-    write(joinpath(cfg_w.repo_dir, cfg_w.status_file), "still here")
+    write(SlackClaw.run_status_path(cfg_w, "C0", "1700000802.000000"), "still here")
     sleep(2.5)
     @test !any(t -> occursin("Status:", t), top_posted)
+
+    # Naming the run's status file can fail (a relative repo_dir after the working
+    # folder was removed): the thread is still released, with one failure reply
+    here = pwd()
+    cwd_gone = mktempdir()
+    cd(cwd_gone)
+    rm(cwd_gone)
+    try
+        cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir="relative-repo")
+        @test_throws Base.IOError SlackClaw.run_status_path(cfg_p, "C0", "1700000803.000000")
+        state_p = mkstate(cfg_p)
+        empty!(top_posted)
+        SlackClaw.run_agent_loop!(state_p, "1700000803.000000", "check", ""; channel_id="C0")
+        foreach(wait, state_p.active_tasks)
+        @test !haskey(state_p.busy_threads, "1700000803.000000")
+        @test length(top_posted) == 1 && endswith(top_posted[1], SlackClaw.FAILED_RUN_RETRY_LINE)
+    finally
+        cd(here)
+    end
 end
 
 # Pins the skip gate's placement: a skipped reply must post nothing and add no

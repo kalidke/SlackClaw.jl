@@ -4,6 +4,86 @@ Notable changes to SlackClaw.jl. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project uses
 [Semantic Versioning](https://semver.org/) (pre-1.0, so minor bumps may break).
 
+## [Unreleased] — 0.7.5-DEV
+
+### Security
+
+- **The Claude child gets an allow-listed environment** (issue #11). It
+  inherited the monitor's whole environment except the nested-session
+  variables, so every run, following prompts any channel member can write,
+  held the workspace's app-level token, every other workspace's bot token in
+  a fleet's environment, and any other credential the monitor had. It now
+  inherits only the variables a shell, git, `gh`, the CLI and its HTTP client
+  need, the child's own Anthropic credential, endpoint and models (by exact
+  name, so not an admin key), cloud provider profile and region names, those
+  starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (the
+  nested-session variables still dropped; none of these prefixes passes a
+  secret-looking name), and the variables the new `child_env_passthrough`
+  config field names, by exact name. A value holding a Slack token, session
+  cookie or webhook URL anywhere (recognized by its shape, alone or in a
+  header) never passes, under any name; a URL carrying a user name or
+  password, such as a proxy's, passes only when the channel names the
+  variable. The variables SlackClaw sets per run are never inherited. The
+  channel's own bot token still reaches the run as `SLACKCLAW_BOT_TOKEN`, for
+  the upload helper and channel helper scripts. A channel whose runs need a
+  variable outside the allow list (an API key for a tool, `GH_TOKEN`) lists it
+  in `child_env_passthrough` before upgrading.
+- **Not a sandbox.** The allow list covers the environment a run inherits. A
+  run is the monitor's own OS user and can still read the files the monitor
+  can (`slackclaw.env`, which `setup()` writes into `repo_dir` by default, a
+  shell startup file that exports tokens) and the monitor's process
+  environment. Keep token files out of the folders runs work in. Since every
+  run through 0.7.4 held the app-level token and any other workspace's token
+  in the monitor's environment, rotating those tokens after upgrading is the
+  safe course.
+- **A run that cannot start no longer posts its environment.** When `claude`
+  could not be started (a moved `repo_dir`, `claude` missing from `PATH`), the
+  failure reason posted to the thread was the spawn error's text, which spells
+  out the whole command with its environment, so its tail could carry the bot
+  token and the Anthropic key into Slack and the log carried all of it. The
+  reason is now the error and the folder only.
+
+### Changed
+
+- **Runs keep Claude Code's own system prompt.** SlackClaw's instructions (the
+  channel's `system_prompt`, the directive instructions and the upload
+  instructions) were passed with `--system-prompt`, which replaces Claude
+  Code's built-in system prompt, so runs started from Slack lacked its
+  instructions on using its tools, on confirming before hard-to-reverse or
+  outward-facing actions, and on citing code. They are now passed with
+  `--append-system-prompt` and follow the built-in prompt. The text SlackClaw
+  sends is unchanged; each run reads a few thousand more input tokens.
+
+### Upgrading
+
+- Variables runs no longer inherit unless listed in `child_env_passthrough`:
+  everything outside the allow list (see the Features page), for example a
+  tool's API key (`ZOTERO_API_KEY`), `GH_TOKEN`/`GITHUB_TOKEN`, cloud secret
+  keys, `npm_config_*` other than the cache location, and `SLACKCLAW_*` names
+  other than those SlackClaw sets per run. Entries are exact names
+  (`"ZOTERO_API_KEY"`; an entry ending in `*` is logged and ignored). A
+  launcher that builds `SlackClawConfig` for a fleet needs a way to set
+  `child_env_passthrough` per channel. SlackClaw logs the name of a variable it
+  drops for its value.
+- Status files are now `<status_file>.<channel>.<thread ts>`: a repository
+  that ignores them needs `.slackclaw_status*` (or `<status_file>*`), and the
+  single status file 0.7.4 and earlier used is no longer read or removed
+  (delete one left behind by hand).
+
+### Fixed
+
+- **Each run has its own status file.** All runs in a `repo_dir` watched one
+  `.slackclaw_status`, so with two runs at once one run's progress was posted
+  in the other's thread, and the first to finish deleted the other's file. A
+  run's status file is now `<status_file>.<channel>.<thread ts>` in
+  `repo_dir` (as an absolute path), given to the child as `SLACKCLAW_STATUS`;
+  it is removed when the run ends and when the next run in the thread starts,
+  and the monitor removes its channel's leftovers when it starts (a run it
+  stopped mid-way). A prompt that tells Claude to write `.slackclaw_status` must name
+  `$SLACKCLAW_STATUS` instead, when that variable is set (listen and proactive
+  runs have none). `validate_fleet` no longer warns about a shared
+  `status_file`.
+
 ## [0.7.4] — 2026-11-25
 
 Patch: a failed Claude run no longer ends its Slack thread.

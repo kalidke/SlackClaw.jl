@@ -160,11 +160,12 @@ All options are fields on `SlackClawConfig`:
 | `agent_directives` | `true` | Enable `[CONTINUE]`/`[SCHEDULE]` support |
 | `allow_skip` | `false` | Honor an exact `[SKIP]` reply on the primary/thread path (post nothing; also suppresses the dispatch-time 👀) |
 | `announce_startup` | `false` | Post start/stop banners to the primary channel |
-| `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
+| `system_prompt` | *(brevity prompt)* | The channel's instructions, added after Claude Code's own system prompt on each run |
 | `allowed_tools` | `String[]` | Restrict Claude to specific tools |
+| `child_env_passthrough` | `String[]` | Environment variables the Claude child gets beyond the allow list, by exact name; a value holding a Slack token or webhook URL never passes |
 | `listen_channel_ids` | `String[]` | Read-only channels (relevance-filtered; responses go to the primary channel) |
 | `state_file` | `.slackclaw_state.json` | Persistence file in `repo_dir` (override when channels share a `repo_dir`) |
-| `status_file` | `.slackclaw_status` | File watched during execution; its contents post as progress updates |
+| `status_file` | `.slackclaw_status` | Name of each run's status file (`<status_file>.<channel>.<thread ts>`, given to Claude as `SLACKCLAW_STATUS`); its contents post as progress updates |
 | `status_poll_s` | `30` | How often to check `status_file` while Claude runs |
 | `bot_user_id` | `""` | Bot's own user ID (auto-filled at startup; used to skip self-messages) |
 | `proactive_enabled` | `false` | Enable periodic autonomous checks |
@@ -255,7 +256,13 @@ Frequency can be adjusted live via Slack messages in the monitored channel:
 
 ### Progress updates during long tasks
 
-While Claude runs, SlackClaw watches `status_file` (`.slackclaw_status` in `repo_dir`, polled every `status_poll_s`). Any non-empty content present when it polls is posted to the thread as a progress update (a value overwritten between polls can be missed), then the file is cleared when the task finishes. This lets a long-running task narrate itself.
+Each run in a thread has its own status file, named to Claude as `SLACKCLAW_STATUS` (`<status_file>.<channel>.<thread ts>` in `repo_dir`, polled every `status_poll_s`). Any non-empty content present when it polls is posted to the thread as a progress update (a value overwritten between polls can be missed), and the file is removed when the run ends. Two runs never share one, so one run's progress never shows in another thread. Tell Claude in `system_prompt` to write progress to the file named by `$SLACKCLAW_STATUS` when that variable is set (listen and proactive runs have none); this lets a long-running task narrate itself.
+
+### What the Claude child receives
+
+Each `claude` run gets an allow-listed environment, not the monitor's (a fleet's environment holds every workspace's Slack tokens and other credentials, and a run follows prompts any channel member can write): the basic shell, git, `gh` and CLI variables, the child's own Anthropic credential and endpoint, cloud provider profile and region names, those starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_`, and the variables the channel names in `child_env_passthrough`. A value holding a Slack token or webhook URL (recognized by shape, anywhere in the value) never passes under any name, and a URL carrying a password passes only when the channel names its variable. SlackClaw then sets the run's own `SLACKCLAW_*` variables, the channel's bot token among them for the upload helper. The full list is in the docs' Features page.
+
+This covers the environment a run inherits, not what it can read. A run is the monitor's own OS user, so a token in a file it can open (`slackclaw.env` in `repo_dir`, a shell startup file that exports tokens) or in the monitor's process environment is still within its reach. Keep token files out of the folders runs work in; keeping tokens out of a run's reach entirely needs the run under its own OS user.
 
 ## Running as a Service
 

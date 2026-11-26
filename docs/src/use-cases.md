@@ -87,13 +87,14 @@ Claude starts a long task, optionally posts progress, and schedules a follow-up.
 
 **Setup** — `agent_directives` is on by default, so Claude can end a reply with
 `[SCHEDULE: 2h: check the run and report results]` to be re-invoked later. For
-live progress, tell Claude to write to the status file — SlackClaw polls it every
-`status_poll_s` and posts changes to the thread:
+live progress, tell Claude to write to its run's status file (named by
+`$SLACKCLAW_STATUS`) — SlackClaw polls it every `status_poll_s` and posts changes
+to the thread:
 
 ```julia
 cfg = SlackClawConfig(repo_dir = "/path/to/repo")
-cfg.system_prompt *= "\n\nFor long tasks, write one-line progress updates to " *
-                     ".slackclaw_status in your working directory."
+cfg.system_prompt *= "\n\nFor long tasks, when \$SLACKCLAW_STATUS is set, write " *
+                     "one-line progress updates to the file it names."
 run_monitor(cfg)
 ```
 

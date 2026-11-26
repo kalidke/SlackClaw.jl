@@ -129,11 +129,90 @@ The `proactive_prompt` field can carry inline suggestions, but prefer
 
 ## Progress updates during long tasks
 
-While Claude runs, SlackClaw watches `status_file` (`.slackclaw_status` in
-`repo_dir`, polled every `status_poll_s`). Any non-empty content present when it
-polls is posted to the thread as a progress update (a value overwritten between
-polls can be missed), and the file is cleared when the task finishes — letting a
-long task narrate itself rather than going silent.
+Each run in a thread has its own status file, named to Claude as
+`SLACKCLAW_STATUS`: `<status_file>.<channel>.<thread ts>` in `repo_dir`
+(`status_file` defaults to `.slackclaw_status`). While the run goes, SlackClaw
+polls it every `status_poll_s`; any non-empty content present when it polls is
+posted to the thread as a progress update (a value overwritten between polls can
+be missed). The file is removed when the run ends, one left by an earlier run in
+the thread is removed when the next run starts, and the monitor removes its
+channel's leftovers when it starts (a run it stopped mid-way). A thread has one
+run at a time, so two runs never share a status file and one run's progress
+never shows in another thread. To use it, tell Claude in `system_prompt` to write
+progress to the file named by `$SLACKCLAW_STATUS` when that variable is set:
+listen and proactive runs have no thread to post progress in, so they get no
+status file. A repository that ignores the file needs the pattern
+`.slackclaw_status*` (with the star; or `<status_file>*` for a channel that sets
+`status_file`). The single status file 0.7.4 and earlier used (`.slackclaw_status`,
+or the `status_file` a channel set) is no longer read or removed; delete one left
+behind by hand.
+
+## What the Claude child receives
+
+Every run of `claude` gets an allow-listed environment, not the monitor's: a
+fleet's environment holds every workspace's Slack tokens and other credentials,
+and the run follows prompts any channel member can write. It inherits only
+(`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`):
+
+- what a shell, git, `gh`, the CLI and its HTTP client need: `PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`,
+  `TMPDIR`/`TMP`/`TEMP`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, the proxy
+  variables, certificate trust and Node's options (`SSL_CERT_FILE`,
+  `NODE_EXTRA_CA_CERTS`, `NODE_USE_SYSTEM_CA`, `NODE_OPTIONS`, `GIT_SSL_CAINFO`,
+  …), and git and `gh` identity and configuration (`GIT_AUTHOR_*`,
+  `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`,
+  `GH_CONFIG_DIR`, `GH_REPO`, `GH_HOST`);
+- the child's own Anthropic credential, endpoint and models (`ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and the other
+  model and cloud-endpoint names, Bedrock, Vertex and Foundry included), but not
+  an admin key;
+- the names, not the secrets, of a cloud provider's profile, region and files
+  (`AWS_PROFILE`, `AWS_REGION`, `AWS_CONFIG_FILE`, `CLOUD_ML_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, …);
+- variables starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (less
+  the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`, except
+  `CLAUDE_CODE_OAUTH_TOKEN`; those never pass, not even through
+  `child_env_passthrough`, so set such options in Claude Code's `settings.json`);
+- the variables the channel names in `child_env_passthrough`, by exact name
+  (for example `["ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID", "GH_TOKEN"]`; an entry
+  ending in `*` is not a prefix, and is logged once and ignored).
+
+None of the built-in prefixes passes a name that looks like a secret (one
+containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`, `COOKIE`
+or the word `PAT`, such as a `CLAUDE_SESSION_KEY`): such a variable passes only
+by exact name.
+
+Three more rules hold over all of it. A variable whose value holds a Slack
+token or webhook URL anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other
+`xox` token, a session cookie `xoxd-`, alone or in a header, or an
+incoming-webhook URL on `hooks.slack.com` or `hooks.slack-gov.com`) never
+passes, even when `child_env_passthrough` names it. This recognizes tokens by
+their shape: a Slack app's signing or client secret has none, so keep such a
+variable out of `child_env_passthrough`. A URL
+with a user name or password, such as a proxy with its password (with or without
+`http://`), passes only when `child_env_passthrough` names the variable exactly.
+And the variables SlackClaw sets for each run are never inherited:
+`SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN` (the
+channel's bot token, for the upload helper), `SLACKCLAW_UPLOAD`, and
+`SLACKCLAW_STATUS` for a run in a thread. Other `SLACKCLAW_*` names, such as the
+upload helper's `SLACKCLAW_UPLOAD_COMMENT`, pass when the channel names them.
+SlackClaw logs the name (never the value) of a variable it drops for its value,
+once per process.
+
+Claude Code's own settings variables (`DISABLE_AUTOUPDATER`, `BASH_MAX_TIMEOUT_MS`,
+`MCP_TIMEOUT`, …), host policy (`CUDA_VISIBLE_DEVICES`, the thread-count
+variables, `LD_LIBRARY_PATH`, a display) and npm's cache location
+(`npm_config_cache`) pass by exact name too. Anything else a channel's runs used
+from the monitor's environment, such as a tool's API key, must be listed in
+`child_env_passthrough` before upgrading.
+
+**What this does not do.** The allow list governs the environment a run
+inherits. A run is the monitor's own OS user, so it can still read any file the
+monitor can (`slackclaw.env`, which `setup()` writes into `repo_dir` by default;
+a shell startup file that exports tokens; a token file in a checkout it works
+in) and the monitor's own process environment. Keep token files out of the
+folders runs work in. Keeping tokens out of a run's reach entirely needs the run
+under its own OS user.
 
 ## Sending files and images
 

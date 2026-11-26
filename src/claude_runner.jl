@@ -44,23 +44,169 @@ resolve_self_mentions(text::AbstractString, bot_user_id::AbstractString) =
 const CHILD_ENV_PASSTHROUGH = ("CLAUDE_CODE_OAUTH_TOKEN",)
 
 """
-    filtered_child_env(env) -> Vector{String}
-
-Build the child environment for the `claude` subprocess, dropping only the
-nested-session detection vars (`CLAUDECODE`, `CLAUDE_CODE_*`). Other `CLAUDE_*`
-vars are user configuration and must pass through — in particular
-`CLAUDE_CONFIG_DIR`, which redirects child transcripts off the default
-`~/.claude`; stripping it silently reverts every child to the default path.
-Credentials under the `CLAUDE_CODE_` prefix are exempted via
-[`CHILD_ENV_PASSTHROUGH`](@ref): `CLAUDE_CODE_OAUTH_TOKEN` is the child's only
-auth path when authenticated via `claude setup-token` (which prints the token
-without storing it), so stripping it leaves every child unauthenticated.
-(Issue #11: when the env allowlist lands, it must include both
-`CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`.)
+Variables the `claude` child inherits by exact name (see [`filtered_child_env`](@ref)):
+what a shell, git, `gh`, the CLI and its HTTP client need, the child's own
+Anthropic credential and endpoint, and the names (not the secrets) of a cloud
+provider profile or region. Nothing that carries a credential of the monitor's:
+an Anthropic admin key, a `GH_TOKEN` or a cloud secret key passes only when the
+channel names it in `child_env_passthrough`.
 """
-filtered_child_env(env) =
-    String["$(k)=$(v)" for (k, v) in env if
-           !(k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH)))]
+const CHILD_ENV_NAMES = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ",
+    # the CLI's own login after `claude setup-token` (a secret-looking name, so by exact name)
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "TMPDIR", "TMP", "TEMP", "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS",
+    # proxies (one whose URL carries a user name or password: see filtered_child_env)
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    # certificate trust, and Node's runtime options (e.g. --use-openssl-ca)
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_OPTIONS",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+    # the Anthropic client: the child's own credential, endpoint and models
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
+    # cloud provider selectors (profile, region, file locations; not secret keys)
+    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "CLOUD_ML_REGION", "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS",
+    # git and gh identity and configuration
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GH_CONFIG_DIR", "GH_REPO", "GH_HOST",
+    # Claude Code settings it reads from the environment
+    "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "BASH_DEFAULT_TIMEOUT_MS",
+    "BASH_MAX_TIMEOUT_MS", "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT", "MAX_THINKING_TOKENS",
+    # host policy: GPUs and thread counts, the library path, a display
+    "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "LD_LIBRARY_PATH", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    # npm's cache location (not the npm_config_ prefix, which can carry registry tokens)
+    "npm_config_cache", "NPM_CONFIG_CACHE",
+)
+
+"""
+Variables the `claude` child inherits by prefix (see [`filtered_child_env`](@ref)):
+locale, XDG base directories, Julia and juliaup (the depot), and Claude Code
+configuration such as `CLAUDE_CONFIG_DIR` (less the nested-session vars).
+"""
+const CHILD_ENV_PREFIXES = ("LC_", "XDG_", "JULIA_", "JULIAUP_", "CLAUDE_")
+
+"""
+The variables [`run_claude`](@ref) sets for each run. They are never inherited
+from the monitor, even when `child_env_passthrough` names them.
+"""
+const SLACKCLAW_RUN_VARS = ("SLACKCLAW_THREAD_TS", "SLACKCLAW_CHANNEL_ID", "SLACKCLAW_BOT_TOKEN",
+                            "SLACKCLAW_UPLOAD", "SLACKCLAW_STATUS")
+
+"""The proxy variables: a user name or password in one counts with or without a URL scheme (`user:pass@host:port`)."""
+const PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+"""
+True when `v` holds a Slack credential anywhere in it (alone, in an
+`Authorization` header, in a URL), recognized by its shape:
+- a token: `xoxb-` bot, `xoxp-` user and the other `xox?-` kinds, and `xapp-`
+  app-level, each as `<kind>-<digits>-<letter or digit>`, so a path such as
+  `/opt/xapp-tools` or `/opt/xapp-1.2` is not one (a rotating `xoxe.xoxp-…`
+  holds one); a workflow `xwfp-<digit>`;
+- a session cookie `xoxd-…`, which may go on with a letter;
+- an incoming-webhook URL (`hooks.slack.com` or GovSlack's
+  `hooks.slack-gov.com`, any letter case, any port).
+"""
+has_slack_credential(v::AbstractString) =
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%+/]|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
+
+"""
+True when `v`, the value of variable `k`, holds a URL with a user name or
+password (`scheme://user:pass@host`; for a proxy variable also `user:pass@host`
+with no scheme).
+"""
+has_url_credential(k::AbstractString, v::AbstractString) =
+    occursin(r"://[^/\s@]+@", v) || (k in PROXY_NAMES && occursin(r"^\s*[^/\s@]+@", v))
+
+"""
+True for a name that looks like it holds a secret (containing `TOKEN`,
+`SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`, `COOKIE`, or the word `PAT`,
+any case). No prefix in [`CHILD_ENV_PREFIXES`](@ref) passes such a name (a
+usage monitor's `CLAUDE_SESSION_KEY`, say); it passes only by exact name.
+"""
+secret_name(k::AbstractString) =
+    occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK|COOKIE|(^|_)PAT($|_)"i, k)
+
+"""
+    filtered_child_env(env, passthrough=()) -> Vector{String}
+
+Build the environment the `claude` subprocess inherits from the monitor: an
+allow list, not the monitor's whole environment, since the child runs prompts
+any channel member can write and a fleet's environment holds every workspace's
+Slack tokens and other credentials (issue #11). A variable passes when its name
+is in [`CHILD_ENV_NAMES`](@ref), starts with one of
+[`CHILD_ENV_PREFIXES`](@ref), or is named in `passthrough`
+(`config.child_env_passthrough`: exact names; an entry ending in `*` is not a
+prefix, and is logged once and ignored).
+
+Exceptions:
+- **Nested-session detection vars.** `CLAUDECODE` and `CLAUDE_CODE_*` are
+  dropped, except the credentials in [`CHILD_ENV_PASSTHROUGH`](@ref):
+  `CLAUDE_CODE_OAUTH_TOKEN` is the child's only auth path after
+  `claude setup-token`, which prints the token without storing it. Other
+  `CLAUDE_*` vars are user configuration and pass: stripping
+  `CLAUDE_CONFIG_DIR` sends every child's transcripts back to `~/.claude`.
+- **Slack credentials.** A variable whose value holds one
+  ([`has_slack_credential`](@ref)) never passes, even when `passthrough` names it.
+- **A URL with a user name or password** ([`has_url_credential`](@ref)), such
+  as a proxy with its password, passes only when `passthrough` names the
+  variable, not through the allow list or a prefix.
+- **A secret-looking name** ([`secret_name`](@ref)) never passes through one of
+  [`CHILD_ENV_PREFIXES`](@ref); it passes only by exact name
+  (`CLAUDE_CODE_OAUTH_TOKEN` is in [`CHILD_ENV_NAMES`](@ref) for that reason).
+- **[`SLACKCLAW_RUN_VARS`](@ref)** are never inherited: [`run_claude`](@ref) sets
+  them for each run. Other `SLACKCLAW_*` names pass only through `passthrough`.
+"""
+function filtered_child_env(env, passthrough=())
+    names = String[p for p in passthrough if !endswith(p, "*")]
+    for p in passthrough
+        endswith(p, "*") && warn_prefix_entry(p)
+    end
+    listed(k) = k in CHILD_ENV_NAMES || (any(p -> startswith(k, p), CHILD_ENV_PREFIXES) && !secret_name(k))
+    nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
+    out = String[]
+    for (k, v) in env
+        (k in SLACKCLAW_RUN_VARS || nested(k)) && continue
+        named = k in names
+        (named || listed(k)) || continue
+        # A variable dropped for its value alone is named in the log once, so a
+        # dropped PATH or proxy is visible; its value never is
+        if has_slack_credential(v)
+            warn_dropped(k, "holds a Slack token or webhook URL, which never passes")
+        elseif !named && has_url_credential(k, v)
+            warn_dropped(k, "is a URL with a user name or password; name it exactly in child_env_passthrough to pass it")
+        else
+            push!(out, "$(k)=$(v)")
+        end
+    end
+    return out
+end
+
+"""What [`warn_dropped`](@ref) has logged, so each is logged once per process."""
+const WARNED_DROPPED = Set{String}()
+
+"""Log once per process that variable `k` is not passed to Claude runs, and why (never its value)."""
+warn_dropped(k::AbstractString, why::AbstractString) =
+    warn_once(k, "SlackClaw: not passing $k to Claude runs: its value $why")
+
+"""
+Log once per process that a `child_env_passthrough` entry ending in `*` is
+ignored. The entry is echoed only when it is a variable name and a `*`, so a
+value pasted into the list never reaches the log.
+"""
+warn_prefix_entry(p::AbstractString) =
+    warn_once("entry " * p, "SlackClaw: child_env_passthrough takes exact names; ignoring " *
+              (occursin(r"^[A-Za-z_][A-Za-z0-9_]*\*$", p) ? "the entry $p" : "an entry ending in *"))
+
+function warn_once(key::AbstractString, msg::AbstractString)
+    key in WARNED_DROPPED && return
+    push!(WARNED_DROPPED, String(key))
+    @warn msg
+end
 
 """
     run_claude(prompt::String, config::SlackClawConfig) -> ClaudeResult
@@ -70,11 +216,17 @@ Permissions are governed by `--permission-mode \$(config.permission_mode)` (defa
 `"auto"`, the classifier mode); a denial returns promptly as an `is_error` result
 rather than hanging the dispatch. Mentions of the bot itself in the prompt are
 rewritten to `@you` ([`resolve_self_mentions`](@ref)).
+
+The child inherits only the allow-listed environment ([`filtered_child_env`](@ref)),
+plus `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN` and
+`SLACKCLAW_UPLOAD` for the upload helper, and `SLACKCLAW_STATUS` when
+`status_path` is given: the run's own status file ([`run_status_path`](@ref)).
 """
 function run_claude(prompt::String, config::SlackClawConfig;
                     session_id::String="",
                     thread_ts::String="",
-                    channel_id::String="")
+                    channel_id::String="",
+                    status_path::String="")
     prompt = resolve_self_mentions(prompt, config.bot_user_id)
     args = String[
         "claude", "-p", prompt,
@@ -93,13 +245,15 @@ function run_claude(prompt::String, config::SlackClawConfig;
     can_upload = isfile(upload_bin) && !isempty(thread_ts) &&
                  !isempty(channel_id) && !isempty(config.slack_bot_token)
 
-    # Build system prompt: user config + directives + upload helper
+    # SlackClaw's instructions (user config + directives + upload helper), added
+    # after Claude Code's own system prompt: --system-prompt would replace it, and
+    # runs would lose its instructions (confirm before outward-facing actions, ...)
     sys_parts = String[]
     !isempty(config.system_prompt) && push!(sys_parts, config.system_prompt)
     config.agent_directives && push!(sys_parts, DIRECTIVE_INSTRUCTIONS)
     can_upload && push!(sys_parts, UPLOAD_INSTRUCTIONS)
     if !isempty(sys_parts)
-        push!(args, "--system-prompt", join(sys_parts, "\n\n"))
+        push!(args, "--append-system-prompt", join(sys_parts, "\n\n"))
     end
 
     if config.max_budget_usd > 0
@@ -114,14 +268,19 @@ function run_claude(prompt::String, config::SlackClawConfig;
         push!(args, "--allowedTools", tool)
     end
 
-    # Build clean environment without Claude session vars
-    filtered_env = filtered_child_env(ENV)
+    # The allow-listed environment: no Slack token or other credential of the
+    # monitor's is in the environment the child inherits (filtered_child_env).
+    # The child is the monitor's OS user, so files and the monitor's own process
+    # environment stay readable to it: this is not a sandbox.
+    filtered_env = filtered_child_env(ENV, config.child_env_passthrough)
 
-    # Inject SlackClaw context so the upload helper can post into this thread.
+    # Inject SlackClaw context so the upload helper can post into this thread,
+    # and this run's own status file
     !isempty(thread_ts) && push!(filtered_env, "SLACKCLAW_THREAD_TS=$thread_ts")
     !isempty(channel_id) && push!(filtered_env, "SLACKCLAW_CHANNEL_ID=$channel_id")
     !isempty(config.slack_bot_token) && push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
     isfile(upload_bin) && push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
+    !isempty(status_path) && push!(filtered_env, "SLACKCLAW_STATUS=$status_path")
 
     cmd = setenv(`$args`, filtered_env; dir=config.repo_dir)
 
@@ -222,9 +381,18 @@ function _run_claude_once(cmd::Base.AbstractCmd, timeout_s::Real)
     proc = try
         run(pipeline(ignorestatus(cmd), stdout=out, stderr=err); wait=false)
     catch e
-        # Couldn't even spawn (e.g. `claude` not on PATH)
-        return (exitcode = -1, stdout = "",
-                stderr = "failed to spawn claude: $(sprint(showerror, e))", timed_out = false)
+        # Couldn't even spawn (`claude` not on PATH, a missing repo_dir). The
+        # error's own text spells out the whole command with its environment,
+        # which holds the run's credentials, and this text is posted to Slack:
+        # report only the error's code and the folder (any user name or
+        # password in it masked), and say so when the folder is what is missing.
+        why = e isa Base.IOError ? "$(Base.struverror(e.code)) ($(Base.uverrorname(e.code)))" :
+                                   string(nameof(typeof(e)))
+        dir = replace(cmd isa Cmd ? cmd.dir : "", r"://[^/\s@]+@" => "://…@")
+        msg = isempty(dir) ? "failed to start claude: $why" :
+              !isdir(dir) ? "failed to start claude: its folder $dir does not exist" :
+                            "failed to start claude in $dir: $why"
+        return (exitcode = -1, stdout = "", stderr = msg, timed_out = false)
     end
     close(out.in)
     close(err.in)

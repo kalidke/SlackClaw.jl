@@ -277,10 +277,59 @@ end
 
 # --- Status file watching ---
 
-"""Watch status file during Claude execution, posting updates to thread."""
+"""
+    run_status_path(config, channel_id, thread_ts) -> String
+
+The status file of the run in thread `thread_ts` of channel `channel_id`:
+`<status_file>.<channel>.<thread ts>` in `repo_dir`, named to the child as
+`SLACKCLAW_STATUS`. A thread has one run at a time, so two runs never share a
+status file, in one channel or across fleet channels that share a `repo_dir`.
+The path is absolute: the child starts in `repo_dir`, so a path relative to the
+monitor's folder would name a different file there.
+"""
+run_status_path(config::SlackClawConfig, channel_id::AbstractString, thread_ts::AbstractString) =
+    status_prefix(config, channel_id) * replace(thread_ts, r"[^0-9.]" => "_")
+
+"""The absolute path every status file of channel `channel_id` starts with: `<repo_dir>/<status_file>.<channel>.`"""
+status_prefix(config::SlackClawConfig, channel_id::AbstractString) =
+    joinpath(abspath(config.repo_dir),
+             string(config.status_file, ".", replace(channel_id, r"[^A-Za-z0-9]" => "_"), "."))
+
+"""
+    sweep_status_files(config) -> Int
+
+Remove the status files that runs in the monitor's primary channel left in
+`repo_dir` when the monitor stopped mid-run, so none lingers in a channel's
+repository (where a run's `git add -A` would commit it). Called at start, before
+any run. Only names SlackClaw makes go: `<status_file>.<channel>.<thread ts>`
+for this channel, nothing else (a backup beside one stays), so fleet channels
+sharing a `repo_dir`, and a channel moved to another monitor, keep theirs.
+Returns how many were removed; an error is logged.
+"""
+function sweep_status_files(config::SlackClawConfig)
+    prefix = status_prefix(config, config.slack_channel_id)
+    dir, base = dirname(prefix), basename(prefix)
+    n = 0
+    try
+        isdir(dir) || return 0
+        for f in readdir(dir)
+            p = joinpath(dir, f)
+            if startswith(f, base) && occursin(r"^[0-9]+\.[0-9]{6}$", f[ncodeunits(base)+1:end]) && isfile(p)
+                rm(p; force=true)
+                n += 1
+            end
+        end
+    catch e
+        @error "SlackClaw: status file sweep failed" exception=(e, catch_backtrace())
+    end
+    n > 0 && @info "SlackClaw: removed $n status file(s) left by earlier runs"
+    return n
+end
+
+"""Watch a run's status file (`path`) during Claude execution, posting updates to its thread."""
 function watch_status_file(config::SlackClawConfig, thread_ts::String, stop::Ref{Bool};
-                           channel_id::String=config.slack_channel_id)
-    path = joinpath(config.repo_dir, config.status_file)
+                           channel_id::String=config.slack_channel_id,
+                           path::String=run_status_path(config, channel_id, thread_ts))
     last_content = ""
     while !stop[]
         for _ in 1:config.status_poll_s
@@ -317,6 +366,9 @@ function start_monitor(config::SlackClawConfig)
 
     threads, persisted_ts, scheduled, listen_last_ts, last_proactive = load_state(config)
     last_ts = isempty(persisted_ts) ? slack_ts_now() : persisted_ts
+
+    # No run is going yet: any status file of this channel's threads is left over
+    sweep_status_files(config)
 
     # Resolve channel names for listen channels
     channel_names = Dict{String,String}()
@@ -907,25 +959,36 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
         # both Slack timestamps. With neither, the run does not track it.
         new_cursor = react_ts
 
-        # Ends this run's hold on the thread once: releases the busy mark, then
-        # clears the status file. A failed run calls it before posting its
-        # reason, so a reply meanwhile can start a run that this run no longer
-        # touches. A cleanup error is logged.
-        released = false
-        function finish_run!()
-            released && return
-            released = true
-            release_busy!(state, thread_ts, busy_mark)
+        # This run's own status file (no other run shares it), named inside the
+        # try below, so an error naming it cannot skip the busy mark's release;
+        # "" means none. A cleanup error is logged.
+        status_path = ""
+        function clear_status!()
             try
-                status_path = joinpath(config.repo_dir, config.status_file)
-                isfile(status_path) && rm(status_path; force=true)
+                !isempty(status_path) && isfile(status_path) && rm(status_path; force=true)
             catch e
                 @error "SlackClaw: status file cleanup failed" thread_ts exception=(e, catch_backtrace())
             end
         end
 
+        # Ends this run's hold on the thread once: releases the busy mark, then
+        # clears the status file. A failed run calls it before posting its
+        # reason, so a reply meanwhile can start a run that this run no longer
+        # touches.
+        released = false
+        function finish_run!()
+            released && return
+            released = true
+            release_busy!(state, thread_ts, busy_mark)
+            clear_status!()
+        end
+
         try
-            # Inside the try: nothing after the busy mark can skip its release
+            # Inside the try: nothing after the busy mark can skip its release.
+            # A status file left by an earlier run in this thread (the monitor
+            # stopped mid-run) is not this run's progress.
+            status_path = run_status_path(config, channel_id, thread_ts)
+            clear_status!()
             if before_run !== nothing
                 try
                     r = before_run()
@@ -937,14 +1000,17 @@ function run_agent_loop!(state::MonitorState, thread_ts::String, prompt::String,
             while true
                 # Start status file watcher
                 stop_watcher = Ref(false)
-                watcher = @async watch_status_file(config, thread_ts, stop_watcher; channel_id)
+                watcher = @async watch_status_file(config, thread_ts, stop_watcher;
+                                                   channel_id, path=status_path)
 
-                # Run Claude (pass thread context for file upload support)
+                # Run Claude (pass thread context for file upload support, and
+                # the run's status file)
                 result = try
                     run_claude(current_prompt, config;
                         session_id=current_session,
                         thread_ts=thread_ts,
-                        channel_id=channel_id)
+                        channel_id=channel_id,
+                        status_path=status_path)
                 finally
                     stop_watcher[] = true
                 end

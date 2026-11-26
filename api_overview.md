@@ -86,16 +86,17 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `claude_timeout_s::Int = 3600`
 - `max_turns::Int = 30`
 - `allowed_tools::Vector{String} = String[]`
+- `child_env_passthrough::Vector{String} = String[]` — environment variables the `claude` child gets beyond the allow list (`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`), by exact name (an entry ending in `*` is logged and ignored). A value holding a Slack token or webhook URL never passes, and a URL with a password passes only when named here (`filtered_child_env`)
 - `max_concurrent_tasks::Int = 5`
 - `max_active_threads::Int = 3`
 - `max_thread_idle_s::Int = 604800` — 7 d; `0` = never
 - `max_continue::Int = 10` — max consecutive `[CONTINUE]`
-- `system_prompt::String` — a Slack-formatting brevity prompt (full literal below)
+- `system_prompt::String` — a Slack-formatting brevity prompt (full literal below); passed with the directive and upload instructions as `--append-system-prompt`, after Claude Code's own system prompt, which it never replaces
 - `agent_directives::Bool = true` — enable `[CONTINUE]`/`[SCHEDULE]`
 - `allow_skip::Bool = false` — honor an exact `[SKIP]` reply on the primary/thread path (post nothing, no checkmark; thread session still tracked). Eyes-as-intent: the dispatch-time `:eyes` ack is added on `allow_skip` channels too, then REMOVED when the reply is `[SKIP]` — lingering eyes mean a reply is coming, vanished eyes mean "seen, deliberately staying out". Mechanism only — tell Claude about the convention via `system_prompt`
 - `announce_startup::Bool = false` — post the start/stop banners to the primary channel (off by default: supervised crash-loops would spam it)
 - `state_file::String = ".slackclaw_state.json"`
-- `status_file::String = ".slackclaw_status"`
+- `status_file::String = ".slackclaw_status"` — each run's status file is `<status_file>.<channel>.<thread ts>` in `repo_dir` (`run_status_path`), named to the child as `SLACKCLAW_STATUS`
 - `status_poll_s::Int = 30`
 - `bot_user_id::String = ""` — auto-filled at startup
 - `listen_channel_ids::Vector{String} = String[]`

@@ -300,9 +300,8 @@ function validate_fleet(configs::Vector{SlackClawConfig})
     length(unique(state_paths)) == length(state_paths) ||
         error("run_socket_fleet: two channels resolve to the same state file — " *
               "set a distinct state_file for channels sharing a repo_dir")
-    status_paths = [joinpath(c.repo_dir, c.status_file) for c in configs]
-    length(unique(status_paths)) == length(status_paths) ||
-        @warn "SlackClaw fleet: channels share a status file path — status updates may cross-post"
+    # No status-file check: a run's status file names its channel and thread
+    # (run_status_path), so channels sharing a repo_dir and status_file never collide
     return nothing
 end
 
