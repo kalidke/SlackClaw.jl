@@ -196,7 +196,7 @@ warn_dropped(k::AbstractString, why::AbstractString) =
 """
 Log once per process that a `child_env_passthrough` entry ending in `*` is
 ignored. The entry is echoed only when it is a variable name and a `*`, so a
-value pasted into the list never reaches the log.
+value pasted into the list reaches the log only if it has that form.
 """
 warn_prefix_entry(p::AbstractString) =
     warn_once("entry " * p, "SlackClaw: child_env_passthrough takes exact names; ignoring " *
@@ -220,7 +220,9 @@ rewritten to `@you` ([`resolve_self_mentions`](@ref)).
 The child inherits only the allow-listed environment ([`filtered_child_env`](@ref)),
 plus `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN` and
 `SLACKCLAW_UPLOAD` for the upload helper, and `SLACKCLAW_STATUS` when
-`status_path` is given: the run's own status file ([`run_status_path`](@ref)).
+`status_path` is given: the run's own status file ([`run_status_path`](@ref)), and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` unless `config.auto_memory` is set. SlackClaw's
+instructions go in `--append-system-prompt`, after Claude Code's own system prompt.
 """
 function run_claude(prompt::String, config::SlackClawConfig;
                     session_id::String="",
@@ -281,6 +283,11 @@ function run_claude(prompt::String, config::SlackClawConfig;
     !isempty(config.slack_bot_token) && push!(filtered_env, "SLACKCLAW_BOT_TOKEN=$(config.slack_bot_token)")
     isfile(upload_bin) && push!(filtered_env, "SLACKCLAW_UPLOAD=$upload_bin")
     !isempty(status_path) && push!(filtered_env, "SLACKCLAW_STATUS=$status_path")
+    # Claude Code's built-in prompt tells a run to save memories in the repo's
+    # memory folder, which later threads (and a person's own sessions in that
+    # repo) load; off unless the channel turns it on. The monitor's own
+    # CLAUDE_CODE_* settings never reach the child (filtered_child_env).
+    config.auto_memory || push!(filtered_env, "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1")
 
     cmd = setenv(`$args`, filtered_env; dir=config.repo_dir)
 
@@ -388,9 +395,16 @@ function _run_claude_once(cmd::Base.AbstractCmd, timeout_s::Real)
         # password in it masked), and say so when the folder is what is missing.
         why = e isa Base.IOError ? "$(Base.struverror(e.code)) ($(Base.uverrorname(e.code)))" :
                                    string(nameof(typeof(e)))
-        dir = replace(cmd isa Cmd ? cmd.dir : "", r"://[^/\s@]+@" => "://…@")
+        raw = cmd isa Cmd ? cmd.dir : ""
+        dir = replace(raw, r"://[^/\s]*@" => "://…@")
+        # stat can itself fail (a parent folder that cannot be searched): then say only the error
+        exists = try ispath(raw) catch; true end
+        folder = try isdir(raw) catch; true end
+        missing_exe = e isa Base.IOError && e.code == Base.UV_ENOENT
         msg = isempty(dir) ? "failed to start claude: $why" :
-              !isdir(dir) ? "failed to start claude: its folder $dir does not exist" :
+              !exists ? "failed to start claude: its folder $dir does not exist" :
+              !folder ? "failed to start claude: $dir is not a folder" :
+              missing_exe ? "failed to start claude in $dir: $why; is claude on the run's PATH?" :
                             "failed to start claude in $dir: $why"
         return (exitcode = -1, stdout = "", stderr = msg, timed_out = false)
     end

@@ -332,6 +332,7 @@ end
                   "SLACKCLAW_BOT_TOKEN" => "xoxb-5555-6666-testinherited",
                   "ZOTERO_API_KEY" => "test-unrelated-key",
                   "ANTHROPIC_ADMIN_API_KEY" => "test-admin-key",
+                  "CLAUDE_CODE_DISABLE_AUTO_MEMORY" => "0",
                   "JULIA_DEPOT_PATH" => "/test/depot")
         child_env(; kw...) = withenv(parent...) do
             r = SlackClaw.run_claude("hi", cfg; kw...)
@@ -358,6 +359,11 @@ end
         @test env["SLACKCLAW_THREAD_TS"] == "1700000001.000100"
         @test env["SLACKCLAW_CHANNEL_ID"] == "C0ENV"
         @test !haskey(env, "SLACKCLAW_STATUS")
+        # Claude Code's auto memory is off in runs (the built-in prompt would have a
+        # run save memories in the repo's memory folder); the monitor's own setting
+        # of the variable never reaches the child, so it is set exactly once
+        @test env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+        @test count(l -> startswith(l, "CLAUDE_CODE_DISABLE_AUTO_MEMORY="), eachline(envf)) == 1
 
         # a run given a status file names it
         st = SlackClaw.run_status_path(cfg, "C0ENV", "1700000001.000100")
@@ -370,6 +376,10 @@ end
         @test !haskey(env, "SLACK_BOT_TOKEN")
         # with no thread there is no upload context
         @test !haskey(env, "SLACKCLAW_THREAD_TS") && !haskey(env, "SLACKCLAW_CHANNEL_ID")
+        # a channel that turns auto memory on gets Claude Code's default
+        cfg.auto_memory = true
+        @test !haskey(child_env(), "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+        cfg.auto_memory = false
 
         # A run that cannot start reports the error and the folder only: the spawn
         # error's own text holds the whole environment, and this reason is posted to
@@ -399,10 +409,30 @@ end
                 SlackClaw.run_claude("hi", cfg_nopath; thread_ts="1700000001.000100", channel_id="C0ENV")
             end
         end
-        @test occursin("failed to start claude in $dir: no such file or directory (ENOENT)", r.result_text)
+        @test occursin("failed to start claude in $dir: no such file or directory (ENOENT); is claude on the run's PATH?",
+                       r.result_text)
         @test !occursin("MARK7", r.result_text) && !leaked(logs)
-        # a folder written with a user name and password is shown masked
+        # a folder written with a user name and password is shown masked, also when
+        # the user name itself holds an @
         @test occursin("://…@", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u:MARK7@host/x"), 5).stderr)
+        @test !occursin("MARK7", SlackClaw._run_claude_once(setenv(`claude`, String[]; dir="https://u@x.org:MARK7@host/x"), 5).stderr)
+        # a repo_dir that is a file is said so
+        @test SlackClaw._run_claude_once(setenv(`claude`, String[]; dir=envf), 5).stderr ==
+              "failed to start claude: $envf is not a folder"
+        # a folder whose parent cannot be searched: the check of the folder itself
+        # fails too, and the reason is still the error (checked only where stat
+        # really fails, so not as root)
+        locked = joinpath(dir, "locked")
+        mkpath(joinpath(locked, "repo"))
+        chmod(locked, 0o600)
+        try
+            if (try isdir(joinpath(locked, "repo")); false; catch; true; end)
+                res = SlackClaw._run_claude_once(setenv(`claude`, String[]; dir=joinpath(locked, "repo")), 5)
+                @test res.exitcode == -1 && startswith(res.stderr, "failed to start claude in $(joinpath(locked, "repo")): ")
+            end
+        finally
+            chmod(locked, 0o700)
+        end
     end
 end
 
@@ -437,8 +467,13 @@ end
         if isfile(normpath(joinpath(pkgdir(SlackClaw), "bin", "slack-upload")))
             args = argv(cfg; thread_ts="1700000001.000100", channel_id="C0")
             @test count(==("--append-system-prompt"), args) == 1 && !("--system-prompt" in args)
-            @test endswith(args[findfirst(==("--append-system-prompt"), args) + 1], SlackClaw.UPLOAD_INSTRUCTIONS)
+            @test args[findfirst(==("--append-system-prompt"), args) + 1] ==
+                  join([cfg.system_prompt, SlackClaw.DIRECTIVE_INSTRUCTIONS, SlackClaw.UPLOAD_INSTRUCTIONS], "\n\n")
         end
+        # a resumed run carries the same text (the CLI renders it again after a compaction)
+        args = argv(cfg; session_id="s-1")
+        @test args[findfirst(==("--resume"), args) + 1] == "s-1"
+        @test args[findfirst(==("--append-system-prompt"), args) + 1] == text && !("--system-prompt" in args)
         # nothing to add: neither flag
         bare = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=dir, claude_max_retries=0,
                                system_prompt="", agent_directives=false)
@@ -2164,22 +2199,25 @@ end)
     @test !any(t -> occursin("Status:", t), top_posted)
 
     # Naming the run's status file can fail (a relative repo_dir after the working
-    # folder was removed): the thread is still released, with one failure reply
-    here = pwd()
-    cwd_gone = mktempdir()
-    cd(cwd_gone)
-    rm(cwd_gone)
-    try
-        cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir="relative-repo")
-        @test_throws Base.IOError SlackClaw.run_status_path(cfg_p, "C0", "1700000803.000000")
-        state_p = mkstate(cfg_p)
-        empty!(top_posted)
-        SlackClaw.run_agent_loop!(state_p, "1700000803.000000", "check", ""; channel_id="C0")
-        foreach(wait, state_p.active_tasks)
-        @test !haskey(state_p.busy_threads, "1700000803.000000")
-        @test length(top_posted) == 1 && endswith(top_posted[1], SlackClaw.FAILED_RUN_RETRY_LINE)
-    finally
-        cd(here)
+    # folder was removed): the thread is still released, with one failure reply.
+    # Unix only: Windows will not remove a process's current folder.
+    if Sys.isunix()
+        here = pwd()
+        cwd_gone = mktempdir()
+        cd(cwd_gone)
+        rm(cwd_gone)
+        try
+            cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir="relative-repo")
+            @test_throws Base.IOError SlackClaw.run_status_path(cfg_p, "C0", "1700000803.000000")
+            state_p = mkstate(cfg_p)
+            empty!(top_posted)
+            SlackClaw.run_agent_loop!(state_p, "1700000803.000000", "check", ""; channel_id="C0")
+            foreach(wait, state_p.active_tasks)
+            @test !haskey(state_p.busy_threads, "1700000803.000000")
+            @test length(top_posted) == 1 && endswith(top_posted[1], SlackClaw.FAILED_RUN_RETRY_LINE)
+        finally
+            cd(here)
+        end
     end
 end
 

@@ -34,6 +34,10 @@ Base.@kwdef mutable struct SlackClawConfig
     child_env_passthrough::Vector{String} = String[]  # environment variables the claude child gets on top of
                                         # the allow list (CHILD_ENV_NAMES, CHILD_ENV_PREFIXES), by exact name.
                                         # A Slack token or webhook URL never passes (filtered_child_env).
+    auto_memory::Bool = false           # Claude Code's auto memory in runs. Off (CLAUDE_CODE_DISABLE_AUTO_MEMORY=1):
+                                        # a run neither reads nor writes the repo's memory folder, so one member's
+                                        # message cannot become a memory later threads, or a person's own sessions
+                                        # in that repo, load. On: runs read the memory index and may save to it.
     max_concurrent_tasks::Int = 5
     max_active_threads::Int = 3
     max_thread_idle_s::Int = 604800     # drop tracked threads idle this long (7d; 0 = never)

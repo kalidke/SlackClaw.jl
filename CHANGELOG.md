@@ -53,6 +53,15 @@ Notable changes to SlackClaw.jl. Format follows
   outward-facing actions, and on citing code. They are now passed with
   `--append-system-prompt` and follow the built-in prompt. The text SlackClaw
   sends is unchanged; each run reads a few thousand more input tokens.
+- **Claude Code's auto memory is off in runs** (new `auto_memory` config
+  field, default `false`). The built-in prompt tells a session to read the
+  repository's memory index and save memories to it; with it a channel
+  member's message could become a memory that later threads, and a person's
+  own Claude sessions in that repository, load and act on. Runs now get
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so they neither read nor write that
+  folder. Before, runs read the memory index but were never told to save to
+  it; a channel that relies on the index sets `auto_memory = true`, which
+  also lets its runs save memories.
 
 ### Upgrading
 
@@ -69,6 +78,11 @@ Notable changes to SlackClaw.jl. Format follows
   that ignores them needs `.slackclaw_status*` (or `<status_file>*`), and the
   single status file 0.7.4 and earlier used is no longer read or removed
   (delete one left behind by hand).
+- Claude Code records a conversation's system prompt at its first request, so
+  a thread open at the upgrade keeps the replacing prompt until its
+  conversation is compacted; new threads get the built-in prompt.
+- Runs no longer see the repository's Claude Code memory index (see Changed);
+  set `auto_memory = true` for a channel whose runs need it.
 
 ### Fixed
 

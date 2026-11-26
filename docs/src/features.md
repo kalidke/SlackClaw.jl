@@ -206,6 +206,19 @@ variables, `LD_LIBRARY_PATH`, a display) and npm's cache location
 from the monitor's environment, such as a tool's API key, must be listed in
 `child_env_passthrough` before upgrading.
 
+**Instructions and memory.** SlackClaw's instructions to a run (the channel's
+`system_prompt`, the directive and upload instructions) are added after Claude
+Code's own system prompt (`--append-system-prompt`), so a run keeps Claude
+Code's built-in instructions, such as confirming before hard-to-reverse or
+outward-facing actions. Claude Code records a conversation's prompt at its first
+request, so a thread keeps the prompt it started with until its conversation is
+compacted; an edited `system_prompt` reaches new threads. Claude Code's auto
+memory is off in runs (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`): a run neither reads
+the repository's memory index nor saves to it, so one member's message cannot
+become a memory that later threads, or a person's own Claude sessions in that
+repository, load and act on. Set `auto_memory = true` for a channel whose runs
+should read and write it.
+
 **What this does not do.** The allow list governs the environment a run
 inherits. A run is the monitor's own OS user, so it can still read any file the
 monitor can (`slackclaw.env`, which `setup()` writes into `repo_dir` by default;
