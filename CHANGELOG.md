@@ -21,8 +21,9 @@ Patch: a failed Claude run no longer ends its Slack thread.
 - **A failed exit keeps its session id.** With `--output-format json` the CLI
   prints its result object on a failed exit too, with `session_id`. It is
   now kept, so the next reply resumes the same session with what the failed
-  run already did. With no id (a timeout, nothing on stdout) the thread keeps
-  the session it had; a thread with none yet starts the next reply fresh, and
+  run already did. A timed-out run's session is the id of a result printed
+  before the overrun, else the session it resumed. With no id (nothing on
+  stdout, a fresh run's timeout) the thread keeps the session it had; a thread with none yet starts the next reply fresh, and
   its prompt carries `REVIVED_THREAD_NOTE`, which now says only that the
   earlier conversation is not available (it no longer names a cause, which
   did not fit every case).

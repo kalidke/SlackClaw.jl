@@ -803,10 +803,10 @@ function track_thread!(state::MonitorState, thread_ts::AbstractString, channel_i
     return sid
 end
 
-"""Line ending a failed run's reply when the next run resumes the failed run's own session."""
+"""Line ending a failed run's reply when the session the thread resumes holds the failed run's work."""
 const FAILED_RUN_CONTINUE_LINE = "_Reply in this thread to continue; the next run resumes this one._"
 
-"""Line ending a failed run's reply when the failed run left no session of its own."""
+"""Line ending a failed run's reply when the failed run's work is in no session the thread resumes."""
 const FAILED_RUN_RETRY_LINE = "_Reply in this thread to try again, saying what is still to be done: this run left nothing to resume, though some of its work may have run._"
 
 """

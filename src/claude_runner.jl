@@ -180,9 +180,11 @@ captured output. `resumed` is the session id the run was given with `--resume`
 
 A non-zero exit keeps the `session_id` of the CLI's stdout result object when it
 printed one: with `--output-format json` it does on a failed exit too (a step
-limit, a usage limit), so the thread can resume that session. A timeout has no
-id: the run was killed before printing anything. A refused resume sets
-`session_missing` ([`resume_refused`](@ref)).
+limit, a usage limit), so the thread can resume that session. A timeout keeps
+the id of a result printed before the overrun, else the session it resumed (the
+CLI writes the transcript as it goes and keeps the id across `--resume`); a
+fresh run that timed out has none. A refused resume sets `session_missing`
+([`resume_refused`](@ref)).
 """
 function interpret_claude_run(res, duration_ms::Integer, timeout_s::Real; resumed::AbstractString="")
     if res.timed_out
