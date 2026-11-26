@@ -961,9 +961,33 @@ end
                                       "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GH_CONFIG_DIR", "GH_REPO",
                                       "GIT_SSL_CAINFO", "DISABLE_AUTOUPDATER", "CUDA_VISIBLE_DEVICES",
                                       "HTTP_PROXY"])
-    # a variable dropped for its value alone is named in the log, once, never its value
-    @test_logs (:warn, r"not passing SSL_CERT_DIR to Claude runs") fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-x"))
+    # a variable dropped for its value alone is named in the log, once, and no part of
+    # the log record holds its value
+    logs, _ = Test.collect_test_logs() do
+        fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-MARKER9x"))
+    end
+    @test length(logs) == 1 && occursin("not passing SSL_CERT_DIR to Claude runs", string(logs[1].message))
+    @test !occursin("MARKER9", string(logs[1].message)) && !any(kv -> occursin("MARKER9", string(kv)), logs[1].kwargs)
     @test_logs fce(Dict("SSL_CERT_DIR" => "/etc/xoxb-1-x"))
+    # each exact selector passes on its own, each reserved name is dropped on its own,
+    # and an app token under a name the channel lists exactly is still dropped
+    for k in ("GH_HOST", "ANTHROPIC_FOUNDRY_BASE_URL", "GIT_SSL_CAINFO", "CLAUDE_CODE_OAUTH_TOKEN")
+        @test envnames(fce(Dict(k => "v"))) == Set([k])
+    end
+    for k in SlackClaw.SLACKCLAW_RUN_VARS
+        @test isempty(fce(Dict(k => "v"), [k, "SLACKCLAW_*"]))
+    end
+    @test isempty(fce(Dict("MY_APP_VALUE" => "xapp-1-A111-2222-abc"), ["MY_APP_VALUE"]))
+    # no prefix, built in or the channel's, passes a secret-looking name: a usage
+    # monitor's session key under CLAUDE_, a Slack cookie, a GitHub PAT, git's
+    # numbered settings (which work only together)
+    odd = Dict("CLAUDE_SESSION_KEY" => "sk-dummy", "CLAUDE_CONFIG_DIR" => "/cc",
+               "SLACK_COOKIE" => "xoxd-abc%2Fdummy", "GITHUB_PAT" => "ghp_dummy",
+               "GITHUB_REPOSITORY" => "lab/project", "GIT_CONFIG_COUNT" => "1",
+               "GIT_CONFIG_KEY_0" => "http.extraHeader", "GIT_CONFIG_VALUE_0" => "Authorization: dummy",
+               "PATH" => "/usr/bin:/opt/xapp-1.2/bin")
+    @test envnames(fce(odd, ["SLACK_*", "GITHUB_*", "GIT_*"])) == Set(["CLAUDE_CONFIG_DIR", "GITHUB_REPOSITORY", "PATH"])
+    @test isempty(fce(Dict("SLACK_COOKIE" => "xoxd-abc%2Fdummy"), ["SLACK_COOKIE"]))
     # extras by name or by prefix; a prefix never passes a secret-looking name, a channel names it
     extra = envnames(fce(monitor, ["GH_TOKEN", "MY_TOOL_*", "ZOTERO_*"]))
     @test extra ⊇ Set(["GH_TOKEN", "MY_TOOL_HOME", "MY_TOOL_MODE"])
@@ -990,6 +1014,7 @@ end
     @test hsc("xoxe.xoxp-1-abc") && hsc("xoxr-1-abc") && hsc("Bearer xoxb-1-2") && hsc("xwfp-1")
     @test hsc("https://hooks.slack.com/services/T0/B0/x") && hsc("hooks.Slack-Gov.com:443/x")
     @test !hsc("C0123") && !hsc("/usr/bin") && !hsc("/opt/myxapp-1/bin") && !hsc("/opt/xapp-tools/bin")
+    @test !hsc("/opt/xapp-1.2/bin") && hsc("xoxd-abc%2Fdef") && hsc("d=xoxd-1abc")
     huc = SlackClaw.has_url_credential
     @test huc("X", "http://u:p@proxy:3128") && !huc("X", "http://proxy:3128")
     @test huc("https_proxy", "u:p@proxy:3128") && !huc("https_proxy", "proxy:3128")
@@ -1942,20 +1967,29 @@ end
     # (a run the monitor stopped mid-way), and only those: another channel's sharing
     # the repo_dir, a backup beside a leftover, and unrelated files stay. Checked
     # through start_monitor (Slack's auth call stubbed), so the sweep's call is too.
+    # The saved state still holds a thread of channel C9 (moved to another
+    # monitor): its file stays too.
     d = mktempdir()
     cfg3 = SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=d)
-    for (ch, ts) in (("C0", "1.000000"), ("C0", "2.000000"), ("C9", "3.000000"), ("C1", "4.000000"))
+    t1, t2, t3, t4 = "1700000001.000000", "1700000002.000000", "1700000003.000000", "1700000004.000000"
+    for (ch, ts) in (("C0", t1), ("C0", t2), ("C9", t3), ("C1", t4))
         write(SlackClaw.run_status_path(cfg3, ch, ts), "left")
     end
-    backup = SlackClaw.run_status_path(cfg3, "C0", "1.000000") * ".bak"
+    backup = SlackClaw.run_status_path(cfg3, "C0", t1) * ".bak"
     write(backup, "kept by hand")
+    versioned = SlackClaw.status_prefix(cfg3, "C0") * "1.2"
+    write(versioned, "kept by hand")
     write(joinpath(d, ".slackclaw_status"), "old shared file")
     write(joinpath(d, "notes.txt"), "keep")
+    saved = mkstate(cfg3)
+    saved.threads[t3] = SlackClaw.ThreadSession(t3, "s-c9", t3, time(), "C9")
+    SlackClaw.save_state!(saved)
     Core.eval(SlackClaw, :(slack_auth_test(config::SlackClawConfig) = "UBOT"))
     SlackClaw.start_monitor(cfg3)
-    @test sort(readdir(d)) == sort([".slackclaw_status", "notes.txt", basename(backup),
-                                    basename(SlackClaw.run_status_path(cfg3, "C9", "3.000000")),
-                                    basename(SlackClaw.run_status_path(cfg3, "C1", "4.000000"))])
+    @test sort(readdir(d)) == sort([".slackclaw_status", "notes.txt", basename(backup), basename(versioned),
+                                    basename(cfg3.state_file),
+                                    basename(SlackClaw.run_status_path(cfg3, "C9", t3)),
+                                    basename(SlackClaw.run_status_path(cfg3, "C1", t4))])
     @test SlackClaw.sweep_status_files(cfg3) == 0
 end
 
@@ -2037,6 +2071,24 @@ end)
     write(SlackClaw.run_status_path(cfg_w, "C0", "1700000802.000000"), "still here")
     sleep(2.5)
     @test !any(t -> occursin("Status:", t), top_posted)
+
+    # Naming the run's status file can fail (a relative repo_dir after the working
+    # folder was removed): the thread is still released, with one failure reply
+    Core.eval(SlackClaw, :(run_status_path(config::SlackClawConfig, channel_id::AbstractString,
+                                           thread_ts::AbstractString) = error("simulated: no working folder")))
+    try
+        cfg_p = SlackClaw.SlackClawConfig(slack_bot_token="fake", slack_channel_id="C0", repo_dir=mktempdir())
+        state_p = mkstate(cfg_p)
+        empty!(top_posted)
+        SlackClaw.run_agent_loop!(state_p, "1700000803.000000", "check", ""; channel_id="C0")
+        foreach(wait, state_p.active_tasks)
+        @test !haskey(state_p.busy_threads, "1700000803.000000")
+        @test length(top_posted) == 1 && endswith(top_posted[1], SlackClaw.FAILED_RUN_RETRY_LINE)
+    finally
+        Core.eval(SlackClaw, :(run_status_path(config::SlackClawConfig, channel_id::AbstractString,
+                                               thread_ts::AbstractString) =
+                                   status_prefix(config, channel_id) * replace(thread_ts, r"[^0-9.]" => "_")))
+    end
 end
 
 # Pins the skip gate's placement: a skipped reply must post nothing and add no

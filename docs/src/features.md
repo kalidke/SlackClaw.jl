@@ -172,10 +172,12 @@ and the run follows prompts any channel member can write. It inherits only
   `CLAUDE_CODE_OAUTH_TOKEN`; those never pass, not even through
   `child_env_passthrough`, so set such options in Claude Code's `settings.json`);
 - whatever the channel's `child_env_passthrough` lists: a name, or a prefix
-  ending in `*` (for example `["MYTOOL_*", "ZOTERO_API_KEY", "GH_TOKEN"]`). A
-  prefix never passes a name that looks like a secret (one containing `TOKEN`,
-  `SECRET`, `PASSW`, `KEY`, `CREDENTIAL` or `WEBHOOK`): a channel names such a
-  variable exactly.
+  ending in `*` (for example `["MYTOOL_*", "ZOTERO_API_KEY", "GH_TOKEN"]`). No
+  prefix, built in or the channel's, passes a name that looks like a secret (one
+  containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`, `WEBHOOK`,
+  `COOKIE` or the word `PAT`) or git's numbered settings (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, which work only together): a
+  channel names such a variable exactly.
 
 Three more rules hold over all of it. A variable whose value holds a Slack
 token or webhook URL anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other

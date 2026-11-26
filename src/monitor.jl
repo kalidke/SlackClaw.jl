@@ -314,7 +314,7 @@ function sweep_status_files(config::SlackClawConfig)
         isdir(dir) || return 0
         for f in readdir(dir)
             p = joinpath(dir, f)
-            if startswith(f, base) && occursin(r"^[0-9]+\.[0-9]+$", f[ncodeunits(base)+1:end]) && isfile(p)
+            if startswith(f, base) && occursin(r"^[0-9]+\.[0-9]{6}$", f[ncodeunits(base)+1:end]) && isfile(p)
                 rm(p; force=true)
                 n += 1
             end

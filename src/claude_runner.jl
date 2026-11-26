@@ -53,6 +53,8 @@ channel names it in `child_env_passthrough`.
 """
 const CHILD_ENV_NAMES = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ",
+    # the CLI's own login after `claude setup-token` (a secret-looking name, so by exact name)
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "TMPDIR", "TMP", "TEMP", "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS",
     # proxies (one whose URL carries a user name or password: see filtered_child_env)
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
@@ -100,14 +102,17 @@ const PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "ht
 
 """
 True when `v` holds a Slack credential anywhere in it (alone, in an
-`Authorization` header, in a URL): a token (`xoxb-` bot, `xoxp-` user, the other
-`xox?-` kinds, a rotating `xoxe.`, an app-level `xapp-`, a workflow `xwfp-`, each
-followed by the digit Slack's tokens carry there, so a path such as
-`/opt/xapp-tools` is not one) or an incoming-webhook URL (`hooks.slack.com` or
-GovSlack's `hooks.slack-gov.com`, any letter case, any port).
+`Authorization` header, in a URL), recognized by its shape:
+- a token: `xoxb-` bot, `xoxp-` user and the other `xox?-` kinds, and `xapp-`
+  app-level, each as `<kind>-<digits>-<letter or digit>`, so a path such as
+  `/opt/xapp-tools` or `/opt/xapp-1.2` is not one; a rotating `xoxe.xox…`; a
+  workflow `xwfp-<digit>`;
+- a session cookie `xoxd-…`, which may go on with a letter;
+- an incoming-webhook URL (`hooks.slack.com` or GovSlack's
+  `hooks.slack-gov.com`, any letter case, any port).
 """
 has_slack_credential(v::AbstractString) =
-    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]|xoxe\.xox|xapp-[0-9]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-[0-9]+-[0-9A-Za-z]|xoxd-[0-9A-Za-z%]|xoxe\.xox|xapp-[0-9]+-[0-9A-Za-z]|xwfp-[0-9])|(?i:hooks\.slack(?:-gov)?\.com)(?::[0-9]+)?/", v)
 
 """
 True when `v`, the value of variable `k`, holds a URL with a user name or
@@ -118,11 +123,17 @@ has_url_credential(k::AbstractString, v::AbstractString) =
     occursin(r"://[^/\s@]+@", v) || (k in PROXY_NAMES && occursin(r"^\s*[^/\s@]+@", v))
 
 """
-True for a name that looks like it holds a secret (`TOKEN`, `SECRET`, `PASSW`,
-`KEY`, `CREDENTIAL`, `WEBHOOK`, any case). A channel's prefix entry in
-`child_env_passthrough` never passes such a name; the channel names it exactly.
+True for a name that passes only when listed exactly: one that looks like it
+holds a secret (containing `TOKEN`, `SECRET`, `PASSW`, `KEY`, `CREDENTIAL`,
+`WEBHOOK`, `COOKIE`, or the word `PAT`, any case), and git's numbered settings
+(`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`,
+`GIT_CONFIG_PARAMETERS`), which work only as a whole and can carry an
+`http.extraHeader`. No prefix, built in or in `child_env_passthrough`, passes
+such a name.
 """
-secret_name(k::AbstractString) = occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK"i, k)
+secret_name(k::AbstractString) =
+    occursin(r"TOKEN|SECRET|PASSW|KEY|CREDENTIAL|WEBHOOK|COOKIE|(^|_)PAT($|_)"i, k) ||
+    occursin(r"^GIT_CONFIG_(COUNT|PARAMETERS|KEY_[0-9]+|VALUE_[0-9]+)$", k)
 
 """
     filtered_child_env(env, passthrough=()) -> Vector{String}
@@ -148,15 +159,17 @@ Exceptions:
   as a proxy with its password, passes only when `passthrough` names the
   variable exactly, not through the allow list or a prefix.
 - **A secret-looking name** ([`secret_name`](@ref)) never passes through a
-  prefix entry of `passthrough`; a channel names it exactly.
+  prefix, one of [`CHILD_ENV_PREFIXES`](@ref) or a prefix entry of
+  `passthrough`; it passes only by exact name (`CLAUDE_CODE_OAUTH_TOKEN` is in
+  [`CHILD_ENV_NAMES`](@ref) for that reason).
 - **[`SLACKCLAW_RUN_VARS`](@ref)** are never inherited: [`run_claude`](@ref) sets
   them for each run. Other `SLACKCLAW_*` names pass only through `passthrough`.
 """
 function filtered_child_env(env, passthrough=())
     names = String[p for p in passthrough if !endswith(p, "*")]
     prefixes = String[chop(p) for p in passthrough if endswith(p, "*")]
-    listed(k) = k in CHILD_ENV_NAMES || any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
-                (any(p -> startswith(k, p), prefixes) && !secret_name(k))
+    listed(k) = k in CHILD_ENV_NAMES ||
+                (any(p -> startswith(k, p), (CHILD_ENV_PREFIXES..., prefixes...)) && !secret_name(k))
     nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
     out = String[]
     for (k, v) in env

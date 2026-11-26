@@ -19,8 +19,9 @@ Notable changes to SlackClaw.jl. Format follows
   starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (the
   nested-session variables still dropped), and what the new
   `child_env_passthrough` config field lists (a name, or a prefix ending in
-  `*`; a prefix never passes a secret-looking name, which a channel names
-  exactly). A value holding a Slack credential anywhere (a token alone or in a
+  `*`; no prefix, built in or the channel's, passes a secret-looking name or
+  git's numbered settings, which a channel names exactly). A value holding a
+  Slack token, session cookie or webhook URL anywhere (a token alone or in a
   header, a webhook URL) never passes, under any name; a URL carrying a user
   name or password, such as a proxy's, passes only when the channel names the
   variable. The variables SlackClaw sets per run are never inherited. The
