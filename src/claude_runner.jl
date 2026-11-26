@@ -45,27 +45,67 @@ const CHILD_ENV_PASSTHROUGH = ("CLAUDE_CODE_OAUTH_TOKEN",)
 
 """
 Variables the `claude` child inherits by exact name (see [`filtered_child_env`](@ref)):
-what a shell, git, the CLI and its HTTP client need, and nothing that carries a
-credential of the monitor's.
+what a shell, git, `gh`, the CLI and its HTTP client need, the child's own
+Anthropic credential and endpoint, and the names (not the secrets) of a cloud
+provider profile or region. Nothing that carries a credential of the monitor's:
+an Anthropic admin key, a `GH_TOKEN` or a cloud secret key passes only when the
+channel names it in `child_env_passthrough`.
 """
 const CHILD_ENV_NAMES = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ",
     "TMPDIR", "TMP", "TEMP", "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS",
+    # proxies (one whose URL carries a user name or password: see filtered_child_env)
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "no_proxy", "all_proxy",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # certificate trust
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+    # the Anthropic client: the child's own credential, endpoint and models
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    # cloud provider selectors (profile, region, file locations; not secret keys)
+    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "CLOUD_ML_REGION", "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS",
+    # git and gh identity and configuration
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+    "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GH_CONFIG_DIR",
+    # Claude Code settings it reads from the environment
+    "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "BASH_DEFAULT_TIMEOUT_MS",
+    "BASH_MAX_TIMEOUT_MS", "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT", "MAX_THINKING_TOKENS",
+    # host policy: GPUs and thread counts, the library path, a display
+    "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "LD_LIBRARY_PATH", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    # npm's cache location (not the npm_config_ prefix, which can carry registry tokens)
+    "npm_config_cache", "NPM_CONFIG_CACHE",
 )
 
 """
 Variables the `claude` child inherits by prefix (see [`filtered_child_env`](@ref)):
-locale, XDG base directories, Julia and juliaup (the depot), the Anthropic
-client's own settings and credential, and Claude Code configuration such as
-`CLAUDE_CONFIG_DIR` (less the nested-session vars).
+locale, XDG base directories, Julia and juliaup (the depot), and Claude Code
+configuration such as `CLAUDE_CONFIG_DIR` (less the nested-session vars).
 """
-const CHILD_ENV_PREFIXES = ("LC_", "XDG_", "JULIA_", "JULIAUP_", "ANTHROPIC_", "CLAUDE_")
+const CHILD_ENV_PREFIXES = ("LC_", "XDG_", "JULIA_", "JULIAUP_", "CLAUDE_")
 
-"""True for a Slack token: bot `xoxb-`, user `xoxp-`, the other `xox?-` kinds, a rotating `xoxe`, an app-level `xapp-`."""
-is_slack_token(v::AbstractString) = occursin(r"^\s*(xox[a-z]-|xoxe[.-]|xapp-)", v)
+"""
+The variables [`run_claude`](@ref) sets for each run. They are never inherited
+from the monitor, even when `child_env_passthrough` names them.
+"""
+const SLACKCLAW_RUN_VARS = ("SLACKCLAW_THREAD_TS", "SLACKCLAW_CHANNEL_ID", "SLACKCLAW_BOT_TOKEN",
+                            "SLACKCLAW_UPLOAD", "SLACKCLAW_STATUS")
+
+"""
+True when `v` holds a Slack credential anywhere in it (alone, in an
+`Authorization` header, in a URL): a token (`xoxb-` bot, `xoxp-` user, the other
+`xox?-` kinds, a rotating `xoxe`, an app-level `xapp-`, a workflow `xwfp-`) or an
+incoming-webhook URL (`hooks.slack.com/`).
+"""
+has_slack_credential(v::AbstractString) =
+    occursin(r"(?<![A-Za-z0-9])(xox[a-z]-|xoxe[.-]|xapp-|xwfp-)|hooks\.slack\.com/", v)
+
+"""True when `v` holds a URL with a user name or password (`scheme://user:pass@host`)."""
+has_url_credential(v::AbstractString) = occursin(r"://[^/\s@]+@", v)
 
 """
     filtered_child_env(env, passthrough=()) -> Vector{String}
@@ -78,28 +118,30 @@ is in [`CHILD_ENV_NAMES`](@ref), starts with one of
 [`CHILD_ENV_PREFIXES`](@ref), or matches an entry of `passthrough`
 (`config.child_env_passthrough`: a name, or a prefix ending in `*`).
 
-Two exceptions:
+Exceptions:
 - **Nested-session detection vars.** `CLAUDECODE` and `CLAUDE_CODE_*` are
   dropped, except the credentials in [`CHILD_ENV_PASSTHROUGH`](@ref):
   `CLAUDE_CODE_OAUTH_TOKEN` is the child's only auth path after
   `claude setup-token`, which prints the token without storing it. Other
   `CLAUDE_*` vars are user configuration and pass: stripping
   `CLAUDE_CONFIG_DIR` sends every child's transcripts back to `~/.claude`.
-- **Slack tokens.** A variable whose value is a Slack token
-  ([`is_slack_token`](@ref)) never passes, even when `passthrough` names it.
-
-SlackClaw's own `SLACKCLAW_*` variables are not inherited: [`run_claude`](@ref)
-sets them for each run.
+- **Slack credentials.** A variable whose value holds one
+  ([`has_slack_credential`](@ref)) never passes, even when `passthrough` names it.
+- **A URL with a user name or password** ([`has_url_credential`](@ref)), such
+  as a proxy with its password, passes only when `passthrough` names the
+  variable exactly, not through the allow list or a prefix.
+- **[`SLACKCLAW_RUN_VARS`](@ref)** are never inherited: [`run_claude`](@ref) sets
+  them for each run. Other `SLACKCLAW_*` names pass only through `passthrough`.
 """
 function filtered_child_env(env, passthrough=())
     names = String[p for p in passthrough if !endswith(p, "*")]
     prefixes = String[chop(p) for p in passthrough if endswith(p, "*")]
-    allowed(k) = k in CHILD_ENV_NAMES || k in names ||
-                 any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
-                 any(p -> startswith(k, p), prefixes)
+    listed(k) = k in CHILD_ENV_NAMES || any(p -> startswith(k, p), CHILD_ENV_PREFIXES) ||
+                any(p -> startswith(k, p), prefixes)
     nested(k) = k == "CLAUDECODE" || (startswith(k, "CLAUDE_CODE_") && !(k in CHILD_ENV_PASSTHROUGH))
-    return String["$(k)=$(v)" for (k, v) in env
-                  if allowed(k) && !nested(k) && !startswith(k, "SLACKCLAW_") && !is_slack_token(v)]
+    keep(k, v) = !(k in SLACKCLAW_RUN_VARS) && !nested(k) && !has_slack_credential(v) &&
+                 (k in names || (listed(k) && !has_url_credential(v)))
+    return String["$(k)=$(v)" for (k, v) in env if keep(k, v)]
 end
 
 """
@@ -161,7 +203,9 @@ function run_claude(prompt::String, config::SlackClawConfig;
     end
 
     # The allow-listed environment: no Slack token or other credential of the
-    # monitor's reaches the child (filtered_child_env)
+    # monitor's is in the environment the child inherits (filtered_child_env).
+    # The child is the monitor's OS user, so files and the monitor's own process
+    # environment stay readable to it: this is not a sandbox.
     filtered_env = filtered_child_env(ENV, config.child_env_passthrough)
 
     # Inject SlackClaw context so the upload helper can post into this thread,

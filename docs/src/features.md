@@ -138,29 +138,60 @@ be missed). The file is removed when the run ends, and one left by an earlier
 run in the thread is removed when the next run starts. A thread has one run at a
 time, so two runs never share a status file and one run's progress never shows
 in another thread. To use it, tell Claude in `system_prompt` to write progress
-to the file named by `$SLACKCLAW_STATUS`.
+to the file named by `$SLACKCLAW_STATUS` when that variable is set: listen and
+proactive runs have no thread to post progress in, so they get no status file.
 
 ## What the Claude child receives
 
 Every run of `claude` gets an allow-listed environment, not the monitor's: a
 fleet's environment holds every workspace's Slack tokens and other credentials,
-and the run follows prompts any channel member can write. It inherits only:
+and the run follows prompts any channel member can write. It inherits only
+(`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`):
 
-- what a shell, git, the CLI and its HTTP client need: `PATH`, `HOME`, `USER`,
-  `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`, `TMPDIR`/`TMP`/`TEMP`,
-  `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, the proxy variables and the
-  certificate-bundle variables (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, …);
-- variables starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_`, `ANTHROPIC_` or
-  `CLAUDE_` (less the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`,
-  except `CLAUDE_CODE_OAUTH_TOKEN`);
+- what a shell, git, `gh`, the CLI and its HTTP client need: `PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TERM`, `TZ`,
+  `TMPDIR`/`TMP`/`TEMP`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, the proxy
+  variables, certificate trust (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
+  `NODE_USE_SYSTEM_CA`, `GIT_SSL_CAINFO`, …), and git and `gh` identity and
+  configuration (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`,
+  `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`, `GH_CONFIG_DIR`);
+- the child's own Anthropic credential, endpoint and models (`ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and the other
+  model and cloud-endpoint names), but not an admin key;
+- the names, not the secrets, of a cloud provider's profile, region and files
+  (`AWS_PROFILE`, `AWS_REGION`, `AWS_CONFIG_FILE`, `CLOUD_ML_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, …);
+- variables starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (less
+  the nested-session variables `CLAUDECODE` and `CLAUDE_CODE_*`, except
+  `CLAUDE_CODE_OAUTH_TOKEN`);
 - whatever the channel's `child_env_passthrough` lists: a name, or a prefix
-  ending in `*` (for example `["ZOTERO_*", "HARDWARE_RECORDS"]`).
+  ending in `*` (for example `["ZOTERO_*", "GH_TOKEN"]`).
 
-A variable whose value is a Slack token (`xoxb-`, `xoxp-`, `xapp-` and the other
-`xox` kinds) never passes, even when `child_env_passthrough` names it. SlackClaw
-then sets the run's own variables: `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`,
-`SLACKCLAW_BOT_TOKEN` (the channel's bot token, for the upload helper) and
-`SLACKCLAW_UPLOAD`, and `SLACKCLAW_STATUS` for a run in a thread.
+Three rules hold over all of it. A variable whose value holds a Slack credential
+anywhere (a `xoxb-`, `xoxp-`, `xapp-`, `xwfp-` or other `xox` token, alone or in
+a header, or an incoming-webhook URL) never passes, even when
+`child_env_passthrough` names it. A URL with a user name or password, such as a
+proxy with its password, passes only when `child_env_passthrough` names the
+variable exactly. And the variables SlackClaw sets for each run are never
+inherited: `SLACKCLAW_THREAD_TS`, `SLACKCLAW_CHANNEL_ID`, `SLACKCLAW_BOT_TOKEN`
+(the channel's bot token, for the upload helper), `SLACKCLAW_UPLOAD`, and
+`SLACKCLAW_STATUS` for a run in a thread. Other `SLACKCLAW_*` names, such as the
+upload helper's `SLACKCLAW_UPLOAD_COMMENT`, pass when the channel names them.
+
+Claude Code's own settings variables (`DISABLE_AUTOUPDATER`, `BASH_MAX_TIMEOUT_MS`,
+`MCP_TIMEOUT`, …), host policy (`CUDA_VISIBLE_DEVICES`, the thread-count
+variables, `LD_LIBRARY_PATH`, a display) and npm's cache location
+(`npm_config_cache`) pass by exact name too. Anything else a channel's runs used
+from the monitor's environment, such as a tool's API key, must be listed in
+`child_env_passthrough` before upgrading.
+
+**What this does not do.** The allow list governs the environment a run
+inherits. A run is the monitor's own OS user, so it can still read any file the
+monitor can (`slackclaw.env`, which `setup()` writes into `repo_dir` by default;
+a shell startup file that exports tokens; a token file in a checkout it works
+in) and the monitor's own process environment. Keep token files out of the
+folders runs work in. Keeping tokens out of a run's reach entirely needs the run
+under its own OS user.
 
 ## Sending files and images
 

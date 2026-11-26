@@ -162,7 +162,7 @@ All options are fields on `SlackClawConfig`:
 | `announce_startup` | `false` | Post start/stop banners to the primary channel |
 | `system_prompt` | *(brevity prompt)* | System prompt prepended to each invocation |
 | `allowed_tools` | `String[]` | Restrict Claude to specific tools |
-| `child_env_passthrough` | `String[]` | Environment variables the Claude child gets beyond the allow list (a name, or a prefix ending in `*`); a Slack token never passes |
+| `child_env_passthrough` | `String[]` | Environment variables the Claude child gets beyond the allow list (a name, or a prefix ending in `*`); a Slack credential never passes |
 | `listen_channel_ids` | `String[]` | Read-only channels (relevance-filtered; responses go to the primary channel) |
 | `state_file` | `.slackclaw_state.json` | Persistence file in `repo_dir` (override when channels share a `repo_dir`) |
 | `status_file` | `.slackclaw_status` | Name of each run's status file (`<status_file>.<channel>.<thread ts>`, given to Claude as `SLACKCLAW_STATUS`); its contents post as progress updates |
@@ -256,11 +256,13 @@ Frequency can be adjusted live via Slack messages in the monitored channel:
 
 ### Progress updates during long tasks
 
-Each run in a thread has its own status file, named to Claude as `SLACKCLAW_STATUS` (`<status_file>.<channel>.<thread ts>` in `repo_dir`, polled every `status_poll_s`). Any non-empty content present when it polls is posted to the thread as a progress update (a value overwritten between polls can be missed), and the file is removed when the run ends. Two runs never share one, so one run's progress never shows in another thread. Tell Claude in `system_prompt` to write progress to the file named by `$SLACKCLAW_STATUS`; this lets a long-running task narrate itself.
+Each run in a thread has its own status file, named to Claude as `SLACKCLAW_STATUS` (`<status_file>.<channel>.<thread ts>` in `repo_dir`, polled every `status_poll_s`). Any non-empty content present when it polls is posted to the thread as a progress update (a value overwritten between polls can be missed), and the file is removed when the run ends. Two runs never share one, so one run's progress never shows in another thread. Tell Claude in `system_prompt` to write progress to the file named by `$SLACKCLAW_STATUS` when that variable is set (listen and proactive runs have none); this lets a long-running task narrate itself.
 
 ### What the Claude child receives
 
-Each `claude` run gets an allow-listed environment, not the monitor's (a fleet's environment holds every workspace's Slack tokens and other credentials, and a run follows prompts any channel member can write): the basic shell, git and CLI variables, those starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_`, `ANTHROPIC_` or `CLAUDE_`, and whatever the channel's `child_env_passthrough` adds. A Slack token never passes under any name. SlackClaw then sets the run's own `SLACKCLAW_*` variables, the channel's bot token among them for the upload helper. The full list is in the docs' Features page.
+Each `claude` run gets an allow-listed environment, not the monitor's (a fleet's environment holds every workspace's Slack tokens and other credentials, and a run follows prompts any channel member can write): the basic shell, git, `gh` and CLI variables, the child's own Anthropic credential and endpoint, cloud provider profile and region names, those starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_`, and whatever the channel's `child_env_passthrough` adds. A Slack credential (a token anywhere in a value, or a webhook URL) never passes under any name, and a URL carrying a password passes only when the channel names its variable. SlackClaw then sets the run's own `SLACKCLAW_*` variables, the channel's bot token among them for the upload helper. The full list is in the docs' Features page.
+
+This covers the environment a run inherits, not what it can read. A run is the monitor's own OS user, so a token in a file it can open (`slackclaw.env` in `repo_dir`, a shell startup file that exports tokens) or in the monitor's process environment is still within its reach. Keep token files out of the folders runs work in; keeping tokens out of a run's reach entirely needs the run under its own OS user.
 
 ## Running as a Service
 

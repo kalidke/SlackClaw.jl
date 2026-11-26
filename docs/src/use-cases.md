@@ -93,8 +93,8 @@ to the thread:
 
 ```julia
 cfg = SlackClawConfig(repo_dir = "/path/to/repo")
-cfg.system_prompt *= "\n\nFor long tasks, write one-line progress updates to " *
-                     "the file named by \$SLACKCLAW_STATUS."
+cfg.system_prompt *= "\n\nFor long tasks, when \$SLACKCLAW_STATUS is set, write " *
+                     "one-line progress updates to the file it names."
 run_monitor(cfg)
 ```
 

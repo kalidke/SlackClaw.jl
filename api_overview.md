@@ -86,7 +86,7 @@ All settings for a monitor. Keyword constructor; the token/channel fields defaul
 - `claude_timeout_s::Int = 3600`
 - `max_turns::Int = 30`
 - `allowed_tools::Vector{String} = String[]`
-- `child_env_passthrough::Vector{String} = String[]` — environment variables the `claude` child gets beyond the allow list (`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`): a name, or a prefix ending in `*`. A Slack-token value never passes (`filtered_child_env`)
+- `child_env_passthrough::Vector{String} = String[]` — environment variables the `claude` child gets beyond the allow list (`CHILD_ENV_NAMES`, `CHILD_ENV_PREFIXES`): a name, or a prefix ending in `*`. A value holding a Slack credential never passes, and a URL with a password passes only when named exactly (`filtered_child_env`)
 - `max_concurrent_tasks::Int = 5`
 - `max_active_threads::Int = 3`
 - `max_thread_idle_s::Int = 604800` — 7 d; `0` = never

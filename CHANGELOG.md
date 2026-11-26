@@ -13,14 +13,38 @@ Notable changes to SlackClaw.jl. Format follows
   variables, so every run, following prompts any channel member can write,
   held the workspace's app-level token, every other workspace's bot token in
   a fleet's environment, and any other credential the monitor had. It now
-  inherits only the variables a shell, git, the CLI and its HTTP client need,
-  those starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_`, `ANTHROPIC_` or
-  `CLAUDE_` (the nested-session variables still dropped), and what the new
+  inherits only the variables a shell, git, `gh`, the CLI and its HTTP client
+  need, the child's own Anthropic credential, endpoint and models (by exact
+  name, so not an admin key), cloud provider profile and region names, those
+  starting with `LC_`, `XDG_`, `JULIA_`, `JULIAUP_` or `CLAUDE_` (the
+  nested-session variables still dropped), and what the new
   `child_env_passthrough` config field lists (a name, or a prefix ending in
-  `*`). A variable whose value is a Slack token never passes, under any name.
-  `SLACKCLAW_*` variables are set per run, never inherited. The channel's own
-  bot token still reaches the run as `SLACKCLAW_BOT_TOKEN`, for the upload
-  helper.
+  `*`). A value holding a Slack credential anywhere (a token alone or in a
+  header, a webhook URL) never passes, under any name; a URL carrying a user
+  name or password, such as a proxy's, passes only when the channel names the
+  variable. The variables SlackClaw sets per run are never inherited. The
+  channel's own bot token still reaches the run as `SLACKCLAW_BOT_TOKEN`, for
+  the upload helper and channel helper scripts. A channel whose runs need a
+  variable outside the allow list (an API key for a tool, `GH_TOKEN`) lists it
+  in `child_env_passthrough` before upgrading.
+- **Not a sandbox.** The allow list covers the environment a run inherits. A
+  run is the monitor's own OS user and can still read the files the monitor
+  can (`slackclaw.env`, which `setup()` writes into `repo_dir` by default, a
+  shell startup file that exports tokens) and the monitor's process
+  environment. Keep token files out of the folders runs work in. Since every
+  run through 0.7.4 held the app-level token and any other workspace's token
+  in the monitor's environment, rotating those tokens after upgrading is the
+  safe course.
+
+### Upgrading
+
+- Variables runs no longer inherit unless listed in `child_env_passthrough`:
+  everything outside the allow list (see the Features page), for example a
+  tool's API key (`ZOTERO_API_KEY`), `GH_TOKEN`/`GITHUB_TOKEN`, cloud secret
+  keys, `npm_config_*` other than the cache location, and `SLACKCLAW_*` names
+  other than those SlackClaw sets per run. A launcher that builds
+  `SlackClawConfig` for a fleet needs a way to set `child_env_passthrough` per
+  channel.
 
 ### Fixed
 
@@ -28,10 +52,12 @@ Notable changes to SlackClaw.jl. Format follows
   `.slackclaw_status`, so with two runs at once one run's progress was posted
   in the other's thread, and the first to finish deleted the other's file. A
   run's status file is now `<status_file>.<channel>.<thread ts>` in
-  `repo_dir`, given to the child as `SLACKCLAW_STATUS`; it is removed when the
-  run ends and when the next run in the thread starts. A prompt that tells
-  Claude to write `.slackclaw_status` must name `$SLACKCLAW_STATUS` instead.
-  `validate_fleet` no longer warns about a shared `status_file`.
+  `repo_dir` (as an absolute path), given to the child as `SLACKCLAW_STATUS`;
+  it is removed when the run ends and when the next run in the thread starts.
+  A prompt that tells Claude to write `.slackclaw_status` must name
+  `$SLACKCLAW_STATUS` instead, when that variable is set (listen and proactive
+  runs have none). `validate_fleet` no longer warns about a shared
+  `status_file`.
 
 ## [0.7.4] — 2026-11-25
 
